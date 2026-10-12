@@ -38,4 +38,5 @@ pub const run = switch (@import("builtin").os.tag) {
 test {
     _ = geom;
     _ = raster;
+    _ = @import("gpu/instances.zig");
 }

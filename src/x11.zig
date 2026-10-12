@@ -139,3 +139,44 @@ pub extern "c" fn shmctl(id: c_int, cmd: c_int, buf: ?*anyopaque) c_int;
 pub const IPC_PRIVATE = 0;
 pub const IPC_CREAT = 0o1000;
 pub const IPC_RMID = 0;
+
+pub const XVisualInfo = extern struct {
+    visual: *Visual,
+    visualid: c_ulong,
+    screen: c_int,
+    depth: c_int,
+    class: c_int,
+    red_mask: c_ulong,
+    green_mask: c_ulong,
+    blue_mask: c_ulong,
+    colormap_size: c_int,
+    bits_per_rgb: c_int,
+};
+
+pub const XSetWindowAttributes = extern struct {
+    background_pixmap: c_ulong = 0,
+    background_pixel: c_ulong = 0,
+    border_pixmap: c_ulong = 0,
+    border_pixel: c_ulong = 0,
+    bit_gravity: c_int = 0,
+    win_gravity: c_int = 0,
+    backing_store: c_int = 0,
+    backing_planes: c_ulong = 0,
+    backing_pixel: c_ulong = 0,
+    save_under: c_int = 0,
+    event_mask: c_long = 0,
+    do_not_propagate_mask: c_long = 0,
+    override_redirect: c_int = 0,
+    colormap: c_ulong = 0,
+    cursor: c_ulong = 0,
+};
+
+pub const CWBackPixel = 1 << 1;
+pub const CWBorderPixel = 1 << 3;
+pub const CWEventMask = 1 << 11;
+pub const CWColormap = 1 << 13;
+pub const InputOutput = 1;
+pub const AllocNone = 0;
+
+pub extern "X11" fn XCreateWindow(d: *Display, parent: Window, x: c_int, y: c_int, w: c_uint, h: c_uint, bw: c_uint, depth: c_int, class: c_uint, visual: *Visual, mask: c_ulong, attrs: *XSetWindowAttributes) Window;
+pub extern "X11" fn XCreateColormap(d: *Display, w: Window, visual: *Visual, alloc: c_int) c_ulong;

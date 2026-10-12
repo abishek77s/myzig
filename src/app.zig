@@ -15,6 +15,9 @@ const text = @import("text.zig");
 const scene = @import("scene.zig");
 const raster = @import("raster.zig");
 const geom = @import("geom.zig");
+const choose = @import("gpu/choose.zig");
+const glr = @import("gpu/gl.zig");
+const Glx = @import("gpu/glx.zig").Glx;
 
 pub const WindowOptions = struct {
     title: [:0]const u8 = "MyZig",
@@ -52,9 +55,25 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     defer _ = x.XCloseDisplay(dpy);
     const screen = x.XDefaultScreen(dpy);
     const root = x.XRootWindow(dpy, screen);
-    const visual = x.XDefaultVisual(dpy, screen);
-    const depth = x.XDefaultDepth(dpy, screen);
+    var visual = x.XDefaultVisual(dpy, screen);
+    var depth = x.XDefaultDepth(dpy, screen);
     if (depth != 24 and depth != 32) return error.UnsupportedDepth;
+
+    // OpenGL needs its visual before the window exists.
+    const choice = choose.choose();
+    var glx: ?Glx = null;
+    var vi: ?*x.XVisualInfo = null;
+    if (choice.kind != .cpu) {
+        if (choice.kind == .vulkan) std.log.warn("myzig: Vulkan is not ready on X11 yet; drawing with OpenGL", .{});
+        if (Glx.open()) |g| {
+            glx = g;
+            vi = glx.?.visual(dpy, screen) catch null;
+            if (vi) |v| {
+                visual = v.visual;
+                depth = v.depth;
+            }
+        } else |_| {}
+    }
 
     const scale: f32 = if (env.get("MYZIG_SCALE")) |s| std.fmt.parseFloat(f32, s) catch 1 else 1;
     const uncapped = env.get("MYZIG_UNCAPPED") != null;
@@ -63,7 +82,8 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
 
     var w: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(opts.width)) * scale));
     var h: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(opts.height)) * scale));
-    const win = x.XCreateSimpleWindow(dpy, root, 0, 0, @intCast(w), @intCast(h), 0, 0, 0xffffff);
+    var attrs = x.XSetWindowAttributes{ .background_pixel = 0xffffff, .colormap = x.XCreateColormap(dpy, root, visual, x.AllocNone) };
+    const win = x.XCreateWindow(dpy, root, 0, 0, @intCast(w), @intCast(h), 0, depth, x.InputOutput, visual, x.CWBackPixel | x.CWBorderPixel | x.CWColormap, &attrs);
     _ = x.XStoreName(dpy, win, opts.title.ptr);
     var wm_delete = x.XInternAtom(dpy, "WM_DELETE_WINDOW", 0);
     _ = x.XSetWMProtocols(dpy, win, @ptrCast(&wm_delete), 1);
@@ -83,8 +103,33 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     var rend = scene.Renderer{ .gpa = gpa, .retain_pixels = false };
     defer rend.deinit();
 
+    // The GPU renderer, where one draws.
+    var gpu: ?glr.Renderer = null;
+    defer if (gpu) |*g| g.deinit();
+    if (glx != null and vi != null) gpu: {
+        glx.?.context(dpy, win) catch |e| {
+            std.log.warn("myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(e)});
+            break :gpu;
+        };
+        const gl = glr.Gl.load(&glx.?, Glx.proc) catch break :gpu;
+        gpu = glr.Renderer.init(gpa, gl) catch break :gpu;
+        const name = gpu.?.name();
+        if (!choice.forced and glr.software(name)) {
+            gpu.?.deinit();
+            gpu = null;
+            glx.?.release(dpy);
+            break :gpu;
+        }
+        if (print_stats) std.debug.print("myzig: drawing with OpenGL on {s}\n", .{name});
+    }
+    defer if (glx) |*g| g.release(dpy);
+    if (gpu != null) rend.raster = false;
+    const dump = env.get("MYZIG_DUMP");
+
     var buf = Buffer{};
-    try resize(dpy, visual, depth, use_shm, &buf, w, h);
+    if (gpu == null) try resize(dpy, visual, depth, use_shm, &buf, w, h);
+    buf.width = w;
+    buf.height = h;
     defer freeBuffer(dpy, &buf);
 
     var stats = Stats{};
@@ -115,7 +160,9 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                     if (c.width != w or c.height != h) {
                         w = c.width;
                         h = c.height;
-                        try resize(dpy, visual, depth, use_shm, &buf, w, h);
+                        if (gpu == null) try resize(dpy, visual, depth, use_shm, &buf, w, h);
+                        buf.width = w;
+                        buf.height = h;
                         rend.invalidate();
                         need_frame = true;
                     }
@@ -179,8 +226,22 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
         if (need_frame and mapped and !presenting and (uncapped or now >= next_frame)) {
             need_frame = false;
             buildAndDraw(state, view, &ctx, &sc, &rend, &fonts, &buf, scale, &timer, &stats);
-            presentDamage(dpy, win, gc, &buf, rend.scrolls.items, rend.damage.items, use_shm, &stats, &timer);
-            presenting = use_shm and rend.damage.items.len > 0;
+            if (gpu) |*g| {
+                // The whole frame, when anything in it changed.
+                if (rend.damage.items.len > 0) {
+                    const t0 = timer.read();
+                    g.draw(&sc, &fonts, w, h) catch |e| std.log.err("myzig: OpenGL frame: {s}", .{@errorName(e)});
+                    if (dump) |path| {
+                        dumpFrame(gpa, g, w, h, path) catch {};
+                        return;
+                    }
+                    glx.?.swapBuffers(dpy, win);
+                    stats.raster_ns += timer.read() - t0;
+                }
+            } else {
+                presentDamage(dpy, win, gc, &buf, rend.scrolls.items, rend.damage.items, use_shm, &stats, &timer);
+                presenting = use_shm and rend.damage.items.len > 0;
+            }
             if (ctx.animating or ctx.requested) need_frame = true;
             next_frame = if (now - next_frame < period) next_frame + period else now + period;
             continue;
@@ -243,6 +304,19 @@ fn presentDamage(dpy: *x.Display, win: x.Window, gc: x.GC, buf: *Buffer, scrolls
     }
     _ = x.XFlush(dpy);
     stats.present_ns += timer.read() - t0;
+}
+
+fn dumpFrame(gpa: std.mem.Allocator, g: *glr.Renderer, w: i32, h: i32, path: []const u8) !void {
+    const px = try gpa.alloc(u32, @intCast(w * h));
+    defer gpa.free(px);
+    g.read(w, h, px);
+    var f = try std.fs.cwd().createFile(path, .{});
+    defer f.close();
+    var wbuf: [64 << 10]u8 = undefined;
+    var fw = f.writer(&wbuf);
+    try fw.interface.print("P6\n{d} {d}\n255\n", .{ w, h });
+    for (px) |p| try fw.interface.writeAll(&.{ @truncate(p >> 16), @truncate(p >> 8), @truncate(p) });
+    try fw.interface.flush();
 }
 
 fn resize(dpy: *x.Display, visual: *x.Visual, depth: c_int, use_shm: bool, buf: *Buffer, w: i32, h: i32) !void {

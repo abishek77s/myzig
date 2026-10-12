@@ -177,6 +177,9 @@ pub const Renderer = struct {
     /// off: it only ever presents what was drawn this frame, and the
     /// server moves scrolled pixels itself, so the canvas need not.
     retain_pixels: bool = true,
+    /// raster draws the damage on the CPU. A GPU renderer turns it off and
+    /// uses the damage only to know whether the frame changed at all.
+    raster: bool = true,
     last_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     cur_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     damage: std.ArrayListUnmanaged(IRect) = .empty,
@@ -217,7 +220,7 @@ pub const Renderer = struct {
             for (r.last.items) |*op| if (!r.cur_hashes.contains(op.hash)) r.addDamage(r.moved(op));
         }
         r.mergeDamage(cv.bounds());
-        for (r.damage.items) |d| r.drawArea(s, fonts, cv, d);
+        if (r.raster) for (r.damage.items) |d| r.drawArea(s, fonts, cv, d);
         // Keep this scene for the next diff.
         r.last.clearRetainingCapacity();
         r.last_layers.clearRetainingCapacity();
@@ -395,28 +398,40 @@ pub fn drawOp(s: *const Scene, fonts: *text.Fonts, cv: *const raster.Canvas, op:
             }
         },
         .text => {
-            const px = op.size * k;
-            const face = fonts.face(op.weight);
-            const sc = face.scale(px);
-            var pen = op.rect.x * k;
-            const base: i32 = @intFromFloat(@round(op.rect.y * k));
-            var prev: u32 = 0;
-            var it = text.Utf8Iter{ .s = s.string(op) };
-            while (it.next()) |cp| {
-                const g = face.glyph(cp);
-                if (prev != 0) pen += fonts.kern(op.weight, prev, g) * sc;
-                prev = g;
-                const fl = @floor(pen);
-                const phase: u2 = @intFromFloat(@min(3, @floor((pen - fl) * 4)));
-                if (fonts.glyphAt(op.weight, px, g, phase)) |gl| {
-                    if (gl.w > 0) {
-                        const gx = @as(i32, @intFromFloat(fl)) + gl.x0;
-                        const gy = base + gl.y0;
-                        cv.mask(fonts.coverage.items[gl.off..][0 .. @as(usize, gl.w) * gl.h], gl.w, gl.h, gx, gy, op.color, clip);
-                    }
+            const Ctx = struct {
+                cv: *const raster.Canvas,
+                fonts: *text.Fonts,
+                color: Color,
+                clip: IRect,
+                fn glyph(c: @This(), gx: i32, gy: i32, gl: text.Glyph) void {
+                    c.cv.mask(c.fonts.coverage.items[gl.off..][0 .. @as(usize, gl.w) * gl.h], gl.w, gl.h, gx, gy, c.color, c.clip);
                 }
-                pen += face.advance(cp, g) * sc;
-            }
+            };
+            glyphs(s, fonts, op, Ctx{ .cv = cv, .fonts = fonts, .color = op.color, .clip = clip }, Ctx.glyph);
         },
+    }
+}
+
+/// glyphs lays out the text of op, as every renderer draws it: each glyph
+/// at a whole device pixel, rasterized at the quarter pixel of its pen.
+pub fn glyphs(s: *const Scene, fonts: *text.Fonts, op: *const Op, ctx: anytype, comptime emit: fn (@TypeOf(ctx), i32, i32, text.Glyph) void) void {
+    const k = s.scale;
+    const px = op.size * k;
+    const face = fonts.face(op.weight);
+    const sc = face.scale(px);
+    var pen = op.rect.x * k;
+    const base: i32 = @intFromFloat(@round(op.rect.y * k));
+    var prev: u32 = 0;
+    var it = text.Utf8Iter{ .s = s.string(op) };
+    while (it.next()) |cp| {
+        const g = face.glyph(cp);
+        if (prev != 0) pen += fonts.kern(op.weight, prev, g) * sc;
+        prev = g;
+        const fl = @floor(pen);
+        const phase: u2 = @intFromFloat(@min(3, @floor((pen - fl) * 4)));
+        if (fonts.glyphAt(op.weight, px, g, phase)) |gl| {
+            if (gl.w > 0 and gl.h > 0) emit(ctx, @as(i32, @intFromFloat(fl)) + gl.x0, base + gl.y0, gl);
+        }
+        pen += face.advance(cp, g) * sc;
     }
 }
