@@ -296,7 +296,7 @@ def window(res):
                 # 60 wheel notches a second over the window, as a fast scroll.
                 wid = sh(f"xdotool search --sync --onlyvisible --name List", env={"DISPLAY": d.display}).split()[0]
                 sh(f"xdotool mousemove --window {wid} 300 400", env={"DISPLAY": d.display})
-                wheel = subprocess.Popen(["sh", "-c", f"for i in $(seq {secs * 60 + 120}); do xdotool click 5; sleep 0.0166; done"],
+                wheel = subprocess.Popen(["xdotool", "click", "--repeat", str(secs * 60 + 120), "--delay", "16", "5"],
                                          env=dict(os.environ, DISPLAY=d.display))
             c0 = cpu_s(p.pid)
             t0 = time.perf_counter()

@@ -1,9 +1,12 @@
 # MyZig
 
-**Desktop apps in Zig with native UI that MyZig draws itself.** A port of
-the native UI of [MyGo](https://github.com/egoist/mygo) to Zig: views are Zig
-functions of the app's state, laid out with flexbox, drawn on the CPU and
-shown in an X11 window, with no webview, no GPU driver and no toolkit.
+**Native desktop UI in Zig, drawn by MyZig itself on the GPU (Vulkan or
+OpenGL) or the CPU, on Linux and Windows.** Views are Zig functions of the
+app's state, laid out with flexbox; no webview, no toolkit, no runtime.
+MyZig began as a port of the native UI of [MyGo](https://github.com/egoist/mygo)
+and measures itself against [gpui-fast](https://github.com/longbridge/gpui-fast).
+
+![Gallery](docs/gallery.png)
 
 ```zig
 const myzig = @import("myzig");
@@ -30,83 +33,137 @@ pub fn main() !void {
 }
 ```
 
-The same counter as MyGo's `examples/counter-native`, on the left in MyZig and
-on the right in MyGo:
-
-| MyZig | MyGo |
-| --- | --- |
-| ![MyZig counter](docs/counter-myzig.png) | ![MyGo counter](docs/counter-mygo.png) |
-
 ## Getting started
 
-With [Zig](https://ziglang.org/download/) 0.15.2 and the X11 development
-libraries (`libx11-dev libxext-dev` on Debian and Ubuntu):
+You need [Zig](https://ziglang.org/download/) 0.15.2. Nothing else on
+Windows; on Linux, the X11 development libraries (`libx11-dev libxext-dev`
+on Debian and Ubuntu). The GPU drivers are opened at run time, so building
+needs no Vulkan SDK or OpenGL headers.
 
 ```sh
+zig build gallery                        # every control, with a dark theme
 zig build counter                        # MyGo's counter-native
 zig build quotes                         # a table of prices streaming every frame
-AUTOSCROLL=1 zig build list              # 10,000 rows scrolling themselves
+zig build list                           # 10,000 rows (AUTOSCROLL=1 scrolls them)
 zig build test                           # the views, clicked and typed at without a window
 zig build bench -Doptimize=ReleaseFast   # what a frame costs, headless
 ```
 
-`MYZIG_STATS=1` prints each second the frames drawn and what each cost,
-`MYZIG_SCALE=2` draws at twice the density, and `MYZIG_UNCAPPED=1` draws as
-fast as the X server takes frames instead of at 60 Hz.
+On Windows, in PowerShell:
+
+```powershell
+zig build gallery -Doptimize=ReleaseFast
+$env:MYZIG_RENDERER = "vulkan"; zig build quotes -Doptimize=ReleaseFast
+```
+
+Executables land in `zig-out/bin`. Cross-compiling works from either
+system: `zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast` on
+Linux makes the `.exe` files.
+
+### Settings
+
+| Variable | Effect |
+| --- | --- |
+| `MYZIG_RENDERER=vulkan\|gl\|cpu` | The renderer. By default: Vulkan, else OpenGL, else the CPU. A GPU API that draws on the CPU (llvmpipe, lavapipe, SwiftShader, Microsoft's GDI) is used only when named here, because MyZig's own CPU renderer, which draws only what changed, is cheaper. |
+| `MYZIG_STATS=1` | Prints, each second, the frames drawn and what each cost. |
+| `MYZIG_SCALE=2` | Draws at twice the density (Windows follows the monitor's DPI by itself). |
+| `MYZIG_UNCAPPED=1` | Draws as fast as it can instead of at the display's rate. |
+| `MYZIG_VK_VALIDATION=1` | Enables the Vulkan validation layer, where it is installed. |
+| `MYZIG_FONT`, `MYZIG_FONT_BOLD` | The fonts' paths (TrueType or OpenType). |
+
+## What it has
+
+**Renderers.** All three draw the same pixels; the tests check Vulkan's
+against the CPU's.
+
+- **Vulkan** (X11 through `VK_KHR_xlib_surface`, Windows through
+  `VK_KHR_win32_surface`): the whole frame is one instanced draw. Boxes are
+  shaded from their signed distance (rounded corners, borders, soft
+  shadows), glyphs sample a coverage atlas, icons are strokes, and two
+  frames are in flight. SPIR-V is checked in (`zig build shaders` remakes
+  it from `src/gpu/shaders`).
+- **OpenGL 3.3** (GLX, WGL): the same draw and shader.
+- **CPU**: anti-aliased spans, drawing only the rectangles that changed and
+  presenting only those (MIT-SHM on X11, `StretchDIBits` on Windows).
+
+**Controls.** Buttons, text inputs (selection, word moves, the clipboard,
+passwords, a blinking caret), checkboxes, radio buttons, toggles, sliders,
+progress bars, selects with a popup list, tooltips, modal dialogs,
+virtualized lists, scroll views, dividers and spacers; text that wraps; a
+light and a dark theme. Every control takes the keyboard focus, which Tab
+and Shift+Tab move, and Space and Enter press.
+
+**Platforms.** Linux on X11 (Wayland through XWayland) and Windows 10 and
+later, with per-monitor DPI, typed text through the platform's input
+method, the clipboard, cursor shapes, and frames paced by the display.
 
 ## How it works
 
 ```
- view (Zig) ──► ui: build, measure, arrange, paint ──► scene: ops, hashed ──► renderer: diff, damage, CPU raster ──► X11 (MIT-SHM)
+ view (Zig) ─► ui: build, measure, arrange, paint ─► scene: ops, hashed ─► diff: damage ─► Vulkan │ OpenGL │ CPU
 ```
 
 - **Views are rebuilt, pixels are not.** A view runs only when input, a
-  resize or an animation asks for a frame; nothing polls, and an idle window
-  takes no CPU. The tree it builds lives in arrays the context reuses, so a
-  frame that builds what the last one built allocates nothing.
+  resize, a timer or an animation asks for a frame; nothing polls, and an
+  idle window takes no CPU. A caret blinks on a timer, not with a frame
+  every display refresh. The tree a view builds lives in arrays the context
+  reuses, so a frame that builds what the last one built allocates nothing.
 - **Damage from hashes.** Painting writes a display list; every op is
-  hashed with its content, place and clip. The renderer compares the hashes
-  with the last frame's and draws again only the rectangles of ops that
-  came, went or changed, merged so that no pixel is drawn twice, and the
-  window presents only those rectangles from shared memory.
+  hashed with its content, place and clip, and only what came, went or
+  changed is drawn again: on the CPU, its rectangles; on the GPU, the frame
+  is drawn only when something changed.
 - **Scroll layers.** A scrolled list is a layer whose ops hash where they
-  are in its content, so scrolling changes none of them: the X server
-  moves the layer's pixels (`XCopyArea`) and MyZig draws only the strip
-  that scrolled into view, the idea of
-  [gpui-fast](https://github.com/longbridge/gpui-fast)'s scroll layers on
-  the CPU.
+  are in its content, so scrolling changes none of them: the window moves
+  the layer's pixels and MyZig draws only the strip that scrolled into
+  view, the idea of gpui-fast's scroll layers.
 - **Retained text.** Glyphs are rasterized once per face, size and quarter
   pixel, and text widths are memoized, so a label that comes back frame
   after frame costs a hash lookup.
 - **Clicks show in the frame that reports them.** When a view acts on
-  input (a button reports a click, a shortcut fires), the frame is built
-  again before it paints, as MyGo rebuilds after callback actions.
-- **Small.** Fonts are drawn with
-  [stb_truetype](https://github.com/nothings/stb) behind a five-function C
-  surface, and Xlib is declared by hand rather than translated from its
-  headers, which keeps C translation out of every build.
+  input, the frame is built again before it paints.
+- **Small.** Fonts are drawn with [stb_truetype](https://github.com/nothings/stb);
+  Xlib, Win32 and Vulkan are declared by hand rather than translated from
+  headers, and drivers are loaded only when a window draws with them.
 
-`myzig.Headless` runs a view without a window, as MyGo's `ui.Tester` does:
-it clicks labels, presses keys and scrolls, and its frames are the pixels a
-window would show. The list's test checks that frames drawn incrementally
-while scrolling match frames drawn from scratch, pixel for pixel.
+`myzig.Headless` runs a view without a window: it clicks, types, drags,
+scrolls and advances time, and its frames are the pixels a window would
+show.
 
 ## Benchmarks
 
-See [bench/README.md](bench/README.md) for the numbers, how they were
-measured and how to reproduce them.
+MyZig against MyGo and gpui-fast on the same machine (4 cores of a Xeon at
+2.8 GHz, no GPU, Xvfb); the samples are the same apps in each. See
+[bench/README.md](bench/README.md) for how each number is measured and how
+to reproduce them.
 
-## What is ported
+| | MyZig | MyGo | gpui-fast |
+| --- | --- | --- | --- |
+| Counter executable | **220 KB** (ReleaseSmall), 349 KB (ReleaseFast) | 11.6 MB | 22.3 MB |
+| Counter window, memory (PSS) | **2.8 MB** | 84.7 MB | 125.1 MB |
+| Quotes window, memory (PSS) | **4.5 MB** | 102.3 MB | |
+| Clean build, debug / release | **13.3 s** / **18.0 s** | 20.3 s / 19.9 s | 149 s / 280 s |
+| Rebuild after an edit, debug / release | **0.97 s** / 8.5 s | 0.97 s / **0.68 s** | 3.4 s / 63 s |
+| Quotes streaming in a window, CPU a frame | **0.55 ms** (60 fps, 3.3% CPU) | 6.4 ms (60 fps, 39% CPU) | |
+| Quotes uncapped | **2,362 fps** | | |
+| List scrolled by the wheel, CPU a frame | **0.35 ms** (60 fps) | 6.0 ms (58 fps) | |
+| Headless frame, counter unchanged | **0.003 ms** | 0.022 ms | 0.007 ms¹ |
+| Headless frame, quotes streaming | **0.33 ms** (0.10 ms before raster) | 3.5 ms | 1.12 ms¹ |
+| Headless frame, list scrolling | **0.039 ms**² | 1.9 ms | 0.28 ms¹ |
 
-MyGo is a whole desktop framework: web pages in the system webview with
-typed IPC, native UI with dozens of widgets, menus, dialogs, tray, updates,
-installers, and macOS, Windows, Linux and browser backends. MyZig ports the
-core of its native UI on Linux X11: the view model, flexbox rows and
-columns, text, buttons, virtualized lists, keyboard shortcuts, the CPU
-renderer with damage tracking, and the headless tester. Webviews, text
-editing, the other widgets, and other platforms are not ported yet.
+¹ gpui-fast's CPU time before rasterization, which it leaves to the GPU;
+MyZig's whole frame includes rasterizing on the CPU. ² With the window
+moving the scrolled pixels, as it does on X11 and Windows (0.36 ms when
+MyZig moves them itself). There is no GPU on the benchmark machine, so
+gpui-fast has no window numbers and MyZig's windows draw on the CPU.
+
+## Status
+
+MyZig is young. Not there yet: macOS, native Wayland, images, rich text and
+multi-line text editing, input method composition (pre-edit), drag and
+drop, and accessibility. MyGo's webview side (web pages in the system
+webview with typed IPC) is not ported.
 
 ## License
 
-MIT. MyZig is a port of MyGo (MIT, © MyGo contributors) and borrows ideas
-from gpui-fast (Apache-2.0). stb_truetype is public domain.
+MIT. MyZig began as a port of MyGo (MIT, © MyGo contributors) and borrows
+ideas from gpui-fast (Apache-2.0). stb_truetype is public domain.
