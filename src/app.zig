@@ -16,7 +16,9 @@ const scene = @import("scene.zig");
 const raster = @import("raster.zig");
 const geom = @import("geom.zig");
 const choose = @import("gpu/choose.zig");
-const glr = @import("gpu/gl.zig");
+const backend = @import("gpu/backend.zig");
+const glr = backend.glr;
+const vulkan = backend.vulkan;
 const Glx = @import("gpu/glx.zig").Glx;
 
 pub const WindowOptions = struct {
@@ -59,12 +61,13 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     var depth = x.XDefaultDepth(dpy, screen);
     if (depth != 24 and depth != 32) return error.UnsupportedDepth;
 
-    // OpenGL needs its visual before the window exists.
+    // OpenGL needs its visual before the window exists; Vulkan draws to
+    // a window of any, so the window takes OpenGL's when it could be
+    // the one that draws.
     const choice = choose.choose();
     var glx: ?Glx = null;
     var vi: ?*x.XVisualInfo = null;
-    if (choice.kind != .cpu) {
-        if (choice.kind == .vulkan) std.log.warn("myzig: Vulkan is not ready on X11 yet; drawing with OpenGL", .{});
+    if (choice.kind == .gl or (choice.kind == .vulkan and !choice.forced)) {
         if (Glx.open()) |g| {
             glx = g;
             vi = glx.?.visual(dpy, screen) catch null;
@@ -103,28 +106,43 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     var rend = scene.Renderer{ .gpa = gpa, .retain_pixels = false };
     defer rend.deinit();
 
-    // The GPU renderer, where one draws.
-    var gpu: ?glr.Renderer = null;
+    // The GPU renderer, where one draws: Vulkan's, else OpenGL's. One
+    // that draws on the CPU is not used unless it was asked for.
+    var gpu: ?backend.Gpu = null;
     defer if (gpu) |*g| g.deinit();
-    if (glx != null and vi != null) gpu: {
+    if (choice.kind == .vulkan) vk: {
+        var r = vulkan.Renderer.init(gpa, .{ .xlib = .{ .dpy = dpy, .window = win } }, w, h, .{
+            .vsync = !uncapped,
+            .validation = env.has("MYZIG_VK_VALIDATION"),
+        }) catch |e| {
+            if (choice.forced) std.log.warn("myzig: no Vulkan ({s}); drawing on the CPU", .{@errorName(e)});
+            break :vk;
+        };
+        if (!choice.forced and r.software()) {
+            r.deinit();
+            break :vk;
+        }
+        gpu = .{ .vulkan = r };
+    }
+    if (gpu == null and glx != null and vi != null) gpu: {
         glx.?.context(dpy, win) catch |e| {
             std.log.warn("myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(e)});
             break :gpu;
         };
         const gl = glr.Gl.load(&glx.?, Glx.proc) catch break :gpu;
-        gpu = glr.Renderer.init(gpa, gl) catch break :gpu;
-        const name = gpu.?.name();
-        if (!choice.forced and glr.software(name)) {
-            gpu.?.deinit();
-            gpu = null;
+        var r = glr.Renderer.init(gpa, gl) catch break :gpu;
+        if (!choice.forced and glr.software(r.name())) {
+            r.deinit();
             glx.?.release(dpy);
             break :gpu;
         }
-        if (print_stats) std.debug.print("myzig: drawing with OpenGL on {s}\n", .{name});
+        gpu = .{ .gl = r };
     }
+    if (gpu) |*g| if (print_stats) std.debug.print("myzig: drawing with {s} on {s}\n", .{ g.api(), g.name() });
     defer if (glx) |*g| g.release(dpy);
     if (gpu != null) rend.raster = false;
     const dump = env.get("MYZIG_DUMP");
+    if (dump != null) if (gpu) |*g| g.capture();
 
     var buf = Buffer{};
     if (gpu == null) try resize(dpy, visual, depth, use_shm, &buf, w, h);
@@ -230,12 +248,12 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                 // The whole frame, when anything in it changed.
                 if (rend.damage.items.len > 0) {
                     const t0 = timer.read();
-                    g.draw(&sc, &fonts, w, h) catch |e| std.log.err("myzig: OpenGL frame: {s}", .{@errorName(e)});
+                    g.draw(&sc, &fonts, w, h) catch |e| std.log.err("myzig: {s} frame: {s}", .{ g.api(), @errorName(e) });
                     if (dump) |path| {
-                        dumpFrame(gpa, g, w, h, path) catch {};
+                        backend.writePPM(gpa, g, w, h, path) catch {};
                         return;
                     }
-                    glx.?.swapBuffers(dpy, win);
+                    if (g.* == .gl) glx.?.swapBuffers(dpy, win);
                     stats.raster_ns += timer.read() - t0;
                 }
             } else {
@@ -304,19 +322,6 @@ fn presentDamage(dpy: *x.Display, win: x.Window, gc: x.GC, buf: *Buffer, scrolls
     }
     _ = x.XFlush(dpy);
     stats.present_ns += timer.read() - t0;
-}
-
-fn dumpFrame(gpa: std.mem.Allocator, g: *glr.Renderer, w: i32, h: i32, path: []const u8) !void {
-    const px = try gpa.alloc(u32, @intCast(w * h));
-    defer gpa.free(px);
-    g.read(w, h, px);
-    var f = try std.fs.cwd().createFile(path, .{});
-    defer f.close();
-    var wbuf: [64 << 10]u8 = undefined;
-    var fw = f.writer(&wbuf);
-    try fw.interface.print("P6\n{d} {d}\n255\n", .{ w, h });
-    for (px) |p| try fw.interface.writeAll(&.{ @truncate(p >> 16), @truncate(p >> 8), @truncate(p) });
-    try fw.interface.flush();
 }
 
 fn resize(dpy: *x.Display, visual: *x.Visual, depth: c_int, use_shm: bool, buf: *Buffer, w: i32, h: i32) !void {

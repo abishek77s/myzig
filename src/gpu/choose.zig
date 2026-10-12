@@ -1,5 +1,6 @@
 //! Which renderer a window draws with: MYZIG_RENDERER=cpu, gl or vulkan,
-//! or by default a GPU's where there is one and the CPU's elsewhere.
+//! or by default a GPU's where there is one (Vulkan, else OpenGL) and the
+//! CPU's elsewhere.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -20,7 +21,8 @@ pub fn choose() Choice {
         if (std.mem.eql(u8, v, "gl") or std.mem.eql(u8, v, "opengl")) return .{ .kind = .gl, .forced = true };
         if (std.mem.eql(u8, v, "vulkan") or std.mem.eql(u8, v, "vk")) return .{ .kind = .vulkan, .forced = true };
     }
-    return .{ .kind = if (hasGpu()) .gl else .cpu, .forced = false };
+    // Vulkan first; the window falls back to OpenGL, then to the CPU.
+    return .{ .kind = if (hasGpu()) .vulkan else .cpu, .forced = false };
 }
 
 /// hasGpu reports whether a GPU is there to draw with. On Linux that is a

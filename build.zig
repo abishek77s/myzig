@@ -60,6 +60,16 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     b.step("bench", "Time headless frames of each workload").dependOn(&run_bench.step);
 
+    // The Vulkan shaders are checked in as SPIR-V, so building needs no
+    // shader compiler; after editing src/gpu/shaders, run this step.
+    const shaders = b.step("shaders", "Compile the Vulkan shaders to SPIR-V (needs glslangValidator)");
+    inline for (.{ "box.vert", "box.frag" }) |sh| {
+        const c = b.addSystemCommand(&.{ "glslangValidator", "-V", "--quiet", "-o" });
+        c.addFileArg(b.path("src/gpu/shaders/" ++ sh ++ ".spv"));
+        c.addFileArg(b.path("src/gpu/shaders/" ++ sh));
+        shaders.dependOn(&c.step);
+    }
+
     const unit = b.addTest(.{ .root_module = mod });
     test_step.dependOn(&b.addRunArtifact(unit).step);
 }

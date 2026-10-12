@@ -39,4 +39,5 @@ test {
     _ = geom;
     _ = raster;
     _ = @import("gpu/instances.zig");
+    _ = @import("gpu/vulkan.zig");
 }
