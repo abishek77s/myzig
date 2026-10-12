@@ -55,10 +55,16 @@ pub fn Headless(comptime State: type) type {
             h.gpa.free(h.pixels);
         }
 
-        /// frame builds, lays out and draws one frame.
+        /// frame builds, lays out and draws one frame, at the time of the
+        /// last.
         pub fn frame(h: *Self) void {
+            h.frameAt(h.ctx.frame_time);
+        }
+
+        /// frameAt is frame at the time now (ns), for timers.
+        pub fn frameAt(h: *Self, now: u64) void {
             var timer = std.time.Timer.start() catch unreachable;
-            h.ctx.build(h.state, h.view, @as(f32, @floatFromInt(h.width)) / h.scale, @as(f32, @floatFromInt(h.height)) / h.scale, 0);
+            h.ctx.build(h.state, h.view, @as(f32, @floatFromInt(h.width)) / h.scale, @as(f32, @floatFromInt(h.height)) / h.scale, now);
             h.scene.reset(h.width, h.height, h.scale, h.ctx.theme.background);
             h.ctx.endFrame(&h.scene);
             const t1 = timer.read();

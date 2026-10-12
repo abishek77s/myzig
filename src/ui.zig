@@ -165,6 +165,9 @@ pub const TextOpts = struct {
     width: ?f32 = null,
     @"align": Align = .start,
     grow: f32 = 0,
+    /// wrap breaks the text into lines at spaces (and at newlines) to fit
+    /// the width it is given.
+    wrap: bool = false,
 };
 
 pub const ButtonOpts = struct {
@@ -302,9 +305,21 @@ pub const Clipboard = struct {
 
 const none: u32 = std.math.maxInt(u32);
 
-const Kind = enum(u8) { box, text, button, list, scroll, checkbox, radio, toggle, slider, progress, input, divider };
+const Kind = enum(u8) { box, text, button, list, scroll, checkbox, radio, toggle, slider, progress, input, divider, overlay, select, option };
 
-const Flags = packed struct(u8) {
+/// Place is where an overlay goes: below its anchor (a popup, flipped
+/// above when it does not fit), at the pointer (a tooltip), or centered (a
+/// modal dialog).
+const Place = enum(u2) { below, pointer, center };
+const OverlayMode = enum(u2) { popup, modal, tip };
+
+// Ids derived from a control's, for what it opens.
+const popup_salt: u64 = 0x706f707570;
+const blocker_salt: u64 = 0x626c6f636b;
+const tip_salt: u64 = 0x746970;
+const tip_delay: u64 = 600 * std.time.ns_per_ms;
+
+const Flags = packed struct(u16) {
     hot: bool = false,
     pressed: bool = false,
     focused: bool = false,
@@ -313,6 +328,8 @@ const Flags = packed struct(u8) {
     primary: bool = false,
     caret: bool = false,
     password: bool = false,
+    wrap: bool = false,
+    _: u7 = 0,
 };
 
 const Node = struct {
@@ -340,13 +357,28 @@ const Node = struct {
     // sliders and progress bars (0..1); a scroll view's content height
     value: f32 = 0,
     input: ?*TextInput = null,
+    // overlays
+    anchor: Rect = .{},
+    place: Place = .below,
+    mode: OverlayMode = .popup,
     // layout
     iw: f32 = 0,
     ih: f32 = 0,
     rect: Rect = .{},
 };
 
-const Hit = struct { id: u64, rect: Rect, list: ?*ListState = null, focusable: bool = false, cursor: Cursor = .arrow };
+const Hit = struct {
+    id: u64,
+    rect: Rect,
+    list: ?*ListState = null,
+    focusable: bool = false,
+    cursor: Cursor = .arrow,
+    /// blocks is set on what an overlay puts under itself: it takes the
+    /// pointer (and the wheel) from what is under it.
+    blocks: bool = false,
+    /// modal is set on a modal dialog's: the focus stays above it.
+    modal: bool = false,
+};
 
 /// Cursor is the pointer's shape over what it is over.
 pub const Cursor = enum(u8) { arrow, text, pointer };
@@ -407,6 +439,14 @@ pub const Context = struct {
     paint_clip: Rect = .{},
     /// cursor is the shape the window gives the pointer, after a frame.
     cursor: Cursor = .arrow,
+    overlays: std.ArrayListUnmanaged(u32) = .empty,
+    /// popup is the select whose options are open, highlight the option
+    /// the keyboard or pointer is on.
+    popup: u64 = 0,
+    highlight: usize = 0,
+    /// tip_id is the control the pointer rests on, since tip_since.
+    tip_id: u64 = 0,
+    tip_since: u64 = 0,
 
     const TextSpan = struct { off: u32, len: u32, rect: Rect, id: u64 };
 
@@ -422,6 +462,7 @@ pub const Context = struct {
         c.next_hits.deinit(c.gpa);
         c.texts.deinit(c.gpa);
         c.own_clipboard.deinit(c.gpa);
+        c.overlays.deinit(c.gpa);
     }
 
     // ---- building ----
@@ -542,6 +583,7 @@ pub const Context = struct {
 
     fn textNode(c: *Context, off: u32, len: u32, o: TextOpts) void {
         _ = c.add(.{
+            .flags = .{ .wrap = o.wrap },
             .kind = .text,
             .str_off = off,
             .str_len = len,
@@ -938,6 +980,183 @@ pub const Context = struct {
         c.stack.append(c.gpa, i) catch {};
     }
 
+    // ---- overlays ----
+
+    fn beginOverlay(c: *Context, id: u64, anchor: Rect, place: Place, mode: OverlayMode, b: Box) void {
+        const i: u32 = @intCast(c.nodes.items.len);
+        c.nodes.append(c.gpa, .{ .kind = .overlay, .dir = .column, .box = b, .id = id, .anchor = anchor, .place = place, .mode = mode }) catch {
+            c.stack.append(c.gpa, 0) catch {};
+            return;
+        };
+        c.overlays.append(c.gpa, i) catch {};
+        c.stack.append(c.gpa, i) catch {};
+    }
+
+    pub const SelectOpts = struct {
+        width: ?f32 = null,
+        placeholder: []const u8 = "Select…",
+        disabled: bool = false,
+        key: ?[]const u8 = null,
+    };
+
+    /// select chooses one of options into selected (an index; out of range
+    /// for none) from a popup list: a click opens it, the arrows move in
+    /// it, Enter or a click chooses, Escape or a click outside closes it.
+    /// Closed, the arrows step through the options. It reports whether
+    /// selected changed.
+    pub fn select(c: *Context, options: []const []const u8, selected: *usize, o: SelectOpts) bool {
+        const t = c.theme;
+        const has = selected.* < options.len;
+        const off, const len = c.str(if (has) options[selected.*] else o.placeholder);
+        var widest = c.fonts.measure(.regular, t.font_size, o.placeholder);
+        for (options) |opt| widest = @max(widest, c.fonts.measure(.regular, t.font_size, opt));
+        const i = c.add(.{
+            .kind = .select,
+            .str_off = off,
+            .str_len = len,
+            .size = t.font_size,
+            .color = if (has) t.text else t.text_muted,
+            .value = widest,
+            .box = .{ .width = o.width, .radius = t.radius, .padding_x = t.space(2.5) },
+        }, o.key orelse "select");
+        if (i == none) return false;
+        const id = c.nodes.items[i].id;
+        const in = c.interactKeys(id, o.disabled, false);
+        const before = selected.*;
+        var shown = c.popup == id and !o.disabled;
+        if (c.popup == id and !shown) c.popup = 0;
+        if (in.clicked) {
+            shown = !shown;
+            if (shown) c.highlight = if (has) selected.* else 0;
+        }
+        if (in.focused and options.len > 0) for (c.input.keys[0..c.input.nkeys]) |*k| {
+            if (k.used) continue;
+            switch (k.key) {
+                .space, .enter => if (shown) {
+                    selected.* = @min(c.highlight, options.len - 1);
+                    shown = false;
+                } else {
+                    shown = true;
+                    c.highlight = if (has) selected.* else 0;
+                },
+                .escape => if (shown) {
+                    shown = false;
+                } else continue,
+                .up => if (shown) {
+                    c.highlight -|= 1;
+                } else {
+                    selected.* = if (has) selected.* -| 1 else 0;
+                },
+                .down => if (shown) {
+                    c.highlight = @min(c.highlight + 1, options.len - 1);
+                } else {
+                    selected.* = if (has) @min(selected.* + 1, options.len - 1) else 0;
+                },
+                else => continue,
+            }
+            k.used = true;
+            c.acted = true;
+        };
+        // A click outside closes the popup.
+        if (shown and c.input.clicked == id ^ popup_salt ^ blocker_salt) {
+            c.input.clicked = 0;
+            shown = false;
+            c.acted = true;
+        }
+        if (shown) if (c.lastRect(id)) |anchor| {
+            c.beginOverlay(id ^ popup_salt, anchor, .below, .popup, .{ .padding = 4, .@"align" = .stretch });
+            const first: u32 = @intCast(c.nodes.items.len);
+            for (options, 0..) |opt, k| {
+                const oo, const ol = c.str(opt);
+                const oi = c.add(.{ .kind = .option, .str_off = oo, .str_len = ol, .size = t.font_size, .color = t.text, .first_index = @intCast(k) }, null);
+                if (oi == none) continue;
+                const on = &c.nodes.items[oi];
+                const oin = c.interactKeys(on.id, false, false);
+                if (oin.hot and c.input.hot != 0) c.highlight = k;
+                if (oin.clicked) {
+                    selected.* = k;
+                    shown = false;
+                }
+            }
+            // The highlight, where the pointer or the keys left it.
+            for (c.nodes.items[first..]) |*on| if (on.kind == .option and on.parent == first - 1) {
+                on.flags = .{ .on = on.first_index == selected.*, .hot = on.first_index == c.highlight };
+            };
+            c.end();
+        } else {
+            c.requested = true; // its place is known after this frame
+        };
+        c.popup = if (shown) id else if (c.popup == id) 0 else c.popup;
+        const n = &c.nodes.items[i];
+        n.flags = .{ .hot = in.hot, .focused = in.focused, .on = shown, .disabled = o.disabled };
+        if (selected.* != before) c.acted = true;
+        return selected.* != before;
+    }
+
+    /// tooltip shows s by the pointer when it rests on the control built
+    /// last, for a moment.
+    pub fn tooltip(c: *Context, s: []const u8) void {
+        if (c.nodes.items.len == 0) return;
+        const id = c.nodes.items[c.nodes.items.len - 1].id;
+        if (c.input.hot != id or c.input.active != 0) {
+            if (c.tip_id == id) c.tip_id = 0;
+            return;
+        }
+        if (c.tip_id != id) {
+            c.tip_id = id;
+            c.tip_since = c.frame_time;
+        }
+        const due = c.tip_since + tip_delay;
+        if (c.frame_time < due) return c.wakeAt(due);
+        c.beginOverlay(id ^ tip_salt, .{ .x = c.input.x, .y = c.input.y }, .pointer, .tip, .{ .padding_x = 8, .padding_y = 5, .width = null });
+        c.text(s, .{ .size = 12, .color = c.theme.background });
+        c.end();
+    }
+
+    pub const ModalOpts = struct {
+        title: ?[]const u8 = null,
+        width: f32 = 400,
+        /// dismissable lets Escape and a click outside close the dialog.
+        dismissable: bool = true,
+        key: ?[]const u8 = null,
+    };
+
+    /// beginModal shows a dialog over the window while open is set: it
+    /// reports whether it does, and then the caller builds its content and
+    /// ends it with endModal. Escape or a click outside clear open.
+    ///
+    ///     if (c.beginModal(&s.confirm, .{ .title = "Delete?" })) {
+    ///         defer c.endModal();
+    ///         ...
+    ///     }
+    pub fn beginModal(c: *Context, is_open: *bool, o: ModalOpts) bool {
+        if (!is_open.*) return false;
+        const id = std.hash.Wyhash.hash(0x6d6f64616c, o.key orelse "modal");
+        if (o.dismissable) {
+            if (c.input.clicked == id ^ blocker_salt) {
+                c.input.clicked = 0;
+                is_open.* = false;
+                c.acted = true;
+                return false;
+            }
+            for (c.input.keys[0..c.input.nkeys]) |*k| if (!k.used and k.key == .escape) {
+                k.used = true;
+                is_open.* = false;
+                c.acted = true;
+                return false;
+            };
+        }
+        // Just opened: the focus leaves what is under it.
+        if (c.lastRect(id ^ blocker_salt) == null) c.input.focus = 0;
+        c.beginOverlay(id, .{}, .center, .modal, .{ .width = o.width, .padding = 20, .gap = 14 });
+        if (o.title) |title| c.text(title, .{ .size = 16, .bold = true });
+        return true;
+    }
+
+    pub fn endModal(c: *Context) void {
+        c.end();
+    }
+
     // ---- frames ----
 
     /// build runs view for a frame of width×height, twice when it acted on
@@ -965,7 +1184,16 @@ pub const Context = struct {
         for (c.input.keys[0..c.input.nkeys]) |*k| {
             if (k.used or k.key != .tab) continue;
             k.used = true;
-            const items = c.hits.items;
+            var items = c.hits.items;
+            // A modal dialog keeps the focus.
+            var m = items.len;
+            while (m > 0) {
+                m -= 1;
+                if (items[m].modal) {
+                    items = items[m + 1 ..];
+                    break;
+                }
+            }
             var at: ?usize = null;
             for (items, 0..) |h, idx| if (h.focusable and h.id == c.input.focus) {
                 at = idx;
@@ -994,6 +1222,7 @@ pub const Context = struct {
         c.animating = false;
         c.requested = false;
         c.wake_at = 0;
+        c.overlays.clearRetainingCapacity();
         c.frame_time = now;
         c.frames += 1;
         // The root fills the window.
@@ -1008,13 +1237,15 @@ pub const Context = struct {
         c.input.clicked = 0;
         c.input.pressed = 0;
         if (c.nodes.items.len == 0) return;
-        _ = c.measure(0);
+        _ = c.measure(0, c.width);
         c.arrange(0, .{ .x = 0, .y = 0, .w = c.width, .h = c.height });
         c.next_hits.clearRetainingCapacity();
         c.texts.clearRetainingCapacity();
         s.background = c.theme.background;
         c.paint_clip = .{ .x = 0, .y = 0, .w = c.width, .h = c.height };
         c.paint(0, s);
+        // Overlays, over everything, in the order they were opened.
+        for (c.overlays.items) |oi| c.placeOverlay(oi, s);
         std.mem.swap(std.ArrayListUnmanaged(Hit), &c.hits, &c.next_hits);
         // The focus is lost with its control.
         if (c.input.focus != 0 and c.lastRect(c.input.focus) == null) c.input.focus = 0;
@@ -1035,6 +1266,38 @@ pub const Context = struct {
         };
     }
 
+    fn placeOverlay(c: *Context, oi: u32, s: *Scene) void {
+        const m = c.measure(oi, c.width - 32);
+        const on = &c.nodes.items[oi];
+        const margin: f32 = 8;
+        var w = @max(m[0], if (on.place == .below) on.anchor.w else 0);
+        w = @min(w, c.width - 2 * margin);
+        const h = @min(m[1], c.height - 2 * margin);
+        var x: f32 = 0;
+        var y: f32 = 0;
+        switch (on.place) {
+            .below => {
+                x = on.anchor.x;
+                y = on.anchor.y + on.anchor.h + 4;
+                if (y + h > c.height - margin and on.anchor.y - h - 4 >= margin) y = on.anchor.y - h - 4;
+            },
+            .pointer => {
+                x = on.anchor.x;
+                y = on.anchor.y + 22;
+                if (y + h > c.height - margin) y = on.anchor.y - h - 8;
+            },
+            .center => {
+                x = (c.width - w) / 2;
+                y = (c.height - h) / 2;
+            },
+        }
+        x = std.math.clamp(x, margin, @max(margin, c.width - w - margin));
+        y = std.math.clamp(y, margin, @max(margin, c.height - h - margin));
+        c.arrange(oi, .{ .x = x, .y = y, .w = w, .h = h });
+        c.paint_clip = .{ .x = 0, .y = 0, .w = c.width, .h = c.height };
+        c.paint(oi, s);
+    }
+
     fn labelWidth(c: *Context, n: *const Node) f32 {
         if (n.str_len == 0) return 0;
         return c.fonts.measure(n.weight, n.size, c.strings.items[n.str_off..][0..n.str_len]);
@@ -1045,7 +1308,9 @@ pub const Context = struct {
     const toggle_h: f32 = 20;
     const label_gap: f32 = 8;
 
-    fn measure(c: *Context, i: u32) [2]f32 {
+    /// measure sizes node i and what is in it, given avail of width (what
+    /// wrapped text fits in).
+    fn measure(c: *Context, i: u32, avail: f32) [2]f32 {
         var n = &c.nodes.items[i];
         var w: f32 = 0;
         var h: f32 = 0;
@@ -1053,6 +1318,18 @@ pub const Context = struct {
             .text => {
                 w = c.labelWidth(n);
                 h = c.fonts.metrics(n.weight, n.size).line_height;
+                const limit = n.box.width orelse avail;
+                if (n.flags.wrap and (w > limit or std.mem.indexOfScalar(u8, c.strings.items[n.str_off..][0..n.str_len], '\n') != null)) {
+                    var it = c.lines(n, limit);
+                    var lines_: f32 = 0;
+                    var widest: f32 = 0;
+                    while (it.next()) |ln| {
+                        lines_ += 1;
+                        widest = @max(widest, ln.width);
+                    }
+                    w = widest;
+                    h *= @max(1, lines_);
+                }
             },
             .button => {
                 w = c.labelWidth(n) + 2 * (n.box.padding_x orelse 0);
@@ -1072,6 +1349,14 @@ pub const Context = struct {
                 w = 200;
                 h = 8;
             },
+            .select => {
+                w = n.value + 2 * (n.box.padding_x orelse 0) + 18;
+                h = c.fonts.metrics(.regular, n.size).line_height + 2 * c.theme.space(2);
+            },
+            .option => {
+                w = c.labelWidth(n) + 28 + 12;
+                h = c.fonts.metrics(.regular, n.size).line_height + 12;
+            },
             .input => {
                 w = 240;
                 h = c.fonts.metrics(.regular, n.size).line_height + 2 * c.theme.space(2);
@@ -1082,26 +1367,47 @@ pub const Context = struct {
             },
             .list => {
                 var ch = n.first;
-                while (ch != none) : (ch = c.nodes.items[ch].next) _ = c.measure(ch);
+                const inner = n.box.width orelse avail;
+                while (ch != none) : (ch = c.nodes.items[ch].next) _ = c.measure(ch, inner);
             },
-            .box, .scroll => {
+            .box, .scroll, .overlay => {
                 const px = n.box.padding_x orelse n.box.padding;
                 const py = n.box.padding_y orelse n.box.padding;
-                var ch = n.first;
+                const inner = @max(0, (n.box.width orelse avail) - 2 * px);
+                const row_dir = n.dir == .row;
                 var k: u32 = 0;
+                var flexible: u32 = 0;
+                // A row measures its fixed children first: the ones that
+                // flex (grow, or wrap) share the width they leave.
+                var ch = n.first;
                 while (ch != none) : (ch = c.nodes.items[ch].next) {
-                    const m = c.measure(ch);
-                    if (n.dir == .row) {
+                    k += 1;
+                    if (row_dir and flexes(&c.nodes.items[ch])) {
+                        flexible += 1;
+                        continue;
+                    }
+                    const m = c.measure(ch, inner);
+                    if (row_dir) {
                         w += m[0];
                         h = @max(h, m[1]);
                     } else {
                         h += m[1];
                         w = @max(w, m[0]);
                     }
-                    k += 1;
+                }
+                n = &c.nodes.items[i];
+                const gaps = if (k > 1) n.box.gap * @as(f32, @floatFromInt(k - 1)) else 0;
+                if (flexible > 0) {
+                    const share = @max(0, inner - w - gaps) / @as(f32, @floatFromInt(flexible));
+                    ch = n.first;
+                    while (ch != none) : (ch = c.nodes.items[ch].next) {
+                        if (!flexes(&c.nodes.items[ch])) continue;
+                        const m = c.measure(ch, share);
+                        w += m[0];
+                        h = @max(h, m[1]);
+                    }
                     n = &c.nodes.items[i];
                 }
-                const gaps = if (k > 1) n.box.gap * @as(f32, @floatFromInt(k - 1)) else 0;
                 if (n.dir == .row) w += gaps else h += gaps;
                 w += 2 * px;
                 h += 2 * py;
@@ -1118,11 +1424,70 @@ pub const Context = struct {
         return .{ n.iw, n.ih };
     }
 
+    /// Lines breaks a wrapped text into lines that fit width: at spaces,
+    /// greedily, and at newlines. A word wider than the width is a line.
+    const Lines = struct {
+        c: *Context,
+        s: []const u8,
+        width: f32,
+        weight: textm.Weight,
+        size: f32,
+        space: f32,
+        i: usize = 0,
+        done: bool = false,
+
+        const Line = struct { text: []const u8, width: f32 };
+
+        fn next(it: *Lines) ?Line {
+            if (it.done) return null;
+            const s = it.s;
+            const start = it.i;
+            var e = start; // the end of the last word that fits
+            var w: f32 = 0;
+            var j = start;
+            while (true) {
+                var k = j;
+                while (k < s.len and s[k] != ' ' and s[k] != '\n') k += 1;
+                const with = w + it.space * @as(f32, @floatFromInt(j - e)) + it.c.fonts.measure(it.weight, it.size, s[j..k]);
+                if (with > it.width and e > start) {
+                    // Break before this word; the spaces go with the break.
+                    var after = e;
+                    while (after < s.len and s[after] == ' ') after += 1;
+                    it.i = after;
+                    if (after >= s.len) it.done = true;
+                    return .{ .text = s[start..e], .width = w };
+                }
+                w = with;
+                e = k;
+                if (k >= s.len) {
+                    it.done = true;
+                    return .{ .text = s[start..e], .width = w };
+                }
+                if (s[k] == '\n') {
+                    it.i = k + 1;
+                    return .{ .text = s[start..e], .width = w };
+                }
+                j = k + 1;
+            }
+        }
+    };
+
+    fn lines(c: *Context, n: *const Node, width: f32) Lines {
+        return .{
+            .c = c,
+            .s = c.strings.items[n.str_off..][0..n.str_len],
+            .width = width,
+            .weight = n.weight,
+            .size = n.size,
+            .space = c.fonts.measure(n.weight, n.size, " "),
+        };
+    }
+
     fn arrange(c: *Context, i: u32, r: Rect) void {
         const n = &c.nodes.items[i];
         n.rect = r;
         switch (n.kind) {
-            .box => c.arrangeChildren(i, r),
+            .box, .overlay => c.arrangeChildren(i, r),
             .scroll => {
                 const st = n.list.?;
                 st.viewport = r.h;
@@ -1203,6 +1568,11 @@ pub const Context = struct {
         }
     }
 
+    /// flexes reports whether a row's child takes a share of its free width.
+    fn flexes(cn: *const Node) bool {
+        return cn.box.grow > 0 or cn.box.fill or (cn.kind == .text and cn.flags.wrap) or (cn.kind == .input and cn.box.grow > 0);
+    }
+
     fn childGrow(cn: *const Node) f32 {
         if (cn.box.grow > 0) return cn.box.grow;
         if (cn.box.fill or cn.kind == .list) return 1;
@@ -1249,6 +1619,20 @@ pub const Context = struct {
                 const str_ = c.strings.items[n.str_off..][0..n.str_len];
                 const m = c.fonts.metrics(n.weight, n.size);
                 const w = c.fonts.measure(n.weight, n.size, str_);
+                if (n.flags.wrap and (w > r.w + 0.5 or std.mem.indexOfScalar(u8, str_, '\n') != null)) {
+                    var it = c.lines(n, r.w + 0.5);
+                    var y = r.y + m.ascent;
+                    while (it.next()) |ln| : (y += m.line_height) {
+                        const x = switch (n.text_align) {
+                            .center => r.x + (r.w - ln.width) / 2,
+                            .end => r.x + r.w - ln.width,
+                            else => r.x,
+                        };
+                        s.textRun(c.fonts, x, y, ln.text, n.size, n.weight, n.color);
+                    }
+                    c.texts.append(c.gpa, .{ .off = n.str_off, .len = n.str_len, .rect = r, .id = n.id }) catch {};
+                    return;
+                }
                 const x = switch (n.text_align) {
                     .center => r.x + (r.w - w) / 2,
                     .end => r.x + r.w - w,
@@ -1320,6 +1704,46 @@ pub const Context = struct {
             },
             .divider => s.rect(r, n.color, 0, 0, .transparent),
             .input => c.paintInput(n, s),
+            .select => {
+                c.focusRing(s, n, r, n.box.radius);
+                const fade: f32 = if (n.flags.disabled) 0.5 else 1;
+                const ring = if (n.flags.focused or n.flags.on) t.accent else if (n.flags.hot) t.border_strong else t.border;
+                const bg = if (n.flags.hot and !n.flags.disabled) t.surface else t.background;
+                s.rect(r, bg.withAlpha(fade), n.box.radius, if (n.flags.focused or n.flags.on) 1.5 else 1, ring.withAlpha(fade));
+                const pad = n.box.padding_x orelse 0;
+                s.pushClip(.{ .x = r.x + pad, .y = r.y, .w = @max(0, r.w - 2 * pad - 16), .h = r.h });
+                c.paintLabel(s, n, r.x + pad, r);
+                s.popClip();
+                const chev = Rect{ .x = r.x + r.w - pad - 10, .y = r.y + r.h / 2 - 2.5, .w = 10, .h = 5 };
+                const flip: [2][4]f32 = if (n.flags.on) .{ .{ 0, 1, 0.5, 0 }, .{ 0.5, 0, 1, 1 } } else .{ .{ 0, 0, 0.5, 1 }, .{ 0.5, 1, 1, 0 } };
+                s.stroke(chev, flip, 1.5, t.text_muted.withAlpha(fade));
+                c.addHit(n, true);
+            },
+            .option => {
+                if (n.flags.hot) s.rect(r, t.surface_hover, 4, 0, .transparent);
+                if (n.flags.on) s.stroke(.{ .x = r.x + 9, .y = r.y + r.h / 2 - 4, .w = 10, .h = 8 }, .{ .{ 0, 0.5, 0.36, 0.95 }, .{ 0.36, 0.95, 1, 0.05 } }, 1.75, t.accent);
+                c.paintLabel(s, n, r.x + 28, r);
+                c.addHit(n, false);
+            },
+            .overlay => {
+                const full = Rect{ .x = 0, .y = 0, .w = c.width, .h = c.height };
+                const tip = n.mode == .tip;
+                if (n.mode == .modal) s.rect(full, Color.rgba(0, 0, 0, 0.4), 0, 0, .transparent);
+                // What is under it does not take the pointer.
+                if (!tip) c.next_hits.append(c.gpa, .{ .id = n.id ^ blocker_salt, .rect = full, .blocks = true, .modal = n.mode == .modal }) catch {};
+                const radius: f32 = if (tip) 4 else if (n.mode == .modal) 10 else t.radius + 2;
+                s.shadow(.{ .x = r.x, .y = r.y + 4, .w = r.w, .h = r.h }, radius, if (tip) 6 else 16, Color.rgba(0, 0, 0, if (tip) 0.18 else 0.24));
+                if (tip) {
+                    s.rect(r, t.text, radius, 0, .transparent);
+                } else {
+                    s.rect(r, t.background, radius, 1, t.border);
+                }
+                s.pushClip(r);
+                c.paint_clip = r;
+                var ch = n.first;
+                while (ch != none) : (ch = c.nodes.items[ch].next) c.paint(ch, s);
+                s.popClip();
+            },
             .box, .list, .scroll => {
                 s.rect(r, n.box.background, n.box.radius, n.box.border, n.box.border_color);
                 const scrolls = n.kind == .list or n.kind == .scroll;
@@ -1439,6 +1863,7 @@ pub const Context = struct {
         while (i > 0) {
             i -= 1;
             const h = c.hits.items[i];
+            if (h.blocks and h.rect.contains(x, y)) return false;
             if (h.list) |st| if (h.rect.contains(x, y)) {
                 const before = st.offset;
                 st.scrollBy(dy);
@@ -1494,3 +1919,51 @@ pub const Context = struct {
         return c.find(s) != null;
     }
 };
+
+test "wrapped text breaks at spaces to fit, and a row shares what is left" {
+    const gpa = std.testing.allocator;
+    var fonts = try textm.Fonts.init(gpa);
+    defer fonts.deinit();
+    var c = Context.init(gpa, &fonts);
+    defer c.deinit();
+    var sc = Scene{ .gpa = gpa };
+    defer sc.deinit();
+    const para = "MyZig lays text out in lines that fit the width they are given, breaking at spaces.\nA newline breaks too.";
+    const View = struct {
+        fn view(_: *const u8, cx: *Context) void {
+            cx.column(.{ .width = 200, .key = "col" });
+            cx.text(para, .{ .wrap = true });
+            cx.end();
+            cx.row(.{ .width = 300, .gap = 10 });
+            cx.text("Label", .{});
+            cx.text(para, .{ .wrap = true });
+            cx.end();
+        }
+    };
+    const dummy: u8 = 0;
+    c.build(&dummy, View.view, 800, 600, 0);
+    sc.reset(800, 600, 1, c.theme.background);
+    c.endFrame(&sc);
+    const lh = fonts.metrics(.regular, 14).line_height;
+    var lines_in_col: usize = 0;
+    var lines_in_row: usize = 0;
+    for (sc.ops.items) |op| if (op.kind == .text) {
+        const str_ = sc.string(&op);
+        if (std.mem.eql(u8, str_, "Label")) continue;
+        try std.testing.expect(str_[0] != ' ' and str_[str_.len - 1] != ' ');
+        if (op.rect.x == 0) {
+            lines_in_col += 1;
+            try std.testing.expect(op.rect.w <= 200.5);
+        } else {
+            lines_in_row += 1;
+            // What the label and the gap leave of 300.
+            try std.testing.expect(op.rect.x > 10 and op.rect.x + op.rect.w <= 300.5);
+        }
+    };
+    try std.testing.expect(lines_in_col >= 4);
+    try std.testing.expect(lines_in_row >= 3 and lines_in_row <= lines_in_col);
+    // The column is as tall as its lines.
+    for (c.nodes.items) |n| if (n.kind == .text and n.flags.wrap and n.rect.x == 0) {
+        try std.testing.expectEqual(lh * @as(f32, @floatFromInt(lines_in_col)), n.rect.h);
+    };
+}

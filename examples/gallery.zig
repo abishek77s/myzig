@@ -1,6 +1,7 @@
 //! Gallery shows every control MyZig has: text inputs, checkboxes, radio
 //! buttons, toggles, a slider, a progress bar, buttons and a scroll view,
-//! with a dark theme a toggle switches to. Tab moves the focus.
+//! a select, a tooltip and a dialog, with a dark theme a toggle switches
+//! to. Text wraps. Tab moves the focus.
 //!
 //!     zig build gallery
 const std = @import("std");
@@ -8,6 +9,8 @@ const myzig = @import("myzig");
 const ui = myzig.ui;
 
 pub const Size = enum { small, medium, large };
+
+pub const regions = [_][]const u8{ "Europe", "North America", "South America", "Asia Pacific", "Africa" };
 
 pub const Gallery = struct {
     gpa: std.mem.Allocator,
@@ -21,6 +24,8 @@ pub const Gallery = struct {
     log: std.ArrayListUnmanaged([]u8) = .empty,
     log_scroll: ui.ScrollState = .{},
     saves: u32 = 0,
+    region: usize = 0,
+    confirm_clear: bool = false,
 
     pub fn deinit(s: *Gallery) void {
         s.name.deinit(s.gpa);
@@ -75,7 +80,12 @@ pub fn view(s: *Gallery, c: *ui.Context) void {
                 }
             }
         }
-        if (c.toggle("Dark mode", &s.dark, .{})) s.note("Dark mode {s}", .{if (s.dark) "on" else "off"});
+        {
+            c.row(.{ .gap = 16, .@"align" = .center });
+            defer c.end();
+            if (c.toggle("Dark mode", &s.dark, .{})) s.note("Dark mode {s}", .{if (s.dark) "on" else "off"});
+            if (c.select(&regions, &s.region, .{ .width = 170, .key = "region" })) s.note("Region {s}", .{regions[s.region]});
+        }
 
         section(c, "VOLUME");
         {
@@ -94,10 +104,22 @@ pub fn view(s: *Gallery, c: *ui.Context) void {
                 s.saves += 1;
                 s.note("Saved ({d})", .{s.saves});
             }
-            if (c.button("Clear log", .{ .disabled = s.log.items.len == 0 })) {
-                for (s.log.items) |l| s.gpa.free(l);
-                s.log.clearRetainingCapacity();
-            }
+            c.tooltip("Adds a line to the activity log");
+            if (c.button("Clear log", .{ .disabled = s.log.items.len == 0 })) s.confirm_clear = true;
+        }
+    }
+
+    if (c.beginModal(&s.confirm_clear, .{ .title = "Clear the activity log?", .width = 360 })) {
+        defer c.endModal();
+        const n = s.log.items.len;
+        c.textf("Its {d} line{s} will be gone for good.", .{ n, if (n == 1) "" else "s" }, .{ .wrap = true, .color = t.text_muted });
+        c.row(.{ .gap = 8, .justify = .end, .@"align" = .center, .fill = true });
+        defer c.end();
+        if (c.button("Cancel", .{})) s.confirm_clear = false;
+        if (c.button("Clear", .{ .primary = true, .key = "confirm" })) {
+            for (s.log.items) |l| s.gpa.free(l);
+            s.log.clearRetainingCapacity();
+            s.confirm_clear = false;
         }
     }
 
@@ -281,5 +303,87 @@ test "the activity log scrolls" {
     try testing.expectEqual(@as(f32, 0), s.log_scroll.offset);
     try testing.expect(h.hasText("Saved (1)"));
     try h.click("Clear log");
+    try testing.expect(h.hasText("Clear the activity log?"));
+    // A click outside closes the dialog, and does not reach what is there.
+    try h.click("Save");
+    try testing.expectEqual(@as(u32, 40), s.saves);
+    try testing.expect(!h.hasText("Clear the activity log?"));
+    try h.click("Clear log");
+    try h.click("Cancel");
+    try testing.expect(!h.hasText("Clear the activity log?"));
+    try h.click("Clear log");
+    h.key(.escape);
+    try testing.expect(!s.confirm_clear);
+    try h.click("Clear log");
+    try h.click("Clear");
     try testing.expect(h.hasText("Nothing yet"));
+    try testing.expect(!h.hasText("Clear the activity log?"));
+}
+
+test "select: pointer, keyboard, and a click outside" {
+    var fonts = try myzig.text.Fonts.init(testing.allocator);
+    defer fonts.deinit();
+    var s = Gallery{ .gpa = testing.allocator };
+    defer s.deinit();
+    var h = try harness(&s, &fonts);
+    defer h.deinit();
+    try h.click("Europe");
+    try testing.expect(h.hasText("Asia Pacific"));
+    try h.click("Asia Pacific");
+    try testing.expectEqual(@as(usize, 3), s.region);
+    try testing.expect(!h.hasText("Africa"));
+    // The keyboard: open, down, Enter.
+    try h.click("Asia Pacific");
+    h.key(.down);
+    h.key(.enter);
+    try testing.expectEqual(@as(usize, 4), s.region);
+    // Closed, the arrows step.
+    h.key(.up);
+    try testing.expectEqual(@as(usize, 3), s.region);
+    // A click outside closes it, and does not reach what is there.
+    try h.click("Asia Pacific");
+    try h.click("Save");
+    try testing.expect(!h.hasText("Africa"));
+    try testing.expectEqual(@as(u32, 0), s.saves);
+    try testing.expectEqualStrings("Region Asia Pacific", s.log.items[s.log.items.len - 1]);
+}
+
+test "a tooltip shows when the pointer rests" {
+    var fonts = try myzig.text.Fonts.init(testing.allocator);
+    defer fonts.deinit();
+    var s = Gallery{ .gpa = testing.allocator };
+    defer s.deinit();
+    var h = try harness(&s, &fonts);
+    defer h.deinit();
+    const r = h.rectOf("Save").?;
+    _ = h.ctx.pointerMove(r.x + 4, r.y + 4);
+    h.frameAt(0);
+    try testing.expect(!h.hasText("Adds a line to the activity log"));
+    try testing.expect(h.ctx.wake_at > 0);
+    h.frameAt(h.ctx.wake_at);
+    try testing.expect(h.hasText("Adds a line to the activity log"));
+    _ = h.ctx.pointerMove(1, 1);
+    h.frameAt(h.ctx.frame_time + 1);
+    try testing.expect(!h.hasText("Adds a line to the activity log"));
+}
+
+test "one option of an open select is highlighted, where the pointer is" {
+    var fonts = try myzig.text.Fonts.init(testing.allocator);
+    defer fonts.deinit();
+    var s = Gallery{ .gpa = testing.allocator };
+    defer s.deinit();
+    var h = try harness(&s, &fonts);
+    defer h.deinit();
+    try h.click("Europe");
+    const r = h.rectOf("South America").?;
+    if (h.ctx.pointerMove(r.x + 4, r.y + r.h / 2)) h.frame();
+    h.frame();
+    var hot: usize = 0;
+    var which: []const u8 = "";
+    for (h.ctx.nodes.items) |n| if (n.kind == .option and n.flags.hot) {
+        hot += 1;
+        which = h.ctx.strings.items[n.str_off..][0..n.str_len];
+    };
+    try testing.expectEqual(@as(usize, 1), hot);
+    try testing.expectEqualStrings("South America", which);
 }

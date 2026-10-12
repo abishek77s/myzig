@@ -126,6 +126,17 @@ pub const Scene = struct {
         s.finish(&op, "");
     }
 
+    /// shadow paints the soft shadow of a rounded rectangle r: its color
+    /// fades out over blur on both sides of r's edge. Paint it under r.
+    pub fn shadow(s: *Scene, r: Rect, radius: f32, blur: f32, color: Color) void {
+        if (color.a == 0 or blur <= 0) return;
+        const c = s.clip();
+        const b = IRect.fromRect(.{ .x = r.x - blur, .y = r.y - blur, .w = r.w + 2 * blur, .h = r.h + 2 * blur }, s.scale).intersect(c);
+        if (b.isEmpty()) return;
+        var op = Op{ .kind = .rect, .color = color, .rect = r, .radius = radius, .size = blur, .clip = c, .bounds = b };
+        s.finish(&op, "");
+    }
+
     /// stroke paints up to two line segments with round caps, width wide,
     /// placed in r: icons (a check mark, chevrons, a cross) at any scale.
     /// Segments are x0, y0, x1, y1 in fractions of r.
@@ -401,6 +412,7 @@ pub fn drawOp(s: *const Scene, fonts: *text.Fonts, cv: *const raster.Canvas, op:
             const w = op.rect.w * k;
             const h = op.rect.h * k;
             const rad = op.radius * k;
+            if (op.size > 0) return cv.shadow(x, y, w, h, rad, op.size * k, op.color, clip);
             if (op.border > 0 and op.border_color.a > 0) {
                 const bw = op.border * k;
                 if (op.color.a == 255) {

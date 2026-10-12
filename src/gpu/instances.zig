@@ -17,7 +17,7 @@ pub const Instance = extern struct {
     border_color: [4]f32,
     /// params are the radius and the border width in device pixels, and
     /// the kind: 0 for a box, 1 for a glyph, 2 for a stroke (whose width
-    /// is the border's).
+    /// is the border's), 3 for a shadow (of the box in uv, blurred by w).
     params: [4]f32,
     /// uv is the glyph's place in the atlas, normalized: uv_x, uv_y, u1, v1;
     /// for a stroke its first segment, and border_color its second, in
@@ -113,7 +113,19 @@ fn buildOnce(s: *const scene.Scene, fonts: *text.Fonts, atlas: *Atlas, out: *std
     const k = s.scale;
     try out.ensureTotalCapacity(atlas.gpa, s.ops.items.len);
     for (s.ops.items) |*op| switch (op.kind) {
-        .rect => try out.append(atlas.gpa, .{
+        .rect => if (op.size > 0) {
+            // A shadow: the quad covers its blur; uv carries the box.
+            const b = op.size;
+            const r = op.rect;
+            try out.append(atlas.gpa, .{
+                .rect = .{ (r.x - b) * k, (r.y - b) * k, (r.w + 2 * b) * k, (r.h + 2 * b) * k },
+                .clip = clipOf(op.clip),
+                .color = rgba(op.color),
+                .border_color = .{ 0, 0, 0, 0 },
+                .params = .{ @min(op.radius, @min(r.w, r.h) / 2) * k, 0, 3, b * k },
+                .uv = .{ r.x * k, r.y * k, r.w * k, r.h * k },
+            });
+        } else try out.append(atlas.gpa, .{
             .rect = .{ op.rect.x * k, op.rect.y * k, op.rect.w * k, op.rect.h * k },
             .clip = clipOf(op.clip),
             .color = rgba(op.color),
@@ -230,6 +242,12 @@ pub const glsl_fragment =
     \\void main() {
     \\    if (v_pos.x < v_clip.x || v_pos.y < v_clip.y || v_pos.x >= v_clip.z || v_pos.y >= v_clip.w) discard;
     \\    vec4 fill = vec4(v_color.rgb * v_color.a, v_color.a);
+    \\    if (v_params.z > 2.5) {
+    \\        vec2 h = v_seg.zw * 0.5;
+    \\        float d = box(v_pos, v_seg.xy + h, h, v_params.x);
+    \\        o_color = fill * (1.0 - smoothstep(-v_params.w, v_params.w, d));
+    \\        return;
+    \\    }
     \\    if (v_params.z > 1.5) {
     \\        float d = min(segment(v_pos, v_seg), segment(v_pos, v_border_color)) - v_params.y * 0.5;
     \\        o_color = fill * clamp(0.5 - d, 0.0, 1.0);

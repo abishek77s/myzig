@@ -91,16 +91,20 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     var wm_delete = x.XInternAtom(dpy, "WM_DELETE_WINDOW", 0);
     _ = x.XSetWMProtocols(dpy, win, @ptrCast(&wm_delete), 1);
     _ = x.XSelectInput(dpy, win, x.KeyPressMask | x.ButtonPressMask | x.ButtonReleaseMask | x.PointerMotionMask | x.LeaveWindowMask | x.ExposureMask | x.StructureNotifyMask | x.FocusChangeMask);
-    // Text comes through an input method, in UTF-8, where there is one.
-    _ = x.setlocale(0, ""); // LC_CTYPE
-    _ = x.XSetLocaleModifiers("");
-    const im = x.XOpenIM(dpy, null, null, null);
+    // Text comes through an input method, in UTF-8, where there is one;
+    // it is opened when a text input first takes the focus (it loads the
+    // compose tables, a megabyte an app without text input does without).
+    var im: ?*anyopaque = null;
+    var ic: ?*anyopaque = null;
+    var im_tried = false;
+    defer if (ic) |i| x.XDestroyIC(i);
     defer if (im) |m| {
         _ = x.XCloseIM(m);
     };
-    const ic: ?*anyopaque = if (im) |m| x.XCreateIC(m, "inputStyle", @as(c_long, x.XIMPreeditNothing | x.XIMStatusNothing), "clientWindow", win, "focusWindow", win, @as(?*anyopaque, null)) else null;
-    defer if (ic) |i| x.XDestroyIC(i);
-    const cursors = [_]c_ulong{ x.XCreateFontCursor(dpy, x.XC_left_ptr), x.XCreateFontCursor(dpy, x.XC_xterm), x.XCreateFontCursor(dpy, x.XC_hand2) };
+    // Cursors are made when first shown (making one loads the cursor
+    // theme); the arrow is the window's default, none of its own.
+    var cursors = [_]c_ulong{ 0, 0, 0 };
+    const cursor_shapes = [_]c_uint{ x.XC_left_ptr, x.XC_xterm, x.XC_hand2 };
     var cursor: ui.Cursor = .arrow;
     _ = x.XMapWindow(dpy, win);
     const gc = x.XCreateGC(dpy, win, 0, null);
@@ -287,9 +291,19 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                 presenting = use_shm and rend.damage.items.len > 0;
             }
             if (ctx.animating or ctx.requested) need_frame = true;
+            if (ctx.input.text_focus and !im_tried) {
+                im_tried = true;
+                _ = x.setlocale(0, ""); // LC_CTYPE
+                _ = x.XSetLocaleModifiers("");
+                im = x.XOpenIM(dpy, null, null, null);
+                if (im) |m| ic = x.XCreateIC(m, "inputStyle", @as(c_long, x.XIMPreeditNothing | x.XIMStatusNothing), "clientWindow", win, "focusWindow", win, @as(?*anyopaque, null));
+                if (ic) |i| x.XSetICFocus(i);
+            }
             if (ctx.cursor != cursor) {
                 cursor = ctx.cursor;
-                _ = x.XDefineCursor(dpy, win, cursors[@intFromEnum(cursor)]);
+                const ci = @intFromEnum(cursor);
+                if (cursor != .arrow and cursors[ci] == 0) cursors[ci] = x.XCreateFontCursor(dpy, cursor_shapes[ci]);
+                _ = x.XDefineCursor(dpy, win, cursors[ci]);
             }
             next_frame = if (now - next_frame < period) next_frame + period else now + period;
             continue;

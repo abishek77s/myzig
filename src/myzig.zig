@@ -40,4 +40,7 @@ test {
     _ = raster;
     _ = @import("gpu/instances.zig");
     _ = @import("gpu/vulkan.zig");
+    _ = ui;
+    _ = scene;
+    _ = text;
 }

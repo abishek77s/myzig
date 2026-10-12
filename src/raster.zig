@@ -122,6 +122,47 @@ pub const Canvas = struct {
         }
     }
 
+    /// shadow draws the soft shadow of the rounded box at x, y, w×h: its
+    /// alpha falls off smoothly from blur inside the edge to blur outside.
+    pub fn shadow(c: *const Canvas, x: f32, y: f32, w: f32, h: f32, radius: f32, blur: f32, color: Color, clip: IRect) void {
+        const r = @min(radius, @min(w, h) / 2);
+        const outer = IRect{ .x0 = @intFromFloat(@floor(x - blur)), .y0 = @intFromFloat(@floor(y - blur)), .x1 = @intFromFloat(@ceil(x + w + blur)), .y1 = @intFromFloat(@ceil(y + h + blur)) };
+        const b = outer.intersect(clip).intersect(c.bounds());
+        if (b.isEmpty()) return;
+        const hx = w / 2;
+        const hy = h / 2;
+        const cx = x + hx;
+        const cy = y + hy;
+        // Inside the box shrunk by blur and the corners, alpha is whole.
+        const in_d = blur + r;
+        const ix0: i32 = @intFromFloat(@ceil(x + in_d));
+        const ix1: i32 = @intFromFloat(@floor(x + w - in_d));
+        const iy0 = y + in_d;
+        const iy1 = y + h - in_d;
+        var py = b.y0;
+        while (py < b.y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const solid = fy >= iy0 and fy <= iy1 and ix1 > ix0;
+            var px = b.x0;
+            while (px < b.x1) : (px += 1) {
+                if (solid and px == @max(b.x0, ix0)) {
+                    const e = @min(b.x1, ix1);
+                    if (e > px) {
+                        c.span(py, px, e, color, color.a);
+                        px = e - 1;
+                        continue;
+                    }
+                }
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const d = boxDistance(fx, fy, cx, cy, hx, hy, r);
+                const t = std.math.clamp((d + blur) / (2 * blur), 0, 1);
+                const a = 1 - t * t * (3 - 2 * t);
+                const av: u32 = @intFromFloat(a * @as(f32, @floatFromInt(color.a)));
+                if (av > 0) blendPixel(&c.row(py)[@intCast(px)], color, av);
+            }
+        }
+    }
+
     /// stroke draws two line segments (x0, y0, x1, y1 in device pixels)
     /// with round caps, width wide, over the pixels of area.
     pub fn stroke(c: *const Canvas, area: IRect, seg: [2][4]f32, width: f32, color: Color) void {
@@ -162,6 +203,16 @@ pub const Canvas = struct {
         }
     }
 };
+
+/// boxDistance is the signed distance from (fx, fy) to the rounded box
+/// centered at (cx, cy) with half sizes hx, hy and radius r.
+inline fn boxDistance(fx: f32, fy: f32, cx: f32, cy: f32, hx: f32, hy: f32, r: f32) f32 {
+    const qx = @abs(fx - cx) - (hx - r);
+    const qy = @abs(fy - cy) - (hy - r);
+    const mx = @max(qx, 0);
+    const my = @max(qy, 0);
+    return @sqrt(mx * mx + my * my) + @min(@max(qx, qy), 0) - r;
+}
 
 /// coverage returns the area (0..256) of the pixel at (fx, fy) inside the
 /// rounded box centered at (cx, cy) with half sizes hx, hy and radius r,
