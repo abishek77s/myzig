@@ -28,6 +28,19 @@ pub const Op = struct {
     clip: IRect,
     bounds: IRect, // device pixels, clipped
     hash: u64 = 0,
+    /// layer is 1 + the index of the scroll layer the op is in, 0 for none.
+    layer: u16 = 0,
+};
+
+/// Layer is a scrolled area: its ops hash where they are in its content,
+/// not on screen, so that scrolling it changes none of them, and the
+/// renderer moves its pixels instead of drawing them again (the scroll
+/// layers of gpui-fast, on the CPU).
+pub const Layer = struct {
+    key: u64,
+    clip: IRect,
+    /// offset is how far the content is scrolled, in logical pixels.
+    offset: f32,
 };
 
 pub const Scene = struct {
@@ -38,17 +51,23 @@ pub const Scene = struct {
     clip_stack: std.ArrayListUnmanaged(IRect) = .empty,
     full: IRect = .{},
     background: Color = Color.white,
+    layers: std.ArrayListUnmanaged(Layer) = .empty,
+    layer_stack: std.ArrayListUnmanaged(u16) = .empty,
 
     pub fn deinit(s: *Scene) void {
         s.ops.deinit(s.gpa);
         s.strings.deinit(s.gpa);
         s.clip_stack.deinit(s.gpa);
+        s.layers.deinit(s.gpa);
+        s.layer_stack.deinit(s.gpa);
     }
 
     pub fn reset(s: *Scene, width: i32, height: i32, scale: f32, bg: Color) void {
         s.ops.clearRetainingCapacity();
         s.strings.clearRetainingCapacity();
         s.clip_stack.clearRetainingCapacity();
+        s.layers.clearRetainingCapacity();
+        s.layer_stack.clearRetainingCapacity();
         s.scale = scale;
         s.full = .{ .x0 = 0, .y0 = 0, .x1 = width, .y1 = height };
         s.background = bg;
@@ -67,14 +86,41 @@ pub const Scene = struct {
         _ = s.clip_stack.pop();
     }
 
+    /// pushLayer starts a scroll layer clipped to r, its content scrolled
+    /// by offset; key identifies it from frame to frame.
+    pub fn pushLayer(s: *Scene, key: u64, r: Rect, offset: f32) void {
+        s.pushClip(r);
+        s.layers.append(s.gpa, .{ .key = key, .clip = s.clip(), .offset = offset }) catch return;
+        s.layer_stack.append(s.gpa, @intCast(s.layers.items.len)) catch {};
+    }
+
+    pub fn popLayer(s: *Scene) void {
+        _ = s.layer_stack.pop();
+        s.popClip();
+    }
+
+    fn currentLayer(s: *const Scene) u16 {
+        return if (s.layer_stack.items.len > 0) s.layer_stack.items[s.layer_stack.items.len - 1] else 0;
+    }
+
+    fn finish(s: *Scene, op: *Op, str: []const u8) void {
+        op.layer = s.currentLayer();
+        if (op.layer == 0) {
+            op.hash = hashOp(op, str, 0, null);
+        } else {
+            const l = &s.layers.items[op.layer - 1];
+            op.hash = hashOp(op, str, l.key, l.offset);
+        }
+        s.ops.append(s.gpa, op.*) catch {};
+    }
+
     pub fn rect(s: *Scene, r: Rect, color: Color, radius: f32, border: f32, border_color: Color) void {
         if (color.a == 0 and (border == 0 or border_color.a == 0)) return;
         const c = s.clip();
         const b = IRect.fromRect(r, s.scale).intersect(c);
         if (b.isEmpty()) return;
         var op = Op{ .kind = .rect, .color = color, .rect = r, .radius = radius, .border = border, .border_color = border_color, .clip = c, .bounds = b };
-        op.hash = hashOp(&op, "");
-        s.ops.append(s.gpa, op) catch {};
+        s.finish(&op, "");
     }
 
     /// text paints str with its pen at x and its baseline at y.
@@ -89,8 +135,7 @@ pub const Scene = struct {
         const off: u32 = @intCast(s.strings.items.len);
         s.strings.appendSlice(s.gpa, str) catch return;
         var op = Op{ .kind = .text, .color = color, .rect = .{ .x = x, .y = y, .w = w }, .size = size, .weight = weight, .str_off = off, .str_len = @intCast(str.len), .clip = c, .bounds = b };
-        op.hash = hashOp(&op, str);
-        s.ops.append(s.gpa, op) catch {};
+        s.finish(&op, str);
     }
 
     pub fn string(s: *const Scene, op: *const Op) []const u8 {
@@ -98,11 +143,13 @@ pub const Scene = struct {
     }
 };
 
-fn hashOp(op: *const Op, str: []const u8) u64 {
-    var h = std.hash.Wyhash.init(@intFromEnum(op.kind));
+fn hashOp(op: *const Op, str: []const u8, layer_key: u64, offset: ?f32) u64 {
+    var h = std.hash.Wyhash.init(@intFromEnum(op.kind) ^ layer_key);
     h.update(std.mem.asBytes(&op.color));
     h.update(std.mem.asBytes(&op.border_color));
-    h.update(std.mem.asBytes(&op.rect));
+    var r = op.rect;
+    if (offset) |o| r.y += o; // where it is in the layer's content
+    h.update(std.mem.asBytes(&r));
     h.update(std.mem.asBytes(&op.radius));
     h.update(std.mem.asBytes(&op.border));
     h.update(std.mem.asBytes(&op.size));
@@ -114,9 +161,22 @@ fn hashOp(op: *const Op, str: []const u8) u64 {
 
 /// Renderer keeps the last scene drawn into a canvas and redraws only
 /// what changed.
+const max_damage = 32;
+
+pub const Scroll = struct { clip: IRect, dy: i32 };
+
 pub const Renderer = struct {
     gpa: std.mem.Allocator,
     last: std.ArrayListUnmanaged(Op) = .empty,
+    last_layers: std.ArrayListUnmanaged(Layer) = .empty,
+    shifts: [16]i32 = .{0} ** 16,
+    /// scrolls are the layers whose pixels moved this frame: a window
+    /// presenting the damage moves them on its side first.
+    scrolls: std.ArrayListUnmanaged(Scroll) = .empty,
+    /// retain_pixels keeps the whole canvas up to date. A window turns it
+    /// off: it only ever presents what was drawn this frame, and the
+    /// server moves scrolled pixels itself, so the canvas need not.
+    retain_pixels: bool = true,
     last_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     cur_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     damage: std.ArrayListUnmanaged(IRect) = .empty,
@@ -130,6 +190,8 @@ pub const Renderer = struct {
 
     pub fn deinit(r: *Renderer) void {
         r.last.deinit(r.gpa);
+        r.last_layers.deinit(r.gpa);
+        r.scrolls.deinit(r.gpa);
         r.last_hashes.deinit(r.gpa);
         r.cur_hashes.deinit(r.gpa);
         r.damage.deinit(r.gpa);
@@ -142,21 +204,28 @@ pub const Renderer = struct {
     /// render draws scene into canvas and returns the rectangles it changed.
     pub fn render(r: *Renderer, s: *const Scene, fonts: *text.Fonts, cv: *const raster.Canvas) []const IRect {
         r.damage.clearRetainingCapacity();
+        r.scrolls.clearRetainingCapacity();
         r.stats.frames += 1;
         if (!r.valid or !r.last_bg.eql(s.background)) {
             r.addDamage(cv.bounds());
         } else {
+            r.scrollLayers(s, cv);
             r.cur_hashes.clearRetainingCapacity();
             r.cur_hashes.ensureTotalCapacity(r.gpa, @intCast(s.ops.items.len)) catch {};
             for (s.ops.items) |*op| r.cur_hashes.putAssumeCapacity(op.hash, {});
             for (s.ops.items) |*op| if (!r.last_hashes.contains(op.hash)) r.addDamage(op.bounds);
-            for (r.last.items) |*op| if (!r.cur_hashes.contains(op.hash)) r.addDamage(op.bounds);
+            for (r.last.items) |*op| if (!r.cur_hashes.contains(op.hash)) r.addDamage(r.moved(op));
         }
         r.mergeDamage(cv.bounds());
         for (r.damage.items) |d| r.drawArea(s, fonts, cv, d);
         // Keep this scene for the next diff.
         r.last.clearRetainingCapacity();
+        r.last_layers.clearRetainingCapacity();
         r.last.appendSlice(r.gpa, s.ops.items) catch {
+            r.valid = false;
+            return r.damage.items;
+        };
+        r.last_layers.appendSlice(r.gpa, s.layers.items) catch {
             r.valid = false;
             return r.damage.items;
         };
@@ -166,6 +235,64 @@ pub const Renderer = struct {
         r.valid = true;
         r.last_bg = s.background;
         return r.damage.items;
+    }
+
+    /// moved is where the pixels of an op of the last frame are now: moved
+    /// with its layer when the layer's pixels were moved.
+    fn moved(r: *const Renderer, op: *const Op) IRect {
+        if (op.layer == 0) return op.bounds;
+        const d = r.shifts[@min(op.layer - 1, r.shifts.len - 1)];
+        if (d == 0) return op.bounds;
+        const l = r.last_layers.items[op.layer - 1];
+        var b = op.bounds;
+        b.y0 -= d;
+        b.y1 -= d;
+        return b.intersect(l.clip);
+    }
+
+    /// scrollLayers moves the pixels of each layer scrolled since the last
+    /// frame, and damages what that uncovers or carried along with them.
+    fn scrollLayers(r: *Renderer, s: *const Scene, cv: *const raster.Canvas) void {
+        @memset(&r.shifts, 0);
+        for (r.last_layers.items, 0..) |old, li| {
+            var cur: ?Layer = null;
+            for (s.layers.items) |l| if (l.key == old.key) {
+                cur = l;
+                break;
+            };
+            const l = cur orelse continue;
+            if (l.offset == old.offset) continue;
+            const fd = (l.offset - old.offset) * s.scale;
+            const d: i32 = @intFromFloat(@round(fd));
+            const clip = l.clip.intersect(cv.bounds());
+            const h = clip.y1 - clip.y0;
+            if (!std.meta.eql(l.clip, old.clip) or @abs(fd - @as(f32, @floatFromInt(d))) > 0.001 or @abs(d) >= h or li >= r.shifts.len) {
+                // Not a whole number of pixels, or too far: draw it again.
+                r.addDamage(old.clip);
+                r.addDamage(l.clip);
+                continue;
+            }
+            r.shifts[li] = d;
+            if (r.retain_pixels) shiftRows(cv, clip, d);
+            r.scrolls.append(r.gpa, .{ .clip = clip, .dy = d }) catch {
+                r.valid = false;
+            };
+            if (d > 0) {
+                r.addDamage(.{ .x0 = clip.x0, .y0 = clip.y1 - d, .x1 = clip.x1, .y1 = clip.y1 });
+            } else {
+                r.addDamage(.{ .x0 = clip.x0, .y0 = clip.y0, .x1 = clip.x1, .y1 = clip.y0 - d });
+            }
+            // Ops outside the layer drawn over or under it moved too.
+            for (r.last.items) |*op| {
+                if (op.layer == li + 1 or !op.bounds.overlaps(clip)) continue;
+                if (op.kind == .rect and op.radius == 0 and op.color.a == 255 and op.border == 0 and contains(op.bounds, clip)) continue;
+                r.addDamage(op.bounds.intersect(clip));
+                var b = op.bounds;
+                b.y0 -= d;
+                b.y1 -= d;
+                r.addDamage(b.intersect(clip));
+            }
+        }
     }
 
     fn addDamage(r: *Renderer, d: IRect) void {
@@ -195,11 +322,22 @@ pub const Renderer = struct {
                 }
             }
         }
-        if (n > 24) {
-            var u = IRect{};
-            for (items[0..n]) |d| u = u.unite(d);
-            items[0] = u;
-            n = 1;
+        // Too many: join the pairs whose union wastes least.
+        while (n > max_damage) {
+            var bi: usize = 0;
+            var bj: usize = 1;
+            var best: i64 = std.math.maxInt(i64);
+            for (0..n) |i| for (i + 1..n) |j| {
+                const waste = items[i].unite(items[j]).area() - items[i].area() - items[j].area();
+                if (waste < best) {
+                    best = waste;
+                    bi = i;
+                    bj = j;
+                }
+            };
+            items[bi] = items[bi].unite(items[bj]);
+            items[bj] = items[n - 1];
+            n -= 1;
         }
         for (items[0..n]) |*d| d.* = d.intersect(full);
         r.damage.shrinkRetainingCapacity(n);
@@ -216,6 +354,23 @@ pub const Renderer = struct {
         }
     }
 };
+
+fn contains(outer: IRect, inner: IRect) bool {
+    return outer.x0 <= inner.x0 and outer.y0 <= inner.y0 and outer.x1 >= inner.x1 and outer.y1 >= inner.y1;
+}
+
+/// shiftRows moves the pixels inside clip up by d rows (down when d < 0).
+fn shiftRows(cv: *const raster.Canvas, clip: IRect, d: i32) void {
+    const x0: usize = @intCast(clip.x0);
+    const x1: usize = @intCast(clip.x1);
+    if (d > 0) {
+        var y = clip.y0;
+        while (y < clip.y1 - d) : (y += 1) @memcpy(cv.row(y)[x0..x1], cv.row(y + d)[x0..x1]);
+    } else {
+        var y = clip.y1 - 1;
+        while (y >= clip.y0 - d) : (y -= 1) @memcpy(cv.row(y)[x0..x1], cv.row(y + d)[x0..x1]);
+    }
+}
 
 pub fn drawOp(s: *const Scene, fonts: *text.Fonts, cv: *const raster.Canvas, op: *const Op, clip: IRect) void {
     const k = s.scale;

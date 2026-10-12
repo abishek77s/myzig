@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("X11", .{});
     mod.linkSystemLibrary("Xext", .{});
 
+    const only = b.option([]const u8, "only", "Build only this example (and no benchmark)");
     const examples = [_][]const u8{ "counter", "quotes", "list" };
     const test_step = b.step("test", "Run the tests");
     inline for (examples) |name| {
@@ -28,7 +29,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "myzig", .module = mod }},
             }),
         });
-        b.installArtifact(exe);
+        if (only == null or std.mem.eql(u8, only.?, name)) b.installArtifact(exe);
         const run = b.addRunArtifact(exe);
         b.step(name, "Run the " ++ name ++ " example").dependOn(&run.step);
         const t = b.addTest(.{ .root_module = exe.root_module });
@@ -48,7 +49,7 @@ pub fn build(b: *std.Build) void {
     bench.root_module.addAnonymousImport("counter", .{ .root_source_file = b.path("examples/counter.zig"), .imports = &.{.{ .name = "myzig", .module = mod }} });
     bench.root_module.addAnonymousImport("quotes", .{ .root_source_file = b.path("examples/quotes.zig"), .imports = &.{.{ .name = "myzig", .module = mod }} });
     bench.root_module.addAnonymousImport("list", .{ .root_source_file = b.path("examples/list.zig"), .imports = &.{.{ .name = "myzig", .module = mod }} });
-    b.installArtifact(bench);
+    if (only == null) b.installArtifact(bench);
     const run_bench = b.addRunArtifact(bench);
     b.step("bench", "Time headless frames of each workload").dependOn(&run_bench.step);
 

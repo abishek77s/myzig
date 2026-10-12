@@ -88,6 +88,7 @@ pub const ButtonRelease = 5;
 pub const MotionNotify = 6;
 pub const LeaveNotify = 8;
 pub const Expose = 12;
+pub const GraphicsExpose = 13;
 pub const ConfigureNotify = 22;
 pub const ClientMessage = 33;
 
@@ -120,6 +121,7 @@ pub extern "X11" fn XConnectionNumber(d: *Display) c_int;
 pub extern "X11" fn XCreateGC(d: *Display, drawable: Window, mask: c_ulong, values: ?*anyopaque) GC;
 pub extern "X11" fn XCreateImage(d: *Display, v: *Visual, depth: c_uint, format: c_int, offset: c_int, data: ?[*]u8, w: c_uint, h: c_uint, pad: c_int, bpl: c_int) ?*XImage;
 pub extern "X11" fn XPutImage(d: *Display, drawable: Window, gc: GC, img: *XImage, sx: c_int, sy: c_int, dx: c_int, dy: c_int, w: c_uint, h: c_uint) c_int;
+pub extern "X11" fn XCopyArea(d: *Display, src: Window, dst: Window, gc: GC, sx: c_int, sy: c_int, w: c_uint, h: c_uint, dx: c_int, dy: c_int) c_int;
 pub extern "X11" fn XFree(p: ?*anyopaque) c_int;
 pub extern "X11" fn XLookupKeysym(ev: *InputEvent, index: c_int) c_ulong;
 

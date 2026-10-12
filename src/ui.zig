@@ -574,10 +574,14 @@ pub const Context = struct {
             },
             .box, .list => {
                 s.rect(r, n.box.background, n.box.radius, n.box.border, n.box.border_color);
-                if (n.box.clip) s.pushClip(r);
+                if (n.kind == .list) {
+                    s.pushLayer(n.id, r, n.list.?.offset);
+                } else if (n.box.clip) s.pushClip(r);
                 var ch = n.first;
                 while (ch != none) : (ch = c.nodes.items[ch].next) c.paint(ch, s);
                 if (n.kind == .list) {
+                    s.popLayer();
+                    s.pushClip(r);
                     const st = n.list.?;
                     c.next_hits.append(c.gpa, .{ .id = n.id, .rect = r, .list = st }) catch {};
                     if (st.content > st.viewport and st.viewport > 0) {

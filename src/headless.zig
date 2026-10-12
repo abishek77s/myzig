@@ -24,6 +24,9 @@ pub fn Headless(comptime State: type) type {
         width: i32,
         height: i32,
         scale: f32,
+        build_ns: u64 = 0,
+        raster_ns: u64 = 0,
+        pixels_drawn: u64 = 0,
 
         pub fn init(gpa: std.mem.Allocator, fonts: *text.Fonts, state: *State, view: View, width: u32, height: u32, scale: f32) !Self {
             const pw: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(width)) * scale));
@@ -54,11 +57,17 @@ pub fn Headless(comptime State: type) type {
 
         /// frame builds, lays out and draws one frame.
         pub fn frame(h: *Self) void {
+            var timer = std.time.Timer.start() catch unreachable;
             h.ctx.build(h.state, h.view, @as(f32, @floatFromInt(h.width)) / h.scale, @as(f32, @floatFromInt(h.height)) / h.scale, 0);
             h.scene.reset(h.width, h.height, h.scale, h.ctx.theme.background);
             h.ctx.endFrame(&h.scene);
+            const t1 = timer.read();
             const cv = raster.Canvas{ .pixels = h.pixels, .width = h.width, .height = h.height, .stride = @intCast(h.width) };
+            const px = h.renderer.stats.pixels;
             _ = h.renderer.render(&h.scene, h.fonts, &cv);
+            h.build_ns += t1;
+            h.raster_ns += timer.read() - t1;
+            h.pixels_drawn += h.renderer.stats.pixels - px;
         }
 
         pub fn click(h: *Self, label: []const u8) !void {

@@ -79,7 +79,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     defer ctx.deinit();
     var sc = scene.Scene{ .gpa = gpa };
     defer sc.deinit();
-    var rend = scene.Renderer{ .gpa = gpa };
+    var rend = scene.Renderer{ .gpa = gpa, .retain_pixels = false };
     defer rend.deinit();
 
     var buf = Buffer{};
@@ -104,7 +104,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
             _ = x.XNextEvent(dpy, &ev);
             const k = scale;
             switch (ev.type) {
-                x.Expose => {
+                x.Expose, x.GraphicsExpose => {
                     mapped = true;
                     rend.invalidate();
                     need_frame = true;
@@ -178,7 +178,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
         if (need_frame and mapped and !presenting and (uncapped or now >= next_frame)) {
             need_frame = false;
             buildAndDraw(state, view, &ctx, &sc, &rend, &fonts, &buf, scale, &timer, &stats);
-            presentDamage(dpy, win, gc, &buf, rend.damage.items, use_shm, &stats, &timer);
+            presentDamage(dpy, win, gc, &buf, rend.scrolls.items, rend.damage.items, use_shm, &stats, &timer);
             presenting = use_shm and rend.damage.items.len > 0;
             if (ctx.animating or ctx.requested) need_frame = true;
             next_frame = if (now - next_frame < period) next_frame + period else now + period;
@@ -217,9 +217,20 @@ fn buildAndDraw(state: anytype, comptime view: anytype, ctx: *ui.Context, sc: *s
     stats.pixels += rend.stats.pixels - px_before;
 }
 
-fn presentDamage(dpy: *x.Display, win: x.Window, gc: x.GC, buf: *Buffer, damage: []const geom.IRect, use_shm: bool, stats: *Stats, timer: *std.time.Timer) void {
+fn presentDamage(dpy: *x.Display, win: x.Window, gc: x.GC, buf: *Buffer, scrolls: []const scene.Scroll, damage: []const geom.IRect, use_shm: bool, stats: *Stats, timer: *std.time.Timer) void {
     const t0 = timer.read();
     const img = buf.img orelse return;
+    // Scrolled layers move on the server: nothing crosses the connection.
+    for (scrolls) |sc| {
+        const c = sc.clip;
+        const w: c_uint = @intCast(c.x1 - c.x0);
+        const h: c_uint = @intCast(c.y1 - c.y0 - @as(i32, @intCast(@abs(sc.dy))));
+        if (sc.dy > 0) {
+            _ = x.XCopyArea(dpy, win, win, gc, c.x0, c.y0 + sc.dy, w, h, c.x0, c.y0);
+        } else {
+            _ = x.XCopyArea(dpy, win, win, gc, c.x0, c.y0, w, h, c.x0, c.y0 - sc.dy);
+        }
+    }
     for (damage, 0..) |d, i| {
         if (d.isEmpty()) continue;
         const last = i == damage.len - 1;

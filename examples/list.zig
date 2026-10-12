@@ -49,3 +49,24 @@ pub fn main() !void {
     var s = Items{ .auto = std.posix.getenv("AUTOSCROLL") != null };
     try myzig.run(&s, view, .{ .title = "List", .width = 640, .height = 720 });
 }
+
+test "scrolling draws what a full redraw draws" {
+    const gpa = std.testing.allocator;
+    var fonts = try myzig.text.Fonts.init(gpa);
+    defer fonts.deinit();
+    var s = Items{ .auto = true };
+    var h = try myzig.Headless(Items).init(gpa, &fonts, &s, view, 640, 720, 2);
+    defer h.deinit();
+    var t = Items{ .auto = false };
+    var full = try myzig.Headless(Items).init(gpa, &fonts, &t, view, 640, 720, 2);
+    defer full.deinit();
+    for (0..120) |i| {
+        h.frame();
+        if (i % 7 == 0) s.dir = -s.dir * 3; // speeds up, and turns back
+        if (i % 13 == 0) h.scroll(100, 300, 48); // a wheel too
+        t.list = s.list;
+        full.renderer.invalidate();
+        full.frame();
+        try std.testing.expectEqualSlices(u32, full.pixels, h.pixels);
+    }
+}
