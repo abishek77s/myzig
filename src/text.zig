@@ -19,11 +19,18 @@ extern fn mz_glyph_render(fi: *anyopaque, out: [*]u8, w: c_int, h: c_int, stride
 
 pub const Weight = enum(u1) { regular, bold };
 
-const windows = @import("builtin").os.tag == .windows;
+const os = @import("builtin").os.tag;
+const windows = os == .windows;
 
+// A path may name a face of a collection by its index: "fonts.ttc#1".
 const regular_paths: []const []const u8 = if (windows) &.{
     "C:\\Windows\\Fonts\\segoeui.ttf",
     "C:\\Windows\\Fonts\\arial.ttf",
+} else if (os == .macos) &.{
+    "/System/Library/Fonts/HelveticaNeue.ttc#0",
+    "/System/Library/Fonts/Helvetica.ttc#0",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
 } else &.{
     "/usr/share/fonts/opentype/inter/Inter-Regular.otf",
     "/usr/share/fonts/truetype/inter/Inter-Regular.ttf",
@@ -37,6 +44,11 @@ const regular_paths: []const []const u8 = if (windows) &.{
 const bold_paths: []const []const u8 = if (windows) &.{
     "C:\\Windows\\Fonts\\segoeuib.ttf",
     "C:\\Windows\\Fonts\\arialbd.ttf",
+} else if (os == .macos) &.{
+    "/System/Library/Fonts/HelveticaNeue.ttc#1",
+    "/System/Library/Fonts/Helvetica.ttc#1",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
 } else &.{
     "/usr/share/fonts/opentype/inter/Inter-Bold.otf",
     "/usr/share/fonts/truetype/inter/Inter-Bold.ttf",
@@ -60,14 +72,15 @@ pub const Face = struct {
 
     fn load(gpa: std.mem.Allocator, override: ?[]const u8, paths: []const []const u8) !Face {
         var data: ?[]u8 = null;
+        var index: c_int = 0;
         errdefer if (data) |d| gpa.free(d);
-        if (override) |p| data = std.fs.cwd().readFileAlloc(gpa, p, 64 << 20) catch null;
+        if (override) |p| data = readFace(gpa, p, &index);
         for (paths) |p| {
             if (data != null) break;
-            data = std.fs.cwd().readFileAlloc(gpa, p, 64 << 20) catch null;
+            data = readFace(gpa, p, &index);
         }
         const d = data orelse return error.NoFont;
-        const info = mz_font_init(d.ptr, 0) orelse return error.BadFont;
+        const info = mz_font_init(d.ptr, index) orelse return error.BadFont;
         var a: c_int = 0;
         var de: c_int = 0;
         var g: c_int = 0;
@@ -82,6 +95,16 @@ pub const Face = struct {
             f.ascii_adv[cp] = @intCast(adv);
         }
         return f;
+    }
+
+    fn readFace(gpa: std.mem.Allocator, spec: []const u8, index: *c_int) ?[]u8 {
+        var path = spec;
+        index.* = 0;
+        if (std.mem.lastIndexOfScalar(u8, spec, '#')) |i| {
+            index.* = std.fmt.parseInt(c_int, spec[i + 1 ..], 10) catch 0;
+            path = spec[0..i];
+        }
+        return std.fs.cwd().readFileAlloc(gpa, path, 64 << 20) catch null;
     }
 
     pub fn glyph(f: *const Face, cp: u21) u32 {

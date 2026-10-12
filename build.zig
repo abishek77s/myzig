@@ -17,6 +17,9 @@ pub fn build(b: *std.Build) void {
         mod.linkSystemLibrary("gdi32", .{});
         mod.linkSystemLibrary("dwmapi", .{});
         mod.linkSystemLibrary("winmm", .{});
+    } else if (target.result.os.tag == .macos) {
+        // Cocoa, Metal and the Objective-C runtime are opened at run time
+        // (src/mac/objc.zig): building for macOS needs no SDK.
     } else {
         mod.linkSystemLibrary("X11", .{});
         mod.linkSystemLibrary("Xext", .{});

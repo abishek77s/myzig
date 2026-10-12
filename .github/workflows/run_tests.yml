@@ -1,0 +1,209 @@
+# Builds and tests MyZig on each OS it runs on, the way Zed's run_tests
+# does: a style check, a test job per OS, cross-compiles, and one
+# `tests_pass` job to require in branch protection.
+name: run_tests
+env:
+  ZIG_VERSION: 0.15.2
+on:
+  pull_request:
+    branches:
+    - '**'
+  push:
+    branches:
+    - main
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'main' && github.sha || 'anysha' }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+jobs:
+  check_style:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: steps::checkout_repo
+      uses: actions/checkout@v4
+    - name: steps::setup_zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+    - name: run_tests::check_style::zig_fmt
+      run: zig fmt --check src examples bench build.zig
+    timeout-minutes: 10
+
+  run_tests_linux:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: steps::checkout_repo
+      uses: actions/checkout@v4
+    - name: steps::setup_zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+    - name: steps::setup_linux
+      # X11 to build against; Xvfb, Mesa's llvmpipe (OpenGL) and lavapipe
+      # (Vulkan) to draw with, since the runner has no GPU.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends libx11-dev libxext-dev xvfb \
+          libgl1-mesa-dri libglx-mesa0 mesa-vulkan-drivers libvulkan1 vulkan-validationlayers
+    - name: run_tests::zig_build_test
+      # The offscreen Vulkan test draws on lavapipe, with validation.
+      run: zig build test --summary all
+      env:
+        MYZIG_VK_VALIDATION: '1'
+    - name: run_tests::build_release
+      run: zig build -Doptimize=ReleaseFast
+    - name: run_tests::frames
+      run: zig-out/bin/frames
+    - name: run_tests::windows_draw
+      # The gallery's first frame, from each renderer, in a real window.
+      run: |
+        mkdir -p shots
+        Xvfb :99 -screen 0 1280x800x24 &
+        sleep 1
+        for r in cpu gl vulkan; do
+          DISPLAY=:99 MYZIG_RENDERER=$r MYZIG_STATS=1 MYZIG_DUMP=shots/linux-$r.ppm timeout 60 zig-out/bin/gallery 2>&1 | tee shots/linux-$r.log
+          test -s shots/linux-$r.ppm
+          python3 script/ppm2png.py shots/linux-$r.ppm
+        done
+        grep -q "drawing with OpenGL" shots/linux-gl.log
+        grep -q "drawing with Vulkan" shots/linux-vulkan.log
+    - name: steps::upload_screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: screenshots-linux
+        path: shots/*.png
+        if-no-files-found: ignore
+    timeout-minutes: 30
+
+  run_tests_windows:
+    runs-on: windows-2022
+    steps:
+    - name: steps::checkout_repo
+      uses: actions/checkout@v4
+    - name: steps::setup_zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+    - name: run_tests::zig_build_test
+      run: zig build test --summary all
+    - name: run_tests::build_release
+      run: zig build -Doptimize=ReleaseFast
+    - name: run_tests::frames
+      run: zig-out/bin/frames.exe
+    - name: run_tests::windows_draw
+      # The runner has no GPU driver: the window draws on the CPU.
+      run: |
+        mkdir -p shots
+        MYZIG_RENDERER=cpu MYZIG_DUMP=shots/windows-cpu.ppm timeout 60 zig-out/bin/gallery.exe
+        test -s shots/windows-cpu.ppm
+        python script/ppm2png.py shots/windows-cpu.ppm
+        MYZIG_STATS=1 MYZIG_DUMP=shots/windows-default.ppm timeout 60 zig-out/bin/gallery.exe
+        test -s shots/windows-default.ppm
+        python script/ppm2png.py shots/windows-default.ppm
+    - name: steps::upload_screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: screenshots-windows
+        path: shots/*.png
+        if-no-files-found: ignore
+    timeout-minutes: 30
+
+  run_tests_mac:
+    runs-on: macos-15
+    steps:
+    - name: steps::checkout_repo
+      uses: actions/checkout@v4
+    - name: steps::setup_zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+    - name: run_tests::zig_build_test
+      # The offscreen Metal test draws on the runner's GPU.
+      run: zig build test --summary all
+    - name: run_tests::build_release
+      run: zig build -Doptimize=ReleaseFast
+    - name: run_tests::frames
+      run: zig-out/bin/frames
+    - name: steps::setup_moltenvk
+      run: brew install molten-vk
+    - name: run_tests::windows_draw
+      # The gallery's first frame: Metal's, the CPU's, and Vulkan's
+      # through MoltenVK.
+      run: |
+        mkdir -p shots
+        for r in metal cpu vulkan; do
+          MYZIG_RENDERER=$r MYZIG_STATS=1 MYZIG_DUMP=shots/mac-$r.ppm MYZIG_EXIT_AFTER=30 zig-out/bin/gallery 2>&1 | tee shots/mac-$r.log
+          test -s shots/mac-$r.ppm
+          python3 script/ppm2png.py shots/mac-$r.ppm
+        done
+        grep -q "drawing with Metal" shots/mac-metal.log
+        grep -q "drawing with Vulkan" shots/mac-vulkan.log
+    - name: steps::upload_screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: screenshots-mac
+        path: shots/*.png
+        if-no-files-found: ignore
+    timeout-minutes: 30
+
+  cross_compile:
+    # Every target builds from Linux: macOS and Windows need no SDK.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-windows, aarch64-windows, aarch64-macos, x86_64-macos]
+    steps:
+    - name: steps::checkout_repo
+      uses: actions/checkout@v4
+    - name: steps::setup_zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+    - name: cross_compile::build
+      run: |
+        zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSmall
+        ls -l zig-out/bin
+        echo "### ${{ matrix.target }} (ReleaseSmall)" >> "$GITHUB_STEP_SUMMARY"
+        ls -l zig-out/bin | awk 'NR>1 {printf "- %s: %d KB\n", $9, $5/1024}' >> "$GITHUB_STEP_SUMMARY"
+    timeout-minutes: 20
+
+  tests_pass:
+    needs:
+    - check_style
+    - run_tests_linux
+    - run_tests_windows
+    - run_tests_mac
+    - cross_compile
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+    - name: run_tests::tests_pass
+      run: |
+        set +x
+        EXIT_CODE=0
+        check_result() {
+          echo "* $1: $2"
+          if [[ "$2" != "skipped" && "$2" != "success" ]]; then EXIT_CODE=1; fi
+        }
+        check_result "check_style" "$RESULT_CHECK_STYLE"
+        check_result "run_tests_linux" "$RESULT_RUN_TESTS_LINUX"
+        check_result "run_tests_windows" "$RESULT_RUN_TESTS_WINDOWS"
+        check_result "run_tests_mac" "$RESULT_RUN_TESTS_MAC"
+        check_result "cross_compile" "$RESULT_CROSS_COMPILE"
+        exit $EXIT_CODE
+      env:
+        RESULT_CHECK_STYLE: ${{ needs.check_style.result }}
+        RESULT_RUN_TESTS_LINUX: ${{ needs.run_tests_linux.result }}
+        RESULT_RUN_TESTS_WINDOWS: ${{ needs.run_tests_windows.result }}
+        RESULT_RUN_TESTS_MAC: ${{ needs.run_tests_mac.result }}
+        RESULT_CROSS_COMPILE: ${{ needs.cross_compile.result }}
+    timeout-minutes: 5

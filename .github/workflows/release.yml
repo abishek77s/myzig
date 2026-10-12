@@ -1,0 +1,109 @@
+# Builds the examples for each OS and attaches them to a GitHub release
+# when a v* tag is pushed, as Zed's release workflow bundles each
+# platform: a tarball for Linux, a zip for Windows, signed .app bundles
+# for macOS.
+name: release
+env:
+  ZIG_VERSION: 0.15.2
+on:
+  push:
+    tags:
+    - v*
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+jobs:
+  bundle_linux:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: steps::checkout_repo
+      uses: actions/checkout@v4
+    - name: steps::setup_zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+    - name: steps::setup_linux
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libx11-dev libxext-dev
+    - name: release::build
+      run: |
+        zig build -Doptimize=ReleaseFast
+        mkdir -p dist/myzig-linux-x86_64
+        cp zig-out/bin/{counter,quotes,list,gallery} dist/myzig-linux-x86_64/
+        tar -C dist -czf dist/myzig-linux-x86_64.tar.gz myzig-linux-x86_64
+    - uses: actions/upload-artifact@v4
+      with:
+        name: linux
+        path: dist/*.tar.gz
+    timeout-minutes: 20
+
+  bundle_windows:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+    - name: steps::checkout_repo
+      uses: actions/checkout@v4
+    - name: steps::setup_zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+    - name: release::build
+      run: |
+        zig build -Dtarget=${{ matrix.arch }}-windows -Doptimize=ReleaseFast
+        mkdir -p dist/myzig-windows-${{ matrix.arch }}
+        cp zig-out/bin/{counter,quotes,list,gallery}.exe dist/myzig-windows-${{ matrix.arch }}/
+        cd dist && 7z a myzig-windows-${{ matrix.arch }}.zip myzig-windows-${{ matrix.arch }}
+    - uses: actions/upload-artifact@v4
+      with:
+        name: windows-${{ matrix.arch }}
+        path: dist/*.zip
+    timeout-minutes: 20
+
+  bundle_mac:
+    runs-on: macos-15
+    strategy:
+      matrix:
+        arch: [aarch64, x86_64]
+    steps:
+    - name: steps::checkout_repo
+      uses: actions/checkout@v4
+    - name: steps::setup_zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ env.ZIG_VERSION }}
+    - name: release::build
+      run: |
+        zig build -Dtarget=${{ matrix.arch }}-macos -Doptimize=ReleaseFast
+        for n in counter quotes list gallery; do script/bundle-mac $n dist/myzig-macos-${{ matrix.arch }}; done
+        cd dist && ditto -c -k --keepParent myzig-macos-${{ matrix.arch }} myzig-macos-${{ matrix.arch }}.zip
+      env:
+        MYZIG_VERSION: ${{ github.ref_name }}
+    - uses: actions/upload-artifact@v4
+      with:
+        name: mac-${{ matrix.arch }}
+        path: dist/*.zip
+    timeout-minutes: 20
+
+  create_release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [bundle_linux, bundle_windows, bundle_mac]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: dist
+        merge-multiple: true
+    - name: release::create_release
+      run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+      env:
+        GH_TOKEN: ${{ github.token }}
+    timeout-minutes: 10

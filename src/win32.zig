@@ -197,6 +197,8 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
 
             const uncapped = env.has("MYZIG_UNCAPPED");
             const print_stats = env.has("MYZIG_STATS");
+            const dump = env.get("MYZIG_DUMP");
+            if (dump != null) if (g.gpu) |*gr| gr.capture();
             const exit_after_ns: ?u64 = if (env.get("MYZIG_EXIT_AFTER")) |v| @intFromFloat((std.fmt.parseFloat(f64, v) catch 0) * 1e9) else null;
             var last_print: u64 = 0;
             var window_stats = app.Stats{};
@@ -227,6 +229,12 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                 if (g.need_frame) {
                     g.need_frame = false;
                     g.frame();
+                    if (dump) |path| {
+                        if (g.gpu) |*gr| {
+                            backend.writePPM(gpa, gr, g.width, g.height, path) catch {};
+                        } else app.writePixels(path, g.pixels, g.width, g.height, @intCast(g.width)) catch {};
+                        return;
+                    }
                     if (g.need_frame and !uncapped) {
                         // Frames that follow each other wait for the compositor,
                         // and for the period where it does not wait (no DWM).

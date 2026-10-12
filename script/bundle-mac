@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# bundle-mac NAME [OUT_DIR]: zig-out/bin/NAME as NAME.app, signed ad hoc,
+# so it opens from Finder and the Dock like any Mac app.
+set -euo pipefail
+name=$1
+out=${2:-zig-out/bundle}
+title="$(tr '[:lower:]' '[:upper:]' <<<"${name:0:1}")${name:1}"
+app="$out/$title.app"
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS"
+cp "zig-out/bin/$name" "$app/Contents/MacOS/$name"
+cat >"$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>$title</string>
+  <key>CFBundleDisplayName</key><string>$title</string>
+  <key>CFBundleIdentifier</key><string>dev.myzig.$name</string>
+  <key>CFBundleExecutable</key><string>$name</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>${MYZIG_VERSION:-0.0.0}</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+</dict>
+</plist>
+PLIST
+if command -v codesign >/dev/null; then codesign --force --sign - "$app"; fi
+echo "$app"

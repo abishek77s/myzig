@@ -288,6 +288,10 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                 }
             } else {
                 presentDamage(dpy, win, gc, &buf, rend.scrolls.items, rend.damage.items, use_shm, &stats, &timer);
+                if (dump) |path| {
+                    writePixels(path, buf.pixels(), w, h, buf.stride) catch {};
+                    return;
+                }
                 presenting = use_shm and rend.damage.items.len > 0;
             }
             if (ctx.animating or ctx.requested) need_frame = true;
@@ -458,6 +462,20 @@ fn mapKey(sym: c_ulong) ui.Key {
         0xff08 => .backspace,
         else => .none,
     };
+}
+
+/// writePixels writes a canvas of 0x00RRGGBB pixels to path, as a PPM
+/// image: what MYZIG_DUMP=path saves of a window's first frame.
+pub fn writePixels(path: []const u8, pixels: []const u32, w: i32, h: i32, stride: usize) !void {
+    var f = try std.fs.cwd().createFile(path, .{});
+    defer f.close();
+    var wbuf: [64 << 10]u8 = undefined;
+    var fw = f.writer(&wbuf);
+    try fw.interface.print("P6\n{d} {d}\n255\n", .{ w, h });
+    for (0..@intCast(h)) |y| for (pixels[y * stride ..][0..@intCast(w)]) |p| {
+        try fw.interface.writeAll(&.{ @truncate(p >> 16), @truncate(p >> 8), @truncate(p) });
+    };
+    try fw.interface.flush();
 }
 
 pub fn printStats(label: []const u8, s: Stats, elapsed_ns: u64) void {
