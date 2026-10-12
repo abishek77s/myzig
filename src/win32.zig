@@ -11,6 +11,9 @@ const text = @import("text.zig");
 const scene = @import("scene.zig");
 const raster = @import("raster.zig");
 const geom = @import("geom.zig");
+const choose = @import("gpu/choose.zig");
+const glr = @import("gpu/gl.zig");
+const Wgl = @import("gpu/wgl.zig").Wgl;
 
 const WINAPI: std.builtin.CallingConvention = .winapi;
 const HWND = *opaque {};
@@ -104,6 +107,7 @@ const WS_OVERLAPPEDWINDOW = 0x00CF0000;
 const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
 const CS_HREDRAW = 0x2;
 const CS_VREDRAW = 0x1;
+const CS_OWNDC = 0x20;
 const PM_REMOVE = 1;
 const QS_ALLINPUT = 0x04FF;
 const MWMO_INPUTAVAILABLE = 0x4;
@@ -138,13 +142,15 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
         tracking: bool = false,
         stats: app.Stats = .{},
         timer: std.time.Timer,
+        wgl: ?Wgl = null,
+        gpu: ?glr.Renderer = null,
 
         fn run(state: S, opts: app.WindowOptions) !void {
             const gpa = std.heap.c_allocator;
             _ = SetProcessDpiAwarenessContext(-4); // per monitor, v2
             const inst = GetModuleHandleW(null);
             const class = std.unicode.utf8ToUtf16LeStringLiteral("MyZigWindow");
-            const wc = WNDCLASSEXW{ .style = CS_HREDRAW | CS_VREDRAW, .lpfnWndProc = proc, .hInstance = inst, .hCursor = LoadCursorW(null, IDC_ARROW), .lpszClassName = class };
+            const wc = WNDCLASSEXW{ .style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC, .lpfnWndProc = proc, .hInstance = inst, .hCursor = LoadCursorW(null, IDC_ARROW), .lpszClassName = class };
             if (RegisterClassExW(&wc) == 0) return error.RegisterClass;
 
             const dpi = GetDpiForSystem();
@@ -159,6 +165,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             g.scale = if (env.get("MYZIG_SCALE")) |v| std.fmt.parseFloat(f32, v) catch s0 else s0;
             g.hwnd = CreateWindowExW(0, class, title.ptr, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, null, null, inst, null) orelse return error.CreateWindow;
             if (env.get("MYZIG_SCALE") == null) g.scale = @as(f32, @floatFromInt(GetDpiForWindow(g.hwnd))) / 96;
+            g.openGpu(gpa, env.has("MYZIG_STATS"));
             var cr = RECT{};
             _ = GetClientRect(g.hwnd, &cr);
             g.resize(cr.right, cr.bottom);
@@ -214,6 +221,31 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             }
         }
 
+        fn openGpu(w: *Self, gpa: std.mem.Allocator, verbose: bool) void {
+            const choice = choose.choose();
+            if (choice.kind == .cpu) return;
+            if (choice.kind == .vulkan) std.log.warn("myzig: Vulkan is not ready on Windows yet; drawing with OpenGL", .{});
+            const dc = GetDC(w.hwnd) orelse return;
+            w.wgl = Wgl.open(dc) catch |e| {
+                std.log.warn("myzig: no OpenGL ({s}); drawing on the CPU", .{@errorName(e)});
+                return;
+            };
+            const gl = glr.Gl.load(&w.wgl.?, Wgl.proc) catch return w.closeGpu();
+            w.gpu = glr.Renderer.init(gpa, gl) catch return w.closeGpu();
+            const name = w.gpu.?.name();
+            if (!choice.forced and glr.software(name)) return w.closeGpu();
+            if (verbose) std.debug.print("myzig: drawing with OpenGL on {s}\n", .{name});
+            w.rend.raster = false;
+            w.rend.retain_pixels = false;
+        }
+
+        fn closeGpu(w: *Self) void {
+            if (w.gpu) |*r| r.deinit();
+            w.gpu = null;
+            if (w.wgl) |*x| x.release();
+            w.wgl = null;
+        }
+
         fn resize(w: *Self, cw: i32, ch: i32) void {
             const nw = @max(1, cw);
             const nh = @max(1, ch);
@@ -239,7 +271,12 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             const px = w.rend.stats.pixels;
             _ = w.rend.render(&w.sc, &w.fonts, &cv);
             const t2 = w.timer.read();
-            if (GetDC(w.hwnd)) |dc| {
+            if (w.gpu) |*r| {
+                if (w.rend.damage.items.len > 0) {
+                    r.draw(&w.sc, &w.fonts, w.width, w.height) catch |e| std.log.err("myzig: OpenGL frame: {s}", .{@errorName(e)});
+                    w.wgl.?.swap();
+                }
+            } else if (GetDC(w.hwnd)) |dc| {
                 // The pixels of scrolled layers moved in the canvas: they go too.
                 for (w.rend.scrolls.items) |s| w.blit(dc, s.clip);
                 for (w.rend.damage.items) |d| w.blit(dc, d);
@@ -286,11 +323,12 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                     const dc = BeginPaint(hwnd, &ps) orelse return 0;
                     if (w.hwnd == hwnd) {
                         // Live resizing runs a loop of its own: draw here.
+                        if (w.gpu != null) w.rend.invalidate();
                         if (!w.rend.valid) {
                             w.need_frame = false;
                             w.frame();
                         }
-                        w.blit(dc, .{ .x0 = ps.rcPaint.left, .y0 = ps.rcPaint.top, .x1 = ps.rcPaint.right, .y1 = ps.rcPaint.bottom });
+                        if (w.gpu == null) w.blit(dc, .{ .x0 = ps.rcPaint.left, .y0 = ps.rcPaint.top, .x1 = ps.rcPaint.right, .y1 = ps.rcPaint.bottom });
                     }
                     _ = EndPaint(hwnd, &ps);
                     return 0;
