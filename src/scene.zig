@@ -15,7 +15,7 @@ const IRect = geom.IRect;
 const Color = geom.Color;
 
 pub const Op = struct {
-    kind: enum(u8) { rect, text },
+    kind: enum(u8) { rect, text, stroke },
     weight: text.Weight = .regular,
     color: Color,
     border_color: Color = .transparent,
@@ -30,6 +30,9 @@ pub const Op = struct {
     hash: u64 = 0,
     /// layer is 1 + the index of the scroll layer the op is in, 0 for none.
     layer: u16 = 0,
+    /// seg is a stroke's two segments, x0 y0 x1 y1 each, in fractions of
+    /// rect (so they move with it); its width is border.
+    seg: [2][4]f32 = .{ .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
 };
 
 /// Layer is a scrolled area: its ops hash where they are in its content,
@@ -123,6 +126,19 @@ pub const Scene = struct {
         s.finish(&op, "");
     }
 
+    /// stroke paints up to two line segments with round caps, width wide,
+    /// placed in r: icons (a check mark, chevrons, a cross) at any scale.
+    /// Segments are x0, y0, x1, y1 in fractions of r.
+    pub fn stroke(s: *Scene, r: Rect, seg: [2][4]f32, width: f32, color: Color) void {
+        if (color.a == 0) return;
+        const c = s.clip();
+        const pad = width;
+        const b = IRect.fromRect(.{ .x = r.x - pad, .y = r.y - pad, .w = r.w + 2 * pad, .h = r.h + 2 * pad }, s.scale).intersect(c);
+        if (b.isEmpty()) return;
+        var op = Op{ .kind = .stroke, .color = color, .rect = r, .border = width, .seg = seg, .clip = c, .bounds = b };
+        s.finish(&op, "");
+    }
+
     /// text paints str with its pen at x and its baseline at y.
     pub fn textRun(s: *Scene, fonts: *text.Fonts, x: f32, y: f32, str: []const u8, size: f32, weight: text.Weight, color: Color) void {
         if (str.len == 0 or color.a == 0) return;
@@ -155,6 +171,7 @@ fn hashOp(op: *const Op, str: []const u8, layer_key: u64, offset: ?f32) u64 {
     h.update(std.mem.asBytes(&op.size));
     h.update(std.mem.asBytes(&op.weight));
     h.update(std.mem.asBytes(&op.clip));
+    if (op.kind == .stroke) h.update(std.mem.asBytes(&op.seg));
     h.update(str);
     return h.final();
 }
@@ -396,6 +413,12 @@ pub fn drawOp(s: *const Scene, fonts: *text.Fonts, cv: *const raster.Canvas, op:
             } else {
                 cv.rrect(x, y, w, h, rad, op.color, clip);
             }
+        },
+        .stroke => {
+            const r = op.rect;
+            var segs: [2][4]f32 = undefined;
+            for (op.seg, 0..) |sg, i| segs[i] = .{ (r.x + sg[0] * r.w) * k, (r.y + sg[1] * r.h) * k, (r.x + sg[2] * r.w) * k, (r.y + sg[3] * r.h) * k };
+            cv.stroke(op.bounds.intersect(clip), segs, op.border * k, op.color);
         },
         .text => {
             const Ctx = struct {

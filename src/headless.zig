@@ -82,8 +82,49 @@ pub fn Headless(comptime State: type) type {
         }
 
         pub fn key(h: *Self, k: ui.Key) void {
-            _ = h.ctx.keyDown(k);
+            _ = h.ctx.keyDownMods(k, .{});
             h.frame();
+        }
+
+        /// keyMods presses k with mods held.
+        pub fn keyMods(h: *Self, k: ui.Key, mods: ui.Mods) void {
+            _ = h.ctx.keyDownMods(k, mods);
+            h.frame();
+            h.ctx.setMods(.{});
+        }
+
+        /// typeText types s, as the platforms deliver typed text.
+        pub fn typeText(h: *Self, s: []const u8) void {
+            _ = h.ctx.typeText(s);
+            h.frame();
+        }
+
+        /// clickAt clicks at x, y (logical pixels).
+        pub fn clickAt(h: *Self, x: f32, y: f32) void {
+            if (h.ctx.pointerMove(x, y)) h.frame();
+            _ = h.ctx.pointerDown(x, y);
+            h.frame();
+            _ = h.ctx.pointerUp(x, y);
+            h.frame();
+        }
+
+        /// drag presses at (x0, y0), moves to (x1, y1) in steps, and lets go.
+        pub fn drag(h: *Self, x0: f32, y0: f32, x1: f32, y1: f32) void {
+            if (h.ctx.pointerMove(x0, y0)) h.frame();
+            _ = h.ctx.pointerDown(x0, y0);
+            h.frame();
+            const steps = 4;
+            for (1..steps + 1) |i| {
+                const f = @as(f32, @floatFromInt(i)) / steps;
+                if (h.ctx.pointerMove(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f)) h.frame();
+            }
+            _ = h.ctx.pointerUp(x1, y1);
+            h.frame();
+        }
+
+        /// rectOf is where the text (or the control labelled) label is.
+        pub fn rectOf(h: *const Self, label: []const u8) ?ui.Rect {
+            return h.ctx.find(label);
         }
 
         pub fn scroll(h: *Self, x: f32, y: f32, dy: f32) void {

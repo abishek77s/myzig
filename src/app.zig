@@ -90,7 +90,18 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     _ = x.XStoreName(dpy, win, opts.title.ptr);
     var wm_delete = x.XInternAtom(dpy, "WM_DELETE_WINDOW", 0);
     _ = x.XSetWMProtocols(dpy, win, @ptrCast(&wm_delete), 1);
-    _ = x.XSelectInput(dpy, win, x.KeyPressMask | x.ButtonPressMask | x.ButtonReleaseMask | x.PointerMotionMask | x.LeaveWindowMask | x.ExposureMask | x.StructureNotifyMask);
+    _ = x.XSelectInput(dpy, win, x.KeyPressMask | x.ButtonPressMask | x.ButtonReleaseMask | x.PointerMotionMask | x.LeaveWindowMask | x.ExposureMask | x.StructureNotifyMask | x.FocusChangeMask);
+    // Text comes through an input method, in UTF-8, where there is one.
+    _ = x.setlocale(0, ""); // LC_CTYPE
+    _ = x.XSetLocaleModifiers("");
+    const im = x.XOpenIM(dpy, null, null, null);
+    defer if (im) |m| {
+        _ = x.XCloseIM(m);
+    };
+    const ic: ?*anyopaque = if (im) |m| x.XCreateIC(m, "inputStyle", @as(c_long, x.XIMPreeditNothing | x.XIMStatusNothing), "clientWindow", win, "focusWindow", win, @as(?*anyopaque, null)) else null;
+    defer if (ic) |i| x.XDestroyIC(i);
+    const cursors = [_]c_ulong{ x.XCreateFontCursor(dpy, x.XC_left_ptr), x.XCreateFontCursor(dpy, x.XC_xterm), x.XCreateFontCursor(dpy, x.XC_hand2) };
+    var cursor: ui.Cursor = .arrow;
     _ = x.XMapWindow(dpy, win);
     const gc = x.XCreateGC(dpy, win, 0, null);
 
@@ -101,6 +112,9 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     defer fonts.deinit();
     var ctx = ui.Context.init(gpa, &fonts);
     defer ctx.deinit();
+    var clip = Clipboard.init(gpa, dpy, win);
+    defer clip.deinit();
+    ctx.clipboard = clip.interface();
     var sc = scene.Scene{ .gpa = gpa };
     defer sc.deinit();
     var rend = scene.Renderer{ .gpa = gpa, .retain_pixels = false };
@@ -166,6 +180,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
         // Drain the events the server sent.
         while (x.XPending(dpy) > 0) {
             _ = x.XNextEvent(dpy, &ev);
+            if (x.XFilterEvent(&ev, 0) != 0) continue; // the input method's
             const k = scale;
             switch (ev.type) {
                 x.Expose, x.GraphicsExpose => {
@@ -192,6 +207,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                     if (ctx.pointerMove(-1, -1)) need_frame = true;
                 },
                 x.ButtonPress => {
+                    ctx.setMods(modsOf(ev.button.state));
                     const px = @as(f32, @floatFromInt(ev.button.x)) / k;
                     const py = @as(f32, @floatFromInt(ev.button.y)) / k;
                     switch (ev.button.detail) {
@@ -212,8 +228,18 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                     if (ctx.pointerUp(@as(f32, @floatFromInt(ev.button.x)) / k, @as(f32, @floatFromInt(ev.button.y)) / k)) need_frame = true;
                 },
                 x.KeyPress => {
-                    if (ctx.keyDown(mapKey(x.XLookupKeysym(&ev.key, 0)))) need_frame = true;
+                    const mods = modsOf(ev.key.state);
+                    if (ctx.keyDownMods(mapKey(x.XLookupKeysym(&ev.key, 0)), mods)) need_frame = true;
+                    if (!mods.ctrl and !mods.alt and !mods.super) {
+                        var tb: [64]u8 = undefined;
+                        const n = keyText(ic, &ev.key, &tb);
+                        if (n > 0 and ctx.typeText(tb[0..n])) need_frame = true;
+                    }
                 },
+                x.FocusIn => if (ic) |i| x.XSetICFocus(i),
+                x.FocusOut => if (ic) |i| x.XUnsetICFocus(i),
+                x.SelectionRequest => clip.answer(&ev.selection_request),
+                x.SelectionClear => clip.owned.clearRetainingCapacity(),
                 x.ClientMessage => {
                     if (@as(x.Atom, @bitCast(ev.client.data[0])) == wm_delete) return;
                 },
@@ -261,12 +287,23 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                 presenting = use_shm and rend.damage.items.len > 0;
             }
             if (ctx.animating or ctx.requested) need_frame = true;
+            if (ctx.cursor != cursor) {
+                cursor = ctx.cursor;
+                _ = x.XDefineCursor(dpy, win, cursors[@intFromEnum(cursor)]);
+            }
             next_frame = if (now - next_frame < period) next_frame + period else now + period;
             continue;
         }
 
+        // A frame the view asked for at a time (a caret's blink).
+        if (ctx.wake_at != 0 and now >= ctx.wake_at) {
+            ctx.wake_at = 0;
+            need_frame = true;
+            continue;
+        }
         // Sleep until the server writes, or the next frame is due.
         var timeout: i32 = -1;
+        if (ctx.wake_at != 0) timeout = @intCast(@divTrunc(ctx.wake_at - now + 999_999, 1_000_000));
         if (need_frame and !presenting and !uncapped) timeout = @intCast(@max(0, @divTrunc(@as(i64, @intCast(next_frame)) - @as(i64, @intCast(now)) + 999_999, 1_000_000)));
         if (exit_after_ns) |limit| {
             const left: i32 = @intCast(@max(0, @divTrunc(@as(i64, @intCast(limit)) - @as(i64, @intCast(now)), 1_000_000) + 1));
@@ -366,8 +403,32 @@ fn freeBuffer(dpy: *x.Display, buf: *Buffer) void {
     buf.* = .{};
 }
 
+fn modsOf(state: c_uint) ui.Mods {
+    return .{ .shift = state & x.ShiftMask != 0, .ctrl = state & x.ControlMask != 0, .alt = state & x.Mod1Mask != 0, .super = state & x.Mod4Mask != 0 };
+}
+
+/// keyText is the text of a key press, UTF-8, through the input method or,
+/// without one, from its Latin-1 keysym text.
+fn keyText(ic: ?*anyopaque, ev: *x.InputEvent, out: *[64]u8) usize {
+    if (ic) |i| {
+        var status: c_int = 0;
+        const n = x.Xutf8LookupString(i, ev, out, out.len, null, &status);
+        return if (n > 0 and status != x.XBufferOverflow) @intCast(n) else 0;
+    }
+    var latin: [16]u8 = undefined;
+    const n: usize = @intCast(@max(0, x.XLookupString(ev, &latin, latin.len, null, null)));
+    var o: usize = 0;
+    for (latin[0..n]) |b| o += std.unicode.utf8Encode(b, out[o..]) catch break;
+    return o;
+}
+
 fn mapKey(sym: c_ulong) ui.Key {
+    if (sym >= 'a' and sym <= 'z') return ui.Key.letter(@intCast(sym));
+    if (sym >= 'A' and sym <= 'Z') return ui.Key.letter(@intCast(sym));
     return switch (sym) {
+        0xffff => .delete,
+        0xff8d => .enter,
+        0xfe20 => .tab, // Shift+Tab's
         0xff52 => .up,
         0xff54 => .down,
         0xff51 => .left,
@@ -397,3 +458,98 @@ pub fn printStats(label: []const u8, s: Stats, elapsed_ns: u64) void {
         @as(f64, @floatFromInt(s.pixels)) / f,
     });
 }
+
+/// Clipboard is X11's CLIPBOARD selection: copying owns it, and the window
+/// answers the requests of the apps that paste; pasting asks its owner.
+const Clipboard = struct {
+    gpa: std.mem.Allocator,
+    dpy: *x.Display,
+    win: x.Window,
+    clipboard: x.Atom,
+    utf8: x.Atom,
+    targets: x.Atom,
+    text_atom: x.Atom,
+    property: x.Atom,
+    owned: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn init(gpa: std.mem.Allocator, dpy: *x.Display, win: x.Window) Clipboard {
+        return .{
+            .gpa = gpa,
+            .dpy = dpy,
+            .win = win,
+            .clipboard = x.XInternAtom(dpy, "CLIPBOARD", 0),
+            .utf8 = x.XInternAtom(dpy, "UTF8_STRING", 0),
+            .targets = x.XInternAtom(dpy, "TARGETS", 0),
+            .text_atom = x.XInternAtom(dpy, "TEXT", 0),
+            .property = x.XInternAtom(dpy, "MYZIG_CLIPBOARD", 0),
+        };
+    }
+
+    fn deinit(c: *Clipboard) void {
+        c.owned.deinit(c.gpa);
+    }
+
+    fn interface(c: *Clipboard) ui.Clipboard {
+        return .{ .ctx = c, .get = get, .set = set };
+    }
+
+    fn set(ctx: *anyopaque, s: []const u8) void {
+        const c: *Clipboard = @ptrCast(@alignCast(ctx));
+        c.owned.clearRetainingCapacity();
+        c.owned.appendSlice(c.gpa, s) catch return;
+        _ = x.XSetSelectionOwner(c.dpy, c.clipboard, c.win, 0);
+    }
+
+    fn get(ctx: *anyopaque, gpa: std.mem.Allocator) ?[]u8 {
+        const c: *Clipboard = @ptrCast(@alignCast(ctx));
+        const owner = x.XGetSelectionOwner(c.dpy, c.clipboard);
+        if (owner == c.win) return gpa.dupe(u8, c.owned.items) catch null;
+        if (owner == 0) return null;
+        _ = x.XConvertSelection(c.dpy, c.clipboard, c.utf8, c.property, c.win, 0);
+        _ = x.XFlush(c.dpy);
+        // The owner answers with SelectionNotify; wait for it, briefly.
+        var ev: x.XEvent = undefined;
+        var waited: u32 = 0;
+        while (x.XCheckTypedWindowEvent(c.dpy, c.win, x.SelectionNotify, &ev) == 0) : (waited += 1) {
+            if (waited > 250) return null;
+            std.Thread.sleep(std.time.ns_per_ms);
+        }
+        if (ev.selection.property == 0) return null;
+        var actual: x.Atom = 0;
+        var format: c_int = 0;
+        var n: c_ulong = 0;
+        var after: c_ulong = 0;
+        var data: ?[*]u8 = null;
+        if (x.XGetWindowProperty(c.dpy, c.win, c.property, 0, 1 << 20, 1, x.AnyPropertyType, &actual, &format, &n, &after, &data) != 0) return null;
+        const p = data orelse return null;
+        defer _ = x.XFree(p);
+        if (format != 8) return null;
+        return gpa.dupe(u8, p[0..n]) catch null;
+    }
+
+    /// answer gives the text owned to the app that asked for it.
+    fn answer(c: *Clipboard, req: *const x.SelectionRequestEvent) void {
+        var reply = x.XEvent{ .selection = .{
+            .type = x.SelectionNotify,
+            .serial = 0,
+            .send_event = 1,
+            .display = c.dpy,
+            .requestor = req.requestor,
+            .selection = req.selection,
+            .target = req.target,
+            .property = 0,
+            .time = req.time,
+        } };
+        const prop = if (req.property != 0) req.property else req.target;
+        if (req.target == c.targets) {
+            const atoms = [_]x.Atom{ c.targets, c.utf8, x.XA_STRING, c.text_atom };
+            _ = x.XChangeProperty(c.dpy, req.requestor, prop, x.XA_ATOM, 32, x.PropModeReplace, @ptrCast(&atoms), atoms.len);
+            reply.selection.property = prop;
+        } else if (req.target == c.utf8 or req.target == x.XA_STRING or req.target == c.text_atom) {
+            _ = x.XChangeProperty(c.dpy, req.requestor, prop, if (req.target == c.text_atom) c.utf8 else req.target, 8, x.PropModeReplace, c.owned.items.ptr, @intCast(c.owned.items.len));
+            reply.selection.property = prop;
+        }
+        _ = x.XSendEvent(c.dpy, req.requestor, 0, 0, &reply);
+        _ = x.XFlush(c.dpy);
+    }
+};

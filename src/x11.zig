@@ -43,6 +43,8 @@ pub const XEvent = extern union {
     configure: ConfigureEvent,
     expose: ExposeEvent,
     client: ClientMessageEvent,
+    selection_request: SelectionRequestEvent,
+    selection: SelectionEvent,
     pad: [24]c_long,
 };
 
@@ -82,7 +84,31 @@ pub const ConfigureEvent = extern struct {
 pub const ExposeEvent = extern struct { type: c_int, serial: c_ulong, send_event: c_int, display: ?*Display, window: Window, x: c_int, y: c_int, width: c_int, height: c_int, count: c_int };
 pub const ClientMessageEvent = extern struct { type: c_int, serial: c_ulong, send_event: c_int, display: ?*Display, window: Window, message_type: Atom, format: c_int, data: [5]c_long };
 
+pub const SelectionRequestEvent = extern struct { type: c_int, serial: c_ulong, send_event: c_int, display: ?*Display, owner: Window, requestor: Window, selection: Atom, target: Atom, property: Atom, time: c_ulong };
+pub const SelectionEvent = extern struct { type: c_int, serial: c_ulong, send_event: c_int, display: ?*Display, requestor: Window, selection: Atom, target: Atom, property: Atom, time: c_ulong };
+
 pub const KeyPress = 2;
+pub const SelectionClear = 29;
+pub const SelectionRequest = 30;
+pub const SelectionNotify = 31;
+pub const FocusIn = 9;
+pub const FocusOut = 10;
+pub const FocusChangeMask = 1 << 21;
+pub const ShiftMask = 1 << 0;
+pub const LockMask = 1 << 1;
+pub const ControlMask = 1 << 2;
+pub const Mod1Mask = 1 << 3; // Alt
+pub const Mod4Mask = 1 << 6; // Super
+pub const PropModeReplace = 0;
+pub const XA_ATOM: Atom = 4;
+pub const XA_STRING: Atom = 31;
+pub const AnyPropertyType: Atom = 0;
+pub const XC_left_ptr = 68;
+pub const XC_xterm = 152;
+pub const XC_hand2 = 60;
+pub const XIMPreeditNothing = 0x0008;
+pub const XIMStatusNothing = 0x0400;
+pub const XBufferOverflow = -1;
 pub const ButtonPress = 4;
 pub const ButtonRelease = 5;
 pub const MotionNotify = 6;
@@ -124,6 +150,28 @@ pub extern "X11" fn XPutImage(d: *Display, drawable: Window, gc: GC, img: *XImag
 pub extern "X11" fn XCopyArea(d: *Display, src: Window, dst: Window, gc: GC, sx: c_int, sy: c_int, w: c_uint, h: c_uint, dx: c_int, dy: c_int) c_int;
 pub extern "X11" fn XFree(p: ?*anyopaque) c_int;
 pub extern "X11" fn XLookupKeysym(ev: *InputEvent, index: c_int) c_ulong;
+
+pub extern "X11" fn XLookupString(ev: *InputEvent, buf: [*]u8, len: c_int, sym: ?*c_ulong, status: ?*anyopaque) c_int;
+pub extern "X11" fn Xutf8LookupString(ic: *anyopaque, ev: *InputEvent, buf: [*]u8, len: c_int, sym: ?*c_ulong, status: ?*c_int) c_int;
+pub extern "X11" fn XSetLocaleModifiers(mods: [*:0]const u8) ?[*:0]u8;
+pub extern "X11" fn XOpenIM(d: *Display, db: ?*anyopaque, name: ?[*:0]const u8, class: ?[*:0]const u8) ?*anyopaque;
+pub extern "X11" fn XCloseIM(im: *anyopaque) c_int;
+pub extern "X11" fn XCreateIC(im: *anyopaque, ...) ?*anyopaque;
+pub extern "X11" fn XDestroyIC(ic: *anyopaque) void;
+pub extern "X11" fn XSetICFocus(ic: *anyopaque) void;
+pub extern "X11" fn XUnsetICFocus(ic: *anyopaque) void;
+pub extern "X11" fn XFilterEvent(ev: *XEvent, w: Window) c_int;
+pub extern "X11" fn XSetSelectionOwner(d: *Display, selection: Atom, owner: Window, time: c_ulong) c_int;
+pub extern "X11" fn XGetSelectionOwner(d: *Display, selection: Atom) Window;
+pub extern "X11" fn XConvertSelection(d: *Display, selection: Atom, target: Atom, property: Atom, requestor: Window, time: c_ulong) c_int;
+pub extern "X11" fn XChangeProperty(d: *Display, w: Window, property: Atom, type: Atom, format: c_int, mode: c_int, data: [*]const u8, n: c_int) c_int;
+pub extern "X11" fn XGetWindowProperty(d: *Display, w: Window, property: Atom, offset: c_long, length: c_long, delete: c_int, req_type: Atom, actual_type: *Atom, actual_format: *c_int, nitems: *c_ulong, bytes_after: *c_ulong, prop: *?[*]u8) c_int;
+pub extern "X11" fn XDeleteProperty(d: *Display, w: Window, property: Atom) c_int;
+pub extern "X11" fn XSendEvent(d: *Display, w: Window, propagate: c_int, mask: c_long, ev: *XEvent) c_int;
+pub extern "X11" fn XCheckTypedWindowEvent(d: *Display, w: Window, type: c_int, ev: *XEvent) c_int;
+pub extern "X11" fn XCreateFontCursor(d: *Display, shape: c_uint) c_ulong;
+pub extern "X11" fn XDefineCursor(d: *Display, w: Window, cursor: c_ulong) c_int;
+pub extern "c" fn setlocale(category: c_int, locale: ?[*:0]const u8) ?[*:0]u8;
 
 pub extern "Xext" fn XShmQueryExtension(d: *Display) c_int;
 pub extern "Xext" fn XShmGetEventBase(d: *Display) c_int;

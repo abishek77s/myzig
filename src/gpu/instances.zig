@@ -16,9 +16,12 @@ pub const Instance = extern struct {
     color: [4]f32,
     border_color: [4]f32,
     /// params are the radius and the border width in device pixels, and
-    /// the kind: 0 for a box, 1 for a glyph.
+    /// the kind: 0 for a box, 1 for a glyph, 2 for a stroke (whose width
+    /// is the border's).
     params: [4]f32,
-    /// uv is the glyph's place in the atlas, normalized: uv_x, uv_y, u1, v1.
+    /// uv is the glyph's place in the atlas, normalized: uv_x, uv_y, u1, v1;
+    /// for a stroke its first segment, and border_color its second, in
+    /// fractions of rect.
     uv: [4]f32,
 };
 
@@ -79,6 +82,13 @@ fn rgba(c: anytype) [4]f32 {
     return .{ @as(f32, @floatFromInt(c.r)) / 255, @as(f32, @floatFromInt(c.g)) / 255, @as(f32, @floatFromInt(c.b)) / 255, @as(f32, @floatFromInt(c.a)) / 255 };
 }
 
+/// remap moves a segment in fractions of r to fractions of r grown by pad.
+fn remap(s: [4]f32, r: anytype, pad: f32) [4]f32 {
+    const w = r.w + 2 * pad;
+    const h = r.h + 2 * pad;
+    return .{ (s[0] * r.w + pad) / w, (s[1] * r.h + pad) / h, (s[2] * r.w + pad) / w, (s[3] * r.h + pad) / h };
+}
+
 fn clipOf(c: anytype) [4]f32 {
     return .{ @floatFromInt(c.x0), @floatFromInt(c.y0), @floatFromInt(c.x1), @floatFromInt(c.y1) };
 }
@@ -111,6 +121,20 @@ fn buildOnce(s: *const scene.Scene, fonts: *text.Fonts, atlas: *Atlas, out: *std
             .params = .{ @min(op.radius, @min(op.rect.w, op.rect.h) / 2) * k, op.border * k, 0, 0 },
             .uv = .{ 0, 0, 0, 0 },
         }),
+        .stroke => {
+            // The quad covers the stroke's caps; the segments stay in
+            // fractions of the stroke's own rect.
+            const pad = op.border;
+            const r = op.rect;
+            try out.append(atlas.gpa, .{
+                .rect = .{ (r.x - pad) * k, (r.y - pad) * k, (r.w + 2 * pad) * k, (r.h + 2 * pad) * k },
+                .clip = clipOf(op.clip),
+                .color = rgba(op.color),
+                .border_color = remap(op.seg[1], r, pad),
+                .params = .{ 0, op.border * k, 2, 0 },
+                .uv = remap(op.seg[0], r, pad),
+            });
+        },
         .text => {
             const Ctx = struct {
                 out: *std.ArrayListUnmanaged(Instance),
@@ -163,6 +187,7 @@ pub const glsl_vertex =
     \\flat out vec4 v_color;
     \\flat out vec4 v_border_color;
     \\flat out vec4 v_params;
+    \\flat out vec4 v_seg;
     \\void main() {
     \\    vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
     \\    vec2 pos = a_rect.xy + corner * a_rect.zw;
@@ -173,6 +198,7 @@ pub const glsl_vertex =
     \\    v_color = a_color;
     \\    v_border_color = a_border_color;
     \\    v_params = a_params;
+    \\    v_seg = a_uv;
     \\    vec2 ndc = pos / u_viewport * 2.0 - 1.0;
     \\    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
     \\}
@@ -187,15 +213,28 @@ pub const glsl_fragment =
     \\flat in vec4 v_color;
     \\flat in vec4 v_border_color;
     \\flat in vec4 v_params;
+    \\flat in vec4 v_seg;
     \\uniform sampler2D u_atlas;
     \\out vec4 o_color;
     \\float box(vec2 p, vec2 c, vec2 h, float r) {
     \\    vec2 q = abs(p - c) - (h - r);
     \\    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
     \\}
+    \\float segment(vec2 p, vec4 s) {
+    \\    vec2 a = v_rect.xy + s.xy * v_rect.zw;
+    \\    vec2 d = v_rect.xy + s.zw * v_rect.zw - a;
+    \\    float l2 = dot(d, d);
+    \\    float t = l2 > 0.0 ? clamp(dot(p - a, d) / l2, 0.0, 1.0) : 0.0;
+    \\    return length(p - a - t * d);
+    \\}
     \\void main() {
     \\    if (v_pos.x < v_clip.x || v_pos.y < v_clip.y || v_pos.x >= v_clip.z || v_pos.y >= v_clip.w) discard;
     \\    vec4 fill = vec4(v_color.rgb * v_color.a, v_color.a);
+    \\    if (v_params.z > 1.5) {
+    \\        float d = min(segment(v_pos, v_seg), segment(v_pos, v_border_color)) - v_params.y * 0.5;
+    \\        o_color = fill * clamp(0.5 - d, 0.0, 1.0);
+    \\        return;
+    \\    }
     \\    if (v_params.z > 0.5) {
     \\        o_color = fill * texture(u_atlas, v_uv).r;
     \\        return;

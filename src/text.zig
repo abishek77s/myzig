@@ -169,6 +169,33 @@ pub const Fonts = struct {
         return v;
     }
 
+    /// prefixWidth is the advance of s[0..end], not memoized: for carets,
+    /// whose prefixes would crowd the memo out.
+    pub fn prefixWidth(f: *Fonts, w: Weight, px: f32, s: []const u8, end: usize) f32 {
+        return f.measureUncached(w, px, s[0..@min(end, s.len)]);
+    }
+
+    /// indexAt returns the byte offset in s of the caret position nearest
+    /// x, a boundary between code points.
+    pub fn indexAt(f: *Fonts, w: Weight, px: f32, s: []const u8, x: f32) usize {
+        const fc = f.face(w);
+        const sc = fc.scale(px);
+        var pen: f32 = 0;
+        var prev: u32 = 0;
+        var it = Utf8Iter{ .s = s };
+        var at: usize = 0;
+        while (it.next()) |cp| {
+            const g = fc.glyph(cp);
+            if (prev != 0) pen += @as(f32, @floatFromInt(mz_kern(fc.info, @intCast(prev), @intCast(g)))) * sc;
+            const adv = fc.advance(cp, g) * sc;
+            if (x < pen + adv / 2) return at;
+            pen += adv;
+            prev = g;
+            at = it.i;
+        }
+        return s.len;
+    }
+
     fn measureUncached(f: *Fonts, w: Weight, px: f32, s: []const u8) f32 {
         const fc = f.face(w);
         const sc = fc.scale(px);

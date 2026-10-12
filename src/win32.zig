@@ -89,10 +89,28 @@ extern "user32" fn SetProcessDpiAwarenessContext(ctx: isize) callconv(WINAPI) BO
 extern "user32" fn GetDpiForWindow(h: HWND) callconv(WINAPI) u32;
 extern "user32" fn GetDpiForSystem() callconv(WINAPI) u32;
 extern "gdi32" fn StretchDIBits(dc: HDC, xd: i32, yd: i32, wd: i32, hd: i32, xs: i32, ys: i32, ws: i32, hs: i32, bits: ?*const anyopaque, bmi: *const BITMAPINFO, usage: u32, rop: u32) callconv(WINAPI) i32;
+extern "user32" fn GetKeyState(vk: i32) callconv(WINAPI) i16;
+extern "user32" fn SetCursor(c: HANDLE) callconv(WINAPI) HANDLE;
+extern "user32" fn OpenClipboard(h: ?HWND) callconv(WINAPI) BOOL;
+extern "user32" fn CloseClipboard() callconv(WINAPI) BOOL;
+extern "user32" fn EmptyClipboard() callconv(WINAPI) BOOL;
+extern "user32" fn GetClipboardData(format: u32) callconv(WINAPI) HANDLE;
+extern "user32" fn SetClipboardData(format: u32, mem: HANDLE) callconv(WINAPI) HANDLE;
+extern "kernel32" fn GlobalAlloc(flags: u32, bytes: usize) callconv(WINAPI) HANDLE;
+extern "kernel32" fn GlobalFree(mem: HANDLE) callconv(WINAPI) HANDLE;
+extern "kernel32" fn GlobalLock(mem: HANDLE) callconv(WINAPI) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(mem: HANDLE) callconv(WINAPI) BOOL;
 extern "winmm" fn timeBeginPeriod(ms: u32) callconv(WINAPI) u32;
 extern "dwmapi" fn DwmFlush() callconv(WINAPI) i32;
 
 const WM_DESTROY = 0x0002;
+const WM_CHAR = 0x0102;
+const WM_SETCURSOR = 0x0020;
+const HTCLIENT = 1;
+const CF_UNICODETEXT = 13;
+const GMEM_MOVEABLE = 0x0002;
+const IDC_IBEAM = 32513;
+const IDC_HAND = 32649;
 const WM_SIZE = 0x0005;
 const WM_PAINT = 0x000F;
 const WM_CLOSE = 0x0010;
@@ -146,6 +164,8 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
         timer: std.time.Timer,
         wgl: ?Wgl = null,
         gpu: ?backend.Gpu = null,
+        high_surrogate: u16 = 0,
+        cursors: [3]HANDLE = undefined,
 
         fn run(state: S, opts: app.WindowOptions) !void {
             const gpa = std.heap.c_allocator;
@@ -164,9 +184,11 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
 
             g = .{ .state = state, .hwnd = undefined, .fonts = try text.Fonts.init(gpa), .ctx = undefined, .sc = .{ .gpa = gpa }, .rend = .{ .gpa = gpa }, .timer = try std.time.Timer.start() };
             g.ctx = ui.Context.init(gpa, &g.fonts);
+            g.cursors = .{ LoadCursorW(null, IDC_ARROW), LoadCursorW(null, IDC_IBEAM), LoadCursorW(null, IDC_HAND) };
             g.scale = if (env.get("MYZIG_SCALE")) |v| std.fmt.parseFloat(f32, v) catch s0 else s0;
             g.hwnd = CreateWindowExW(0, class, title.ptr, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, null, null, inst, null) orelse return error.CreateWindow;
             if (env.get("MYZIG_SCALE") == null) g.scale = @as(f32, @floatFromInt(GetDpiForWindow(g.hwnd))) / 96;
+            g.ctx.clipboard = clipboard.interface(g.hwnd);
             g.openGpu(gpa, inst.?, env.has("MYZIG_STATS"));
             var cr = RECT{};
             _ = GetClientRect(g.hwnd, &cr);
@@ -216,8 +238,15 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                     }
                     continue;
                 }
+                // A frame the view asked for at a time (a caret's blink).
+                if (g.ctx.wake_at != 0 and now >= g.ctx.wake_at) {
+                    g.ctx.wake_at = 0;
+                    g.need_frame = true;
+                    continue;
+                }
                 var timeout: u32 = INFINITE;
-                if (print_stats) timeout = 1000;
+                if (g.ctx.wake_at != 0) timeout = @intCast(@min(INFINITE - 1, (g.ctx.wake_at - now + 999_999) / 1_000_000));
+                if (print_stats) timeout = @min(timeout, 1000);
                 if (exit_after_ns != null) timeout = @min(timeout, 50);
                 _ = MsgWaitForMultipleObjectsEx(0, null, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             }
@@ -384,6 +413,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                     return 0;
                 },
                 WM_LBUTTONDOWN => {
+                    w.ctx.setMods(mods());
                     _ = SetCapture(hwnd);
                     const p = w.point(lp);
                     if (w.ctx.pointerDown(p[0], p[1])) w.need_frame = true;
@@ -404,8 +434,33 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                     return 0;
                 },
                 WM_KEYDOWN => {
-                    if (w.ctx.keyDown(mapKey(wp))) w.need_frame = true;
+                    if (w.ctx.keyDownMods(mapKey(wp), mods())) w.need_frame = true;
                     return 0;
+                },
+                WM_CHAR => {
+                    // UTF-16 code units, a surrogate pair in two messages.
+                    const u: u16 = @truncate(wp);
+                    if (u >= 0xd800 and u < 0xdc00) {
+                        w.high_surrogate = u;
+                        return 0;
+                    }
+                    var cp: u21 = u;
+                    if (u >= 0xdc00 and u < 0xe000) {
+                        if (w.high_surrogate == 0) return 0;
+                        cp = 0x10000 + ((@as(u21, w.high_surrogate) - 0xd800) << 10) + (u - 0xdc00);
+                    }
+                    w.high_surrogate = 0;
+                    const m_ = mods();
+                    if (m_.ctrl and !m_.alt) return 0; // Ctrl+key, not text (AltGr is Ctrl+Alt)
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &buf) catch return 0;
+                    if (w.ctx.typeText(buf[0..n])) w.need_frame = true;
+                    return 0;
+                },
+                WM_SETCURSOR => {
+                    if (lp & 0xffff != HTCLIENT) return DefWindowProcW(hwnd, m, wp, lp);
+                    _ = SetCursor(w.cursors[@intFromEnum(w.ctx.cursor)]);
+                    return 1;
                 },
                 else => return DefWindowProcW(hwnd, m, wp, lp),
             }
@@ -413,8 +468,52 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
     };
 }
 
+fn mods() ui.Mods {
+    return .{
+        .shift = GetKeyState(0x10) < 0,
+        .ctrl = GetKeyState(0x11) < 0,
+        .alt = GetKeyState(0x12) < 0,
+        .super = GetKeyState(0x5B) < 0 or GetKeyState(0x5C) < 0,
+    };
+}
+
+/// clipboard is Windows' clipboard, as text.
+const clipboard = struct {
+    fn interface(hwnd: HWND) ui.Clipboard {
+        return .{ .ctx = @ptrCast(hwnd), .get = get, .set = set };
+    }
+
+    fn get(ctx: *anyopaque, gpa: std.mem.Allocator) ?[]u8 {
+        if (OpenClipboard(@ptrCast(@alignCast(ctx))) == 0) return null;
+        defer _ = CloseClipboard();
+        const h = GetClipboardData(CF_UNICODETEXT) orelse return null;
+        const p: [*:0]const u16 = @ptrCast(@alignCast(GlobalLock(h) orelse return null));
+        defer _ = GlobalUnlock(h);
+        return std.unicode.utf16LeToUtf8Alloc(gpa, std.mem.span(p)) catch null;
+    }
+
+    fn set(ctx: *anyopaque, s: []const u8) void {
+        var buf: [1 << 16]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], s) catch return;
+        buf[n] = 0;
+        const h = GlobalAlloc(GMEM_MOVEABLE, (n + 1) * 2) orelse return;
+        const p: [*]u16 = @ptrCast(@alignCast(GlobalLock(h) orelse return));
+        @memcpy(p[0 .. n + 1], buf[0 .. n + 1]);
+        _ = GlobalUnlock(h);
+        if (OpenClipboard(@ptrCast(@alignCast(ctx))) == 0) {
+            _ = GlobalFree(h);
+            return;
+        }
+        defer _ = CloseClipboard();
+        _ = EmptyClipboard();
+        if (SetClipboardData(CF_UNICODETEXT, h) == null) _ = GlobalFree(h);
+    }
+};
+
 fn mapKey(vk: WPARAM) ui.Key {
+    if (vk >= 0x41 and vk <= 0x5A) return ui.Key.letter(@intCast(vk));
     return switch (vk) {
+        0x2E => .delete,
         0x26 => .up,
         0x28 => .down,
         0x25 => .left,

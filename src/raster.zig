@@ -122,6 +122,25 @@ pub const Canvas = struct {
         }
     }
 
+    /// stroke draws two line segments (x0, y0, x1, y1 in device pixels)
+    /// with round caps, width wide, over the pixels of area.
+    pub fn stroke(c: *const Canvas, area: IRect, seg: [2][4]f32, width: f32, color: Color) void {
+        const b = area.intersect(c.bounds());
+        if (b.isEmpty()) return;
+        const hw = width / 2;
+        var py = b.y0;
+        while (py < b.y1) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            var px = b.x0;
+            while (px < b.x1) : (px += 1) {
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const d = @min(segmentDistance(fx, fy, seg[0]), segmentDistance(fx, fy, seg[1])) - hw;
+                const cov: u32 = @intFromFloat(std.math.clamp(0.5 - d, 0, 1) * 256);
+                if (cov > 0) blendPixel(&c.row(py)[@intCast(px)], color, (cov * color.a) >> 8);
+            }
+        }
+    }
+
     /// mask blends a coverage bitmap of w×h at (x, y) in color.
     pub fn mask(c: *const Canvas, cov: []const u8, w: i32, h: i32, x: i32, y: i32, color: Color, clip: IRect) void {
         const b = (IRect{ .x0 = x, .y0 = y, .x1 = x + w, .y1 = y + h }).intersect(clip).intersect(c.bounds());
@@ -155,6 +174,17 @@ inline fn coverage(fx: f32, fy: f32, cx: f32, cy: f32, hx: f32, hy: f32, r: f32)
     const d = @sqrt(mx * mx + my * my) + @min(@max(qx, qy), 0) - r;
     const v = std.math.clamp(0.5 - d, 0, 1);
     return @intFromFloat(v * 256);
+}
+
+/// segmentDistance is the distance from (px, py) to the segment s.
+pub fn segmentDistance(px: f32, py: f32, s: [4]f32) f32 {
+    const dx = s[2] - s[0];
+    const dy = s[3] - s[1];
+    const len2 = dx * dx + dy * dy;
+    const t = if (len2 > 0) std.math.clamp(((px - s[0]) * dx + (py - s[1]) * dy) / len2, 0, 1) else 0;
+    const ex = px - (s[0] + t * dx);
+    const ey = py - (s[1] + t * dy);
+    return @sqrt(ex * ex + ey * ey);
 }
 
 pub inline fn opaque32(c: Color) u32 {

@@ -786,6 +786,7 @@ test "offscreen Vulkan draws what the CPU renderer draws" {
     s.rect(.{ .x = 10, .y = 10, .w = 120, .h = 40 }, (comptime geom.Color.hex("#2563eb")), 8, 2, (comptime geom.Color.hex("#111827")));
     s.rect(.{ .x = 150, .y = 10, .w = 60, .h = 40 }, geom.Color.rgba(220, 38, 38, 0.5), 20, 0, geom.Color.black);
     s.textRun(&fonts, 20, 80, "Vulkan · quick 123", 16, .regular, geom.Color.black);
+    s.stroke(.{ .x = 230, .y = 14, .w = 24, .h = 24 }, .{ .{ 0.1, 0.55, 0.4, 0.85 }, .{ 0.4, 0.85, 0.9, 0.15 } }, 3, geom.Color.black);
     r.capture = true;
     try r.draw(&s, &fonts, 320, 120);
     const gpu_px = try gpa.alloc(u32, 320 * 120);

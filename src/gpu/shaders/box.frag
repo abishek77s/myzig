@@ -7,15 +7,28 @@ layout(location = 3) flat in vec4 v_clip;
 layout(location = 4) flat in vec4 v_color;
 layout(location = 5) flat in vec4 v_border_color;
 layout(location = 6) flat in vec4 v_params;
+layout(location = 7) flat in vec4 v_seg;
 layout(set = 0, binding = 0) uniform sampler2D u_atlas;
 layout(location = 0) out vec4 o_color;
 float box(vec2 p, vec2 c, vec2 h, float r) {
     vec2 q = abs(p - c) - (h - r);
     return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
+float segment(vec2 p, vec4 s) {
+    vec2 a = v_rect.xy + s.xy * v_rect.zw;
+    vec2 d = v_rect.xy + s.zw * v_rect.zw - a;
+    float l2 = dot(d, d);
+    float t = l2 > 0.0 ? clamp(dot(p - a, d) / l2, 0.0, 1.0) : 0.0;
+    return length(p - a - t * d);
+}
 void main() {
     if (v_pos.x < v_clip.x || v_pos.y < v_clip.y || v_pos.x >= v_clip.z || v_pos.y >= v_clip.w) discard;
     vec4 fill = vec4(v_color.rgb * v_color.a, v_color.a);
+    if (v_params.z > 1.5) {
+        float d = min(segment(v_pos, v_seg), segment(v_pos, v_border_color)) - v_params.y * 0.5;
+        o_color = fill * clamp(0.5 - d, 0.0, 1.0);
+        return;
+    }
     if (v_params.z > 0.5) {
         o_color = fill * texture(u_atlas, v_uv).r;
         return;

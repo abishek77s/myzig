@@ -1,8 +1,8 @@
 //! The Vulkan API, the part the renderer uses, declared by hand: the loader
 //! (libvulkan.so.1, vulkan-1.dll) is opened at run time, so building needs
 //! neither the SDK nor its headers and an app that draws otherwise never
-//! maps the driver. Layouts follow vulkan_core.h (checked by vkcheck in
-//! bench/, against the headers where they are installed).
+//! maps the driver. Layouts follow vulkan_core.h; every struct's size was
+//! checked against the headers' sizeof.
 
 const std = @import("std");
 const builtin = @import("builtin");

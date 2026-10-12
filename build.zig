@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const only = b.option([]const u8, "only", "Build only this example (and no benchmark)");
-    const examples = [_][]const u8{ "counter", "quotes", "list" };
+    const examples = [_][]const u8{ "counter", "quotes", "list", "gallery" };
     const test_step = b.step("test", "Run the tests");
     inline for (examples) |name| {
         const exe = b.addExecutable(.{
