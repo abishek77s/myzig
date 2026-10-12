@@ -12,8 +12,15 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.addCSourceFile(.{ .file = b.path("vendor/stb_truetype.c"), .flags = &.{ "-O2", "-fno-sanitize=undefined" } });
-    mod.linkSystemLibrary("X11", .{});
-    mod.linkSystemLibrary("Xext", .{});
+    if (target.result.os.tag == .windows) {
+        mod.linkSystemLibrary("user32", .{});
+        mod.linkSystemLibrary("gdi32", .{});
+        mod.linkSystemLibrary("dwmapi", .{});
+        mod.linkSystemLibrary("winmm", .{});
+    } else {
+        mod.linkSystemLibrary("X11", .{});
+        mod.linkSystemLibrary("Xext", .{});
+    }
 
     const only = b.option([]const u8, "only", "Build only this example (and no benchmark)");
     const examples = [_][]const u8{ "counter", "quotes", "list" };

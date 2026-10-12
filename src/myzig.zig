@@ -24,9 +24,16 @@ pub const text = @import("text.zig");
 pub const scene = @import("scene.zig");
 pub const raster = @import("raster.zig");
 pub const Headless = @import("headless.zig").Headless;
+pub const env = @import("env.zig");
 pub const app = @import("app.zig");
 pub const WindowOptions = app.WindowOptions;
-pub const run = app.run;
+
+/// run opens a window showing view of state and runs the app until it
+/// closes: X11 on Linux and the BSDs, Win32 on Windows.
+pub const run = switch (@import("builtin").os.tag) {
+    .windows => @import("win32.zig").run,
+    else => app.run,
+};
 
 test {
     _ = geom;

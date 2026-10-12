@@ -46,7 +46,7 @@ fn dot(i: u32) []const u8 {
 }
 
 pub fn main() !void {
-    var s = Items{ .auto = std.posix.getenv("AUTOSCROLL") != null };
+    var s = Items{ .auto = myzig.env.get("AUTOSCROLL") != null };
     try myzig.run(&s, view, .{ .title = "List", .width = 640, .height = 720 });
 }
 

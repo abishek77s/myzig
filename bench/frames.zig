@@ -14,11 +14,11 @@ fn bench(comptime State: type, name: []const u8, fonts: *myzig.text.Fonts, state
     // A window presents only what changed and lets the server move scrolled pixels.
     hl.renderer.retain_pixels = !window;
     for (0..50) |_| hl.frame();
-    if (std.posix.getenv("DUMP")) |dir| {
+    if (myzig.env.get("DUMP")) |dir| {
         var buf: [256]u8 = undefined;
         try hl.writePPM(try std.fmt.bufPrint(&buf, "{s}/{s}.ppm", .{ dir, name }));
     }
-    if (std.posix.getenv("DAMAGE") != null) for (0..8) |_| {
+    if (myzig.env.get("DAMAGE") != null) for (0..8) |_| {
         const p0 = hl.renderer.stats.pixels;
         hl.frame();
         std.debug.print("px {d} ", .{hl.renderer.stats.pixels - p0});

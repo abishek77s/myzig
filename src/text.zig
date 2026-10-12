@@ -6,6 +6,7 @@
 //! last one shapes nothing (the retained text measurement of gpui-fast).
 
 const std = @import("std");
+const env = @import("env.zig");
 
 extern fn mz_font_init(data: [*]const u8, index: c_int) ?*anyopaque;
 extern fn mz_scale_em(fi: *anyopaque, px: f32) f32;
@@ -18,7 +19,12 @@ extern fn mz_glyph_render(fi: *anyopaque, out: [*]u8, w: c_int, h: c_int, stride
 
 pub const Weight = enum(u1) { regular, bold };
 
-const regular_paths = [_][]const u8{
+const windows = @import("builtin").os.tag == .windows;
+
+const regular_paths: []const []const u8 = if (windows) &.{
+    "C:\\Windows\\Fonts\\segoeui.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+} else &.{
     "/usr/share/fonts/opentype/inter/Inter-Regular.otf",
     "/usr/share/fonts/truetype/inter/Inter-Regular.ttf",
     "/usr/share/fonts/TTF/Inter-Regular.ttf",
@@ -28,7 +34,10 @@ const regular_paths = [_][]const u8{
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
 };
-const bold_paths = [_][]const u8{
+const bold_paths: []const []const u8 = if (windows) &.{
+    "C:\\Windows\\Fonts\\segoeuib.ttf",
+    "C:\\Windows\\Fonts\\arialbd.ttf",
+} else &.{
     "/usr/share/fonts/opentype/inter/Inter-Bold.otf",
     "/usr/share/fonts/truetype/inter/Inter-Bold.ttf",
     "/usr/share/fonts/TTF/Inter-Bold.ttf",
@@ -49,10 +58,10 @@ pub const Face = struct {
     ascii_glyph: [128]u16,
     ascii_adv: [128]i16,
 
-    fn load(gpa: std.mem.Allocator, env: ?[]const u8, paths: []const []const u8) !Face {
+    fn load(gpa: std.mem.Allocator, override: ?[]const u8, paths: []const []const u8) !Face {
         var data: ?[]u8 = null;
         errdefer if (data) |d| gpa.free(d);
-        if (env) |p| data = std.fs.cwd().readFileAlloc(gpa, p, 64 << 20) catch null;
+        if (override) |p| data = std.fs.cwd().readFileAlloc(gpa, p, 64 << 20) catch null;
         for (paths) |p| {
             if (data != null) break;
             data = std.fs.cwd().readFileAlloc(gpa, p, 64 << 20) catch null;
@@ -117,8 +126,8 @@ pub const Fonts = struct {
     measure_misses: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator) !Fonts {
-        const reg = try Face.load(gpa, std.posix.getenv("MYZIG_FONT"), &regular_paths);
-        const bold = Face.load(gpa, std.posix.getenv("MYZIG_FONT_BOLD"), &bold_paths) catch reg;
+        const reg = try Face.load(gpa, env.get("MYZIG_FONT"), regular_paths);
+        const bold = Face.load(gpa, env.get("MYZIG_FONT_BOLD"), bold_paths) catch reg;
         return .{ .gpa = gpa, .faces = .{ reg, bold } };
     }
 

@@ -1,0 +1,91 @@
+{
+  "compile": {
+    "myzig Debug": {
+      "clean_s": 11.37698269800012,
+      "incremental_s": 0.7743871249999756
+    },
+    "myzig ReleaseFast": {
+      "clean_s": 14.24412571699986,
+      "incremental_s": 4.069816079999782
+    },
+    "mygo default": {
+      "clean_s": 20.311867079999956,
+      "incremental_s": 0.9682351920000656
+    },
+    "mygo release": {
+      "clean_s": 19.905626396000116,
+      "incremental_s": 0.6843345149995912
+    },
+    "gpui-fast debug": {
+      "clean_s": 149.0382501869999,
+      "incremental_s": 3.357920840999668
+    },
+    "gpui-fast release": {
+      "clean_s": 280.1536073269999,
+      "incremental_s": 63.33890365599973
+    }
+  },
+  "machine": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cores": 4,
+    "zig": "0.15.2",
+    "go": "go version go1.24.7 linux/amd64",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)"
+  },
+  "size": {
+    "gpui-counter": 22254504,
+    "mygo-counter": 11575559,
+    "mygo-list": 11575559,
+    "mygo-quotes": 11583751,
+    "myzig-counter-fast": 177048,
+    "myzig-counter-small": 137696,
+    "myzig-list-fast": 180456,
+    "myzig-list-small": 139472,
+    "myzig-quotes-fast": 183176,
+    "myzig-quotes-small": 141616
+  },
+  "memory": {
+    "myzig counter": {
+      "pss_mb": 2.4892578125
+    },
+    "mygo counter": {
+      "pss_mb": 84.1630859375
+    },
+    "gpui-fast counter": {
+      "pss_mb": 126.671875
+    },
+    "myzig quotes": {
+      "pss_mb": 4.2138671875
+    },
+    "mygo quotes": {
+      "pss_mb": 102.2373046875
+    }
+  },
+  "window": {
+    "myzig quotes": {
+      "fps": 60.0,
+      "cpu_percent": 3.0983426178359372,
+      "cpu_ms_per_frame": 0.5163904363059896
+    },
+    "myzig quotes uncapped": {
+      "fps": 2533.7,
+      "cpu_percent": 67.87818378882234,
+      "cpu_ms_per_frame": 0.2679014239603045
+    },
+    "mygo quotes": {
+      "fps": 60.0,
+      "cpu_percent": 38.184350621202235,
+      "cpu_ms_per_frame": 6.364058436867039
+    },
+    "myzig list (wheel)": {
+      "fps": 8.1,
+      "cpu_percent": 0.1998776727455713,
+      "cpu_ms_per_frame": 0.24676255894514978
+    },
+    "mygo list (wheel)": {
+      "fps": 8.1,
+      "cpu_percent": 5.497215932791909,
+      "cpu_ms_per_frame": 6.786686336780134
+    }
+  }
+}

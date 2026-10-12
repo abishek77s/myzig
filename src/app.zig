@@ -8,6 +8,7 @@
 //! have read them.
 
 const std = @import("std");
+const env = @import("env.zig");
 const x = @import("x11.zig");
 const ui = @import("ui.zig");
 const text = @import("text.zig");
@@ -55,10 +56,10 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     const depth = x.XDefaultDepth(dpy, screen);
     if (depth != 24 and depth != 32) return error.UnsupportedDepth;
 
-    const scale: f32 = if (std.posix.getenv("MYZIG_SCALE")) |s| std.fmt.parseFloat(f32, s) catch 1 else 1;
-    const uncapped = std.posix.getenv("MYZIG_UNCAPPED") != null;
-    const print_stats = std.posix.getenv("MYZIG_STATS") != null;
-    const exit_after_ns: ?u64 = if (std.posix.getenv("MYZIG_EXIT_AFTER")) |s| @intFromFloat((std.fmt.parseFloat(f64, s) catch 0) * 1e9) else null;
+    const scale: f32 = if (env.get("MYZIG_SCALE")) |s| std.fmt.parseFloat(f32, s) catch 1 else 1;
+    const uncapped = env.get("MYZIG_UNCAPPED") != null;
+    const print_stats = env.get("MYZIG_STATS") != null;
+    const exit_after_ns: ?u64 = if (env.get("MYZIG_EXIT_AFTER")) |s| @intFromFloat((std.fmt.parseFloat(f64, s) catch 0) * 1e9) else null;
 
     var w: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(opts.width)) * scale));
     var h: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(opts.height)) * scale));
@@ -70,7 +71,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     _ = x.XMapWindow(dpy, win);
     const gc = x.XCreateGC(dpy, win, 0, null);
 
-    const use_shm = x.XShmQueryExtension(dpy) != 0 and std.posix.getenv("MYZIG_NO_SHM") == null;
+    const use_shm = x.XShmQueryExtension(dpy) != 0 and env.get("MYZIG_NO_SHM") == null;
     const shm_completion = if (use_shm) x.XShmGetEventBase(dpy) else -1;
 
     var fonts = try text.Fonts.init(gpa);
@@ -199,7 +200,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     }
 }
 
-fn buildAndDraw(state: anytype, comptime view: anytype, ctx: *ui.Context, sc: *scene.Scene, rend: *scene.Renderer, fonts: *text.Fonts, buf: *Buffer, scale: f32, timer: *std.time.Timer, stats: *Stats) void {
+pub fn buildAndDraw(state: anytype, comptime view: anytype, ctx: *ui.Context, sc: *scene.Scene, rend: *scene.Renderer, fonts: *text.Fonts, buf: *Buffer, scale: f32, timer: *std.time.Timer, stats: *Stats) void {
     const t0 = timer.read();
     const lw = @as(f32, @floatFromInt(buf.width)) / scale;
     const lh = @as(f32, @floatFromInt(buf.height)) / scale;
@@ -305,7 +306,7 @@ fn mapKey(sym: c_ulong) ui.Key {
     };
 }
 
-fn printStats(label: []const u8, s: Stats, elapsed_ns: u64) void {
+pub fn printStats(label: []const u8, s: Stats, elapsed_ns: u64) void {
     const secs = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
     const f = @as(f64, @floatFromInt(@max(1, s.frames)));
     std.debug.print("myzig {s}: fps={d:.1} build={d:.3}ms raster={d:.3}ms present={d:.3}ms px/frame={d:.0}\n", .{
