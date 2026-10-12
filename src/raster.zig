@@ -130,7 +130,7 @@ pub const Canvas = struct {
         const solid = opaque32(color);
         var py = b.y0;
         while (py < b.y1) : (py += 1) {
-            const src = cov[@intCast((py - y) * w + (b.x0 - x)) ..][0..@intCast(b.x1 - b.x0)];
+            const src = cov[@intCast((py - y) * w + (b.x0 - x))..][0..@intCast(b.x1 - b.x0)];
             const dst = c.row(py)[@intCast(b.x0)..@intCast(b.x1)];
             for (src, dst) |s, *d| {
                 if (s == 0) continue;
