@@ -32,8 +32,9 @@ pub const Glx = struct {
     }
 
     /// visual chooses a double-buffered true color configuration and
-    /// returns the visual a window drawn with it needs.
-    pub fn visual(g: *Glx, dpy: *x.Display, screen: c_int) !*x.XVisualInfo {
+    /// returns the visual a window drawn with it needs. With want, the
+    /// visual of a window that exists, it chooses one with that visual.
+    pub fn visual(g: *Glx, dpy: *x.Display, screen: c_int, want: ?c_ulong) !*x.XVisualInfo {
         const attrs = [_]c_int{
             0x8012, 1, // GLX_X_RENDERABLE
             0x8010, 1, // GLX_DRAWABLE_TYPE: window
@@ -45,9 +46,16 @@ pub const Glx = struct {
         };
         var n: c_int = 0;
         const list = g.chooseFBConfig(dpy, screen, &attrs, &n) orelse return error.NoFBConfig;
-        if (n == 0) return error.NoFBConfig;
-        g.fbc = list[0];
-        return g.getVisualFromFBConfig(dpy, list[0]) orelse error.NoVisual;
+        defer _ = x.XFree(@ptrCast(list));
+        for (list[0..@intCast(n)]) |fbc| {
+            const vi = g.getVisualFromFBConfig(dpy, fbc) orelse continue;
+            if (want == null or vi.visualid == want.?) {
+                g.fbc = fbc;
+                return vi;
+            }
+            _ = x.XFree(vi);
+        }
+        return error.NoFBConfig;
     }
 
     /// context makes an OpenGL 3.3 core context current on win.

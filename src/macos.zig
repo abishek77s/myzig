@@ -134,7 +134,8 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             menu(opts.title);
 
             g.scale = if (env.get("MYZIG_SCALE")) |v| std.fmt.parseFloat(f32, v) catch 1 else @floatCast(msg(f64, g.window, "backingScaleFactor", .{}));
-            g.openGpu(gpa);
+            const choice = choose.choose(opts.renderer);
+            if (choice.kind != .cpu) g.openGpu(gpa, choice);
             if (g.gpu == null) {
                 CG.load() catch |e| {
                     sys.log(.err, "myzig: {s}", .{@errorName(e)});
@@ -241,11 +242,9 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             for ([_]Id{ bar, item, m, close, quit }) |o| objc.release(o);
         }
 
-        /// openGpu picks the GPU renderer: Metal's, or Vulkan's (MoltenVK)
-        /// when MYZIG_RENDERER=vulkan names it.
-        fn openGpu(w: *Self, gpa: std.mem.Allocator) void {
-            const choice = choose.choose();
-            if (choice.kind == .cpu) return;
+        /// openGpu opens the GPU renderer choice names: Metal's, or
+        /// Vulkan's (MoltenVK) when MYZIG_RENDERER=vulkan names it.
+        fn openGpu(w: *Self, gpa: std.mem.Allocator, choice: choose.Choice) void {
             const layer = send(objc.class("CAMetalLayer"), "layer", .{});
             if (layer == null) return;
             const vsync = !env.has("MYZIG_UNCAPPED");

@@ -170,6 +170,7 @@ pub extern "X11" fn XCreateImage(d: *Display, v: *Visual, depth: c_uint, format:
 pub extern "X11" fn XPutImage(d: *Display, drawable: Window, gc: GC, img: *XImage, sx: c_int, sy: c_int, dx: c_int, dy: c_int, w: c_uint, h: c_uint) c_int;
 pub extern "X11" fn XCopyArea(d: *Display, src: Window, dst: Window, gc: GC, sx: c_int, sy: c_int, w: c_uint, h: c_uint, dx: c_int, dy: c_int) c_int;
 pub extern "X11" fn XFree(p: ?*anyopaque) c_int;
+pub extern "X11" fn XVisualIDFromVisual(v: *Visual) c_ulong;
 pub extern "X11" fn XLookupKeysym(ev: *InputEvent, index: c_int) c_ulong;
 
 pub extern "X11" fn XLookupString(ev: *InputEvent, buf: [*]u8, len: c_int, sym: ?*c_ulong, status: ?*anyopaque) c_int;

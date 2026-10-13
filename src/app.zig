@@ -28,6 +28,9 @@ pub const WindowOptions = struct {
     title: [:0]const u8 = "MyZig",
     width: u32 = 800,
     height: u32 = 600,
+    /// renderer is what draws the window: the platform's GPU API, as
+    /// gpui's (see gpu/choose.zig), or the CPU.
+    renderer: choose.Renderer = .gpu,
 };
 
 /// Stats are what MYZIG_STATS prints each second, and what benchmarks read.
@@ -77,19 +80,20 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     var depth = x.XDefaultDepth(dpy, screen);
     if (depth != 24 and depth != 32) return error.UnsupportedDepth;
 
-    // OpenGL needs its visual before the window exists; Vulkan draws to
-    // a window of any, so the window takes OpenGL's when it could be
-    // the one that draws.
-    const choice = choose.choose();
+    // OpenGL asked for chooses the window's visual; otherwise the window
+    // has the default one, which Vulkan draws to, and OpenGL where it has
+    // a configuration for it (see openGpu).
+    const choice = choose.choose(opts.renderer);
     var glx: ?Glx = null;
-    var vi: ?*x.XVisualInfo = null;
-    if (choice.kind == .gl or (choice.kind == .vulkan and !choice.forced)) {
+    if (choice.kind == .gl) {
         if (Glx.open()) |g| {
             glx = g;
-            vi = glx.?.visual(dpy, screen) catch null;
-            if (vi) |v| {
+            if (glx.?.visual(dpy, screen, null)) |v| {
                 visual = v.visual;
                 depth = v.depth;
+            } else |_| {
+                glx.?.lib.close();
+                glx = null;
             }
         } else |_| {}
     }
@@ -141,40 +145,14 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     var rend = scene.Renderer{ .gpa = gpa, .retain_pixels = false };
     defer rend.deinit();
 
-    // The GPU renderer, where one draws: Vulkan's, else OpenGL's. One
-    // that draws on the CPU is not used unless it was asked for.
     var gpu: ?backend.Gpu = null;
     defer if (gpu) |*g| g.deinit();
-    if (choice.kind == .vulkan) vk: {
-        var r = vulkan.Renderer.init(gpa, .{ .xlib = .{ .dpy = dpy, .window = win } }, w, h, .{
-            .vsync = !uncapped,
-            .validation = env.has("MYZIG_VK_VALIDATION"),
-        }) catch |e| {
-            if (choice.forced) sys.log(.warn, "myzig: no Vulkan ({s}); drawing on the CPU", .{@errorName(e)});
-            break :vk;
-        };
-        if (!choice.forced and r.software()) {
-            r.deinit();
-            break :vk;
-        }
-        gpu = .{ .vulkan = r };
-    }
-    if (gpu == null and glx != null and vi != null) gpu: {
-        glx.?.context(dpy, win) catch |e| {
-            sys.log(.warn, "myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(e)});
-            break :gpu;
-        };
-        const gl = glr.Gl.load(&glx.?, Glx.proc) catch break :gpu;
-        var r = glr.Renderer.init(gpa, gl) catch break :gpu;
-        if (!choice.forced and glr.software(r.name())) {
-            r.deinit();
-            glx.?.release(dpy);
-            break :gpu;
-        }
-        gpu = .{ .gl = r };
-    }
+    defer if (glx) |*g| {
+        g.release(dpy);
+        g.lib.close();
+    };
+    if (choice.kind != .cpu) gpu = openGpu(gpa, dpy, screen, win, visual, w, h, choice, uncapped, &glx);
     if (gpu) |*g| if (print_stats) sys.print("myzig: drawing with {s} on {s}\n", .{ g.api(), g.name() });
-    defer if (glx) |*g| g.release(dpy);
     if (gpu != null) rend.raster = false;
     const dump = env.get("MYZIG_DUMP");
     if (dump != null) if (gpu) |*g| g.capture();
@@ -338,7 +316,10 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                         sys.log(.err, "myzig: {s} frame: {s}; drawing on the CPU", .{ g.api(), @errorName(e) });
                         g.deinit();
                         gpu = null;
-                        if (glx) |*gx| gx.release(dpy);
+                        if (glx) |*gx| {
+                            gx.release(dpy);
+                            gx.lib.close();
+                        }
                         glx = null;
                         rend.raster = true;
                         try resize(dpy, visual, depth, &use_shm, &buf, w, h);
@@ -396,6 +377,46 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
         var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
         if (x.XPending(dpy) == 0) _ = std.posix.poll(&pfd, timeout) catch {};
     }
+}
+
+/// openGpu opens the GPU renderer choice names for win: Vulkan's, else
+/// OpenGL's (GLX), each unloaded before the next is tried. glx holds GLX,
+/// opened here unless it chose the window's visual.
+fn openGpu(gpa: std.mem.Allocator, dpy: *x.Display, screen: c_int, win: x.Window, visual: *x.Visual, w: i32, h: i32, choice: choose.Choice, uncapped: bool, glx: *?Glx) ?backend.Gpu {
+    if (choice.kind == .vulkan) vk: {
+        const r = vulkan.Renderer.init(gpa, .{ .xlib = .{ .dpy = dpy, .window = win } }, w, h, .{
+            .vsync = !uncapped,
+            .validation = env.has("MYZIG_VK_VALIDATION"),
+        }) catch |e| {
+            sys.log(.warn, "myzig: no Vulkan ({s})", .{@errorName(e)});
+            break :vk;
+        };
+        return .{ .vulkan = r };
+    }
+    if (choice.kind != .gl and (choice.kind != .vulkan or choice.forced)) return null;
+    if (glx.* == null) {
+        // A configuration for the window's visual.
+        var g = Glx.open() catch return null;
+        _ = g.visual(dpy, screen, x.XVisualIDFromVisual(visual)) catch {
+            g.lib.close();
+            return null;
+        };
+        glx.* = g;
+    }
+    const g = &glx.*.?;
+    const r = gl: {
+        g.context(dpy, win) catch |e| {
+            sys.log(.warn, "myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(e)});
+            break :gl null;
+        };
+        const gl = glr.Gl.load(g, Glx.proc) catch break :gl null;
+        break :gl glr.Renderer.init(gpa, gl) catch null;
+    };
+    if (r) |rr| return .{ .gl = rr };
+    g.release(dpy);
+    g.lib.close();
+    glx.* = null;
+    return null;
 }
 
 pub fn buildAndDraw(state: anytype, comptime view: anytype, ctx: *ui.Context, sc: *scene.Scene, rend: *scene.Renderer, fonts: *text.Fonts, buf: *Buffer, scale: f32, timer: *sys.Timer, stats: *Stats) void {
