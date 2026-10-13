@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ppm2png.py IN.ppm [OUT.png]: the PPM image a window dumps (MYZIG_DUMP)
-as a PNG, with the standard library only."""
+as a PNG, with the standard library only. It fails on an image of one
+color, which is what a window that drew nothing dumps."""
 import struct
 import sys
 import zlib
@@ -37,4 +38,8 @@ def write_png(path, w, h, rgb):
 if __name__ == "__main__":
     src = sys.argv[1]
     dst = sys.argv[2] if len(sys.argv) > 2 else src.rsplit(".", 1)[0] + ".png"
-    write_png(dst, *read_ppm(src))
+    w, h, rgb = read_ppm(src)
+    write_png(dst, w, h, rgb)
+    colors = len({rgb[i : i + 3] for i in range(0, len(rgb), 3 * 97)})
+    if colors < 8:
+        sys.exit(f"{src}: {colors} colors: the window drew nothing")
