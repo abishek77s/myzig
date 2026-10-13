@@ -16,6 +16,7 @@ const choose = @import("gpu/choose.zig");
 const backend = @import("gpu/backend.zig");
 const glr = backend.glr;
 const vulkan = backend.vulkan;
+const d3d11 = backend.d3d11;
 const Wgl = @import("gpu/wgl.zig").Wgl;
 
 const WINAPI: std.builtin.CallingConvention = .winapi;
@@ -218,7 +219,8 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             g.hwnd = CreateWindowExW(0, class, title.ptr, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, null, null, inst, null) orelse return error.CreateWindow;
             if (env.get("MYZIG_SCALE") == null) g.scale = @as(f32, @floatFromInt(GetDpiForWindow(g.hwnd))) / 96;
             g.ctx.clipboard = clipboard.interface(g.hwnd);
-            g.openGpu(gpa, inst.?, env.has("MYZIG_STATS"));
+            const choice = choose.choose(opts.renderer);
+            if (choice.kind != .cpu) g.openGpu(gpa, choice, env.has("MYZIG_STATS"));
             var cr = RECT{};
             _ = GetClientRect(g.hwnd, &cr);
             g.resize(cr.right, cr.bottom);
@@ -290,40 +292,43 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             }
         }
 
-        /// openGpu picks the GPU renderer: Vulkan's, else OpenGL's (WGL).
-        /// One that draws on the CPU is not used unless it was asked for.
-        fn openGpu(w: *Self, gpa: std.mem.Allocator, inst: HINSTANCE, verbose: bool) void {
-            const choice = choose.choose();
-            if (choice.kind == .cpu) return;
-            if (choice.kind == .vulkan) vk: {
-                var cr = RECT{};
-                _ = GetClientRect(w.hwnd, &cr);
-                var r = vulkan.Renderer.init(gpa, .{ .win32 = .{ .hinstance = inst, .hwnd = w.hwnd } }, cr.right, cr.bottom, .{
-                    .vsync = !env.has("MYZIG_UNCAPPED"),
-                    .validation = env.has("MYZIG_VK_VALIDATION"),
-                }) catch |e| {
-                    if (choice.forced) sys.log(.warn, "myzig: no Vulkan ({s}); drawing on the CPU", .{@errorName(e)});
-                    break :vk;
-                };
-                if (!choice.forced and r.software()) {
-                    r.deinit();
-                    break :vk;
-                }
-                w.gpu = .{ .vulkan = r };
-            }
-            if (w.gpu == null and !(choice.kind == .vulkan and choice.forced)) gl: {
-                const dc = GetDC(w.hwnd) orelse return;
-                w.wgl = Wgl.open(dc) catch |e| {
-                    sys.log(.warn, "myzig: no OpenGL ({s}); drawing on the CPU", .{@errorName(e)});
-                    break :gl;
-                };
-                const gl = glr.Gl.load(&w.wgl.?, Wgl.proc) catch return w.closeGpu();
-                var r = glr.Renderer.init(gpa, gl) catch return w.closeGpu();
-                if (!choice.forced and glr.software(r.name())) {
-                    r.deinit();
-                    return w.closeGpu();
-                }
-                w.gpu = .{ .gl = r };
+        /// openGpu opens the GPU renderer choice names: Direct3D 11's, as
+        /// gpui's, on the hardware and else on WARP; Vulkan's or OpenGL's
+        /// (WGL) when MYZIG_RENDERER names one.
+        fn openGpu(w: *Self, gpa: std.mem.Allocator, choice: choose.Choice, verbose: bool) void {
+            var cr = RECT{};
+            _ = GetClientRect(w.hwnd, &cr);
+            const vsync = !env.has("MYZIG_UNCAPPED");
+            switch (choice.kind) {
+                .d3d11 => for ([_]bool{ false, true }) |warp| {
+                    const r = d3d11.Renderer.init(gpa, w.hwnd, cr.right, cr.bottom, .{ .vsync = vsync, .warp = warp }) catch |e| {
+                        sys.log(.warn, "myzig: no Direct3D 11{s} ({s})", .{ if (warp) " WARP" else "", @errorName(e) });
+                        continue;
+                    };
+                    w.gpu = .{ .d3d11 = r };
+                    break;
+                },
+                .vulkan => {
+                    const r = vulkan.Renderer.init(gpa, .{ .win32 = .{ .hinstance = GetModuleHandleW(null).?, .hwnd = w.hwnd } }, cr.right, cr.bottom, .{
+                        .vsync = vsync,
+                        .validation = env.has("MYZIG_VK_VALIDATION"),
+                    }) catch |e| {
+                        sys.log(.warn, "myzig: no Vulkan ({s}); drawing on the CPU", .{@errorName(e)});
+                        return;
+                    };
+                    w.gpu = .{ .vulkan = r };
+                },
+                .gl => {
+                    const dc = GetDC(w.hwnd) orelse return;
+                    w.wgl = Wgl.open(dc) catch |e| {
+                        sys.log(.warn, "myzig: no OpenGL ({s}); drawing on the CPU", .{@errorName(e)});
+                        return;
+                    };
+                    const gl = glr.Gl.load(&w.wgl.?, Wgl.proc) catch return w.closeGpu();
+                    const r = glr.Renderer.init(gpa, gl) catch return w.closeGpu();
+                    w.gpu = .{ .gl = r };
+                },
+                .cpu, .metal => return,
             }
             const gpu = if (w.gpu) |*x| x else return;
             if (verbose) sys.print("myzig: drawing with {s} on {s}\n", .{ gpu.api(), gpu.name() });

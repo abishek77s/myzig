@@ -2,8 +2,8 @@
 
 [![run_tests](https://github.com/abishek77s/myzig/actions/workflows/run_tests.yml/badge.svg)](https://github.com/abishek77s/myzig/actions/workflows/run_tests.yml)
 
-**Native desktop UI in Zig, drawn by MyZig itself on the GPU (Metal, Vulkan
-or OpenGL) or the CPU, on Linux, Windows and macOS.** Views are Zig functions of the
+**Native desktop UI in Zig, drawn by MyZig itself on the GPU (Direct3D 11,
+Metal, Vulkan or OpenGL) or the CPU, on Linux, Windows and macOS.** Views are Zig functions of the
 app's state, laid out with flexbox; no webview, no toolkit, no runtime.
 MyZig began as a port of the native UI of [MyGo](https://github.com/egoist/mygo)
 and measures itself against [gpui-fast](https://github.com/longbridge/gpui-fast).
@@ -66,7 +66,7 @@ On Windows, in PowerShell:
 
 ```powershell
 zig build gallery -Doptimize=ReleaseFast
-$env:MYZIG_RENDERER = "vulkan"; zig build quotes -Doptimize=ReleaseFast
+$env:MYZIG_RENDERER = "cpu"; zig build quotes -Doptimize=ReleaseFast
 ```
 
 On macOS, in Terminal:
@@ -84,7 +84,7 @@ on Linux makes the Mac and Windows executables.
 
 | Variable | Effect |
 | --- | --- |
-| `MYZIG_RENDERER=metal\|vulkan\|gl\|cpu` | The renderer. By default: Metal on macOS; elsewhere Vulkan, else OpenGL, else the CPU. On macOS, `vulkan` draws through MoltenVK (`brew install molten-vk`). A GPU API that draws on the CPU (llvmpipe, lavapipe, SwiftShader, Microsoft's GDI) is used only when named here, because MyZig's own CPU renderer, which draws only what changed, is cheaper. |
+| `MYZIG_RENDERER=d3d11\|metal\|vulkan\|gl\|cpu` | The renderer. By default the platform's GPU API, as gpui's: Direct3D 11 on Windows (the GPU's, else WARP), Metal on macOS, Vulkan elsewhere, else OpenGL; the CPU only where no GPU API works. One API is loaded at a time: one that fails is unloaded before the next is tried. A renderer named here is the only one tried. On macOS, `vulkan` draws through MoltenVK (`brew install molten-vk`). `WindowOptions.renderer = .cpu` asks for the CPU in code. |
 | `MYZIG_STATS=1` | Prints, each second, the frames drawn and what each cost. |
 | `MYZIG_SCALE=2` | Draws at twice the density (Windows follows the monitor's DPI by itself). |
 | `MYZIG_UNCAPPED=1` | Draws as fast as it can instead of at the display's rate. |
@@ -94,17 +94,22 @@ on Linux makes the Mac and Windows executables.
 
 ## What it has
 
-**Renderers.** All four draw the same pixels; the tests check Vulkan's and
+**Renderers.** All five draw the same pixels; the tests check Vulkan's and
 Metal's against the CPU's.
 
+- **Direct3D 11** (Windows, the default there): the same instanced draw,
+  through a flip-model swap chain, its shader in HLSL compiled when the
+  window opens. Without a GPU driver it draws with WARP.
 - **Metal** (macOS, on a `CAMetalLayer`): the same instanced draw, its
   shader in Metal's language, compiled when the window opens.
-- **Vulkan** (X11 through `VK_KHR_xlib_surface`, Windows through
+- **Vulkan** (the default on Linux; X11 through `VK_KHR_xlib_surface`, Windows through
   `VK_KHR_win32_surface`, macOS through MoltenVK's `VK_EXT_metal_surface`):
   the whole frame is one instanced draw. Boxes are
   shaded from their signed distance (rounded corners, borders, soft
   shadows), glyphs sample a coverage atlas, icons are strokes, and two
-  frames are in flight. SPIR-V is checked in (`zig build shaders` remakes
+  frames are in flight. Once a device is picked, Vulkan is opened again
+  with only its driver, so the loader unloads the others it loaded (on a
+  machine with Mesa, llvmpipe's LLVM among them). SPIR-V is checked in (`zig build shaders` remakes
   it from `src/gpu/shaders`).
 - **OpenGL 3.3** (GLX, WGL): the same draw and shader.
 - **CPU**: anti-aliased spans, drawing only the rectangles that changed and
@@ -208,8 +213,8 @@ to reproduce them.
 | | MyZig | MyGo | gpui-fast |
 | --- | --- | --- | --- |
 | Counter executable | **220 KB** (ReleaseSmall), 349 KB (ReleaseFast) | 11.6 MB | 22.3 MB |
-| Counter window, memory (PSS) | **2.8 MB** | 84.7 MB | 125.1 MB |
-| Quotes window, memory (PSS) | **4.5 MB** | 102.3 MB | |
+| Counter window, memory (PSS)³ | **2.9 MB** | 84.7 MB | 125.1 MB |
+| Quotes window, memory (PSS)³ | **4.8 MB** | 102.3 MB | |
 | Clean build, debug / release | **13.3 s** / **18.0 s** | 20.3 s / 19.9 s | 149 s / 280 s |
 | Rebuild after an edit, debug / release | **0.97 s** / 8.5 s | 0.97 s / **0.68 s** | 3.4 s / 63 s |
 | Quotes streaming in a window, CPU a frame | **0.55 ms** (60 fps, 3.3% CPU) | 6.4 ms (60 fps, 39% CPU) | |
@@ -224,6 +229,10 @@ MyZig's whole frame includes rasterizing on the CPU. ² With the window
 moving the scrolled pixels, as it does on X11 and Windows (0.36 ms when
 MyZig moves them itself). There is no GPU on the benchmark machine, so
 gpui-fast has no window numbers and MyZig's windows draw on the CPU.
+³ With `MYZIG_RENDERER=cpu`. A GPU driver costs more than the whole app:
+on this machine the default, Vulkan on lavapipe, takes 77 MB for the
+counter, most of it lavapipe and its LLVM. CI prints each example's memory per
+renderer (`script/memory` on Linux, `script/memory.ps1` on Windows).
 
 ## Status
 

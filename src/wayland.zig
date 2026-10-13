@@ -811,6 +811,37 @@ fn clipGet(ctx: *anyopaque, gpa: std.mem.Allocator) ?[]u8 {
 
 // ---- drawing on the CPU ----
 
+/// openGpu opens the GPU renderer choice names for surface: Vulkan's,
+/// else OpenGL's through EGL, each unloaded before the next is tried.
+fn openGpu(gpa: std.mem.Allocator, display: *wl.Display, surface: *p.wl_surface, size: [2]i32, choice: choose.Choice, uncapped: bool, egl: *?Egl) ?backend.Gpu {
+    if (choice.kind == .vulkan) vk: {
+        const r = vulkan.Renderer.init(gpa, .{ .wayland = .{ .display = @ptrCast(display), .surface = @ptrCast(surface) } }, size[0], size[1], .{
+            .vsync = !uncapped,
+            .validation = env.has("MYZIG_VK_VALIDATION"),
+        }) catch |e| {
+            sys.log(.warn, "myzig: no Vulkan ({s})", .{@errorName(e)});
+            break :vk;
+        };
+        return .{ .vulkan = r };
+    }
+    if (choice.kind != .gl and (choice.kind != .vulkan or choice.forced)) return null;
+    var e = Egl.open() catch return null;
+    const r = gl: {
+        e.context(@ptrCast(display), @ptrCast(surface), size[0], size[1]) catch |err| {
+            sys.log(.warn, "myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(err)});
+            break :gl null;
+        };
+        const gl = glr.Gl.load(&e, Egl.proc) catch break :gl null;
+        break :gl glr.Renderer.init(gpa, gl) catch null;
+    };
+    if (r == null) {
+        e.close();
+        return null;
+    }
+    egl.* = e;
+    return .{ .gl = r.? };
+}
+
 const Shm = struct {
     pool: ?*p.wl_shm_pool = null,
     map: []align(std.heap.page_size_min) u8 = &.{},
@@ -1008,52 +1039,13 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     defer shm.deinit(gpa);
 
     // The GPU renderer: Vulkan's, else OpenGL's through EGL.
-    const choice = choose.choose();
+    const choice = choose.choose(opts.renderer);
     var size = w.pixels();
     var gpu: ?backend.Gpu = null;
     defer if (gpu) |*g| g.deinit();
     var egl: ?Egl = null;
-    defer if (egl) |*e| e.release();
-    if (choice.kind == .vulkan) vk: {
-        var r = vulkan.Renderer.init(gpa, .{ .wayland = .{ .display = @ptrCast(display), .surface = @ptrCast(w.surface) } }, size[0], size[1], .{
-            .vsync = !uncapped,
-            .validation = env.has("MYZIG_VK_VALIDATION"),
-        }) catch |e| {
-            if (choice.forced) sys.log(.warn, "myzig: no Vulkan ({s}); trying OpenGL", .{@errorName(e)});
-            break :vk;
-        };
-        if (!choice.forced and r.software()) {
-            r.deinit();
-            break :vk;
-        }
-        gpu = .{ .vulkan = r };
-    }
-    if (gpu == null and (choice.kind == .gl or (choice.kind == .vulkan and !choice.forced) or (choice.kind == .vulkan and choice.forced))) gl: {
-        egl = Egl.open() catch break :gl;
-        egl.?.context(@ptrCast(display), @ptrCast(w.surface), size[0], size[1]) catch |e| {
-            sys.log(.warn, "myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(e)});
-            egl.?.release();
-            egl = null;
-            break :gl;
-        };
-        const gl = glr.Gl.load(&egl.?, Egl.proc) catch {
-            egl.?.release();
-            egl = null;
-            break :gl;
-        };
-        var r = glr.Renderer.init(gpa, gl) catch {
-            egl.?.release();
-            egl = null;
-            break :gl;
-        };
-        if (!choice.forced and glr.software(r.name())) {
-            r.deinit();
-            egl.?.release();
-            egl = null;
-            break :gl;
-        }
-        gpu = .{ .gl = r };
-    }
+    defer if (egl) |*e| e.close();
+    if (choice.kind != .cpu) gpu = openGpu(gpa, display, w.surface, size, choice, uncapped, &egl);
     if (print_stats) sys.print("myzig: Wayland{s}, {s}\n", .{ if (w.csd) " (MyZig's decorations)" else "", if (gpu) |*g| g.api() else "drawing on the CPU" });
     if (gpu != null) rend.raster = false;
     if (dump != null) if (gpu) |*g| g.capture();
@@ -1137,7 +1129,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                         sys.log(.err, "myzig: {s} frame: {s}; drawing on the CPU", .{ g.api(), @errorName(e) });
                         g.deinit();
                         gpu = null;
-                        if (egl) |*eg| eg.release();
+                        if (egl) |*eg| eg.close();
                         egl = null;
                         rend.raster = true;
                         rend.invalidate();

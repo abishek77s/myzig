@@ -34,6 +34,7 @@ pub const env = @import("env.zig");
 pub const sys = @import("sys.zig");
 pub const app = @import("app.zig");
 pub const WindowOptions = app.WindowOptions;
+pub const Renderer = @import("gpu/choose.zig").Renderer;
 
 const debug_build = switch (@import("builtin").mode) {
     .Debug, .ReleaseSafe => true,
@@ -81,6 +82,7 @@ test {
     _ = raster;
     _ = @import("gpu/instances.zig");
     _ = @import("gpu/vulkan.zig");
+    _ = @import("gpu/choose.zig");
     if (@import("builtin").os.tag == .macos) _ = @import("gpu/metal.zig");
     _ = ui;
     _ = scene;

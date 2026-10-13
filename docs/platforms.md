@@ -31,7 +31,7 @@ MyZig handles it; the notes say how, or what is still missing.
 
 | | gpui-fast | MyZig |
 | --- | --- | --- |
-| Renderer | DirectX 11 | Vulkan, else OpenGL (WGL), else the CPU (GDI) |
+| Renderer | DirectX 11 | ✓ Direct3D 11 (the GPU's, else WARP), else the CPU (GDI); Vulkan or OpenGL (WGL) on request |
 | Device lost | `WM_GPUI_GPU_DEVICE_LOST`: devices recreated | ✓ the window goes on drawing on the CPU |
 | Alt shortcuts | `WM_SYSKEYDOWN` through its accelerator path | ✓ `WM_SYSKEYDOWN` reaches the view; Alt+F4 and Alt+Space stay Windows'; Alt+letter does not beep |
 | Minimum size | `WM_GETMINMAXINFO` | ✓ 160×120 points |
@@ -61,7 +61,7 @@ MyZig handles it; the notes say how, or what is still missing.
 
 `run_tests` builds and tests on each OS and draws the gallery's first
 frame from every renderer the runner has: CPU, OpenGL (llvmpipe) and
-Vulkan (lavapipe) on Linux; the CPU on Windows; Metal, the CPU and Vulkan
+Vulkan (lavapipe) on Linux; the CPU and Direct3D 11 (WARP) on Windows; Metal, the CPU and Vulkan
 (MoltenVK) on macOS. The Vulkan and Metal tests compare their pixels with
 the CPU renderer's. On Linux, `script/input-test` drives the `events`
 example in a real window with xdotool and xclip: every mouse button, the

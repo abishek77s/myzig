@@ -266,3 +266,54 @@ pub fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comp
     const prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
     print(level.asText() ++ ": " ++ prefix ++ fmt ++ "\n", args);
 }
+
+/// mapFile maps the file at path read-only: its pages are read from the
+/// file as they are touched and shared with every process mapping it, so
+/// a font of a megabyte costs what of it is used, not a private copy.
+pub fn mapFile(path: []const u8) ![]const u8 {
+    if (is_windows) {
+        const k = struct {
+            extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disposition: u32, flags: u32, template: ?*anyopaque) callconv(.winapi) *anyopaque;
+            extern "kernel32" fn GetFileSizeEx(file: *anyopaque, size: *i64) callconv(.winapi) i32;
+            extern "kernel32" fn CreateFileMappingW(file: *anyopaque, sa: ?*anyopaque, protect: u32, high: u32, low: u32, name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+            extern "kernel32" fn MapViewOfFile(mapping: *anyopaque, access: u32, high: u32, low: u32, size: usize) callconv(.winapi) ?[*]const u8;
+            extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.winapi) i32;
+        };
+        var buf: [1024]u16 = undefined;
+        const n = std.unicode.wtf8ToWtf16Le(buf[0 .. buf.len - 1], path) catch return error.FileNotFound;
+        buf[n] = 0;
+        const f = k.CreateFileW(buf[0..n :0], 0x80000000, 1, null, 3, 0x80, null); // GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING
+        if (@intFromPtr(f) == std.math.maxInt(usize)) return error.FileNotFound;
+        defer _ = k.CloseHandle(f);
+        var size: i64 = 0;
+        if (k.GetFileSizeEx(f, &size) == 0 or size <= 0) return error.FileNotFound;
+        const m = k.CreateFileMappingW(f, null, 0x02, 0, 0, null) orelse return error.FileNotFound; // PAGE_READONLY
+        defer _ = k.CloseHandle(m);
+        const p = k.MapViewOfFile(m, 0x4, 0, 0, 0) orelse return error.FileNotFound; // FILE_MAP_READ
+        return p[0..@intCast(size)];
+    }
+    var buf: [4096]u8 = undefined;
+    if (path.len >= buf.len) return error.NameTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const fd = std.c.open(buf[0..path.len :0], .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (fd < 0) return error.FileNotFound;
+    defer close(fd);
+    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (end <= 0) return error.FileNotFound;
+    const size: usize = @intCast(end);
+    const p = std.c.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+    if (p == std.c.MAP_FAILED) return error.FileNotFound;
+    return @as([*]const u8, @ptrCast(p))[0..size];
+}
+
+pub fn unmapFile(data: []const u8) void {
+    if (is_windows) {
+        const k = struct {
+            extern "kernel32" fn UnmapViewOfFile(p: *const anyopaque) callconv(.winapi) i32;
+        };
+        _ = k.UnmapViewOfFile(data.ptr);
+        return;
+    }
+    _ = std.c.munmap(@ptrCast(@alignCast(@constCast(data.ptr))), data.len);
+}

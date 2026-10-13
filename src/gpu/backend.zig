@@ -1,5 +1,5 @@
-//! Gpu is the renderer a window draws with on the GPU: OpenGL's, Vulkan's
-//! or Metal's, the same scene and shader either way. The window keeps the
+//! Gpu is the renderer a window draws with on the GPU: Direct3D 11's,
+//! OpenGL's, Vulkan's or Metal's, the same scene and shader either way. The window keeps the
 //! platform's side (the GLX or WGL context OpenGL presents with).
 
 const std = @import("std");
@@ -21,10 +21,27 @@ pub const metal = if (builtin.os.tag == .macos) @import("metal.zig") else struct
     };
 };
 
+/// d3d11 is Direct3D 11's renderer on Windows, and nothing elsewhere.
+pub const d3d11 = if (builtin.os.tag == .windows) @import("d3d11.zig") else struct {
+    pub const Renderer = struct {
+        capture: bool = false,
+        pub fn deinit(_: *Renderer) void {}
+        pub fn name(_: *const Renderer) []const u8 {
+            return "";
+        }
+        pub fn software(_: *const Renderer) bool {
+            return false;
+        }
+        pub fn draw(_: *Renderer, _: *const scene.Scene, _: *text.Fonts, _: i32, _: i32) !void {}
+        pub fn read(_: *Renderer, _: i32, _: i32, _: []u32) void {}
+    };
+};
+
 pub const Gpu = union(enum) {
     gl: glr.Renderer,
     vulkan: vulkan.Renderer,
     metal: metal.Renderer,
+    d3d11: d3d11.Renderer,
 
     pub fn deinit(g: *Gpu) void {
         switch (g.*) {
@@ -38,6 +55,7 @@ pub const Gpu = union(enum) {
             .gl => "OpenGL",
             .vulkan => "Vulkan",
             .metal => "Metal",
+            .d3d11 => "Direct3D 11",
         };
     }
 
@@ -53,6 +71,7 @@ pub const Gpu = union(enum) {
             .gl => |*r| glr.software(r.name()),
             .vulkan => |*r| r.software(),
             .metal => false,
+            .d3d11 => |*r| r.software(),
         };
     }
 
@@ -69,6 +88,7 @@ pub const Gpu = union(enum) {
         switch (g.*) {
             .gl => {},
             .vulkan => |*r| r.capture = true,
+            .d3d11 => |*r| r.capture = true,
             .metal => |*r| if (builtin.os.tag == .macos) {
                 r.capture = true;
             },

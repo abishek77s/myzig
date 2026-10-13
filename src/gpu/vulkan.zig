@@ -143,11 +143,8 @@ pub const Renderer = struct {
             .atlas = .{ .gpa = gpa },
             .images = .{ .gpa = gpa },
         };
-        try r.createInstance(surface, opts);
-        errdefer r.i.DestroyInstance(r.instance, null);
-        try r.createSurface(surface);
-        try r.pickDevice();
-        try r.createDevice();
+        try r.open(surface, opts);
+        if (builtin.os.tag == .linux) r.onlyDriver(surface, opts) catch {};
         errdefer {
             _ = r.d.DeviceWaitIdle(r.device);
             r.destroyAll();
@@ -205,6 +202,96 @@ pub const Renderer = struct {
     /// SwiftShader), where MyZig's own CPU renderer is cheaper.
     pub fn software(r: *const Renderer) bool {
         return r.props.device_type == .cpu;
+    }
+
+    fn open(r: *Renderer, surface: Surface, opts: Options) !void {
+        try r.createInstance(surface, opts);
+        errdefer r.i.DestroyInstance(r.instance, null);
+        try r.createSurface(surface);
+        errdefer if (r.surface != 0) r.i.DestroySurfaceKHR.?(r.instance, r.surface, null);
+        try r.pickDevice();
+        try r.createDevice();
+    }
+
+    fn close(r: *Renderer) void {
+        r.d.DestroyDevice(r.device, null);
+        if (r.surface != 0) r.i.DestroySurfaceKHR.?(r.instance, r.surface, null);
+        r.i.DestroyInstance(r.instance, null);
+        r.surface = 0;
+    }
+
+    /// onlyDriver opens Vulkan again with only the driver of the device
+    /// picked: the loader loads every installed driver (llvmpipe's LLVM,
+    /// nouveau, radeon, ...) and keeps them while an instance lives, some
+    /// 10 to 30 MB the window never uses. Nothing is done when the user
+    /// chose drivers themselves.
+    fn onlyDriver(r: *Renderer, surface: Surface, opts: Options) !void {
+        inline for (.{ "VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_LOADER_DRIVERS_SELECT", "VK_ADD_DRIVER_FILES" }) |v|
+            if (env.has(v)) return;
+        var info: Dl_info = undefined;
+        if (dladdr(@ptrCast(r.d.QueueSubmit), &info) == 0) return;
+        const lib = std.fs.path.basename(std.mem.sliceTo(info.dli_fname orelse return, 0));
+        var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        const json = findDriverFile(r.gpa, lib, &path_buf) orelse return;
+        const props = r.props;
+        r.close();
+        _ = setenv("VK_DRIVER_FILES", json, 1);
+        _ = setenv("VK_ICD_FILENAMES", json, 1);
+        defer {
+            _ = unsetenv("VK_DRIVER_FILES");
+            _ = unsetenv("VK_ICD_FILENAMES");
+        }
+        r.open(surface, opts) catch {
+            // Every driver again, as at first.
+            _ = unsetenv("VK_DRIVER_FILES");
+            _ = unsetenv("VK_ICD_FILENAMES");
+            return r.open(surface, opts);
+        };
+        if (r.props.device_id != props.device_id or r.props.vendor_id != props.vendor_id) {
+            r.close();
+            _ = unsetenv("VK_DRIVER_FILES");
+            _ = unsetenv("VK_ICD_FILENAMES");
+            return r.open(surface, opts);
+        }
+    }
+
+    /// findDriverFile is the loader's manifest (icd.d/*.json) naming lib,
+    /// in the directories the loader reads them from.
+    fn findDriverFile(gpa: std.mem.Allocator, lib: []const u8, buf: *[std.fs.max_path_bytes:0]u8) ?[:0]const u8 {
+        var dirs: [16][]const u8 = undefined;
+        var n: usize = 0;
+        dirs[n] = "/etc/vulkan/icd.d";
+        n += 1;
+        const data = env.get("XDG_DATA_DIRS") orelse "/usr/local/share:/usr/share";
+        var it = std.mem.tokenizeScalar(u8, data, ':');
+        var joined: [8][std.fs.max_path_bytes]u8 = undefined;
+        var nj: usize = 0;
+        while (it.next()) |d| {
+            if (nj == joined.len) break;
+            dirs[n] = std.fmt.bufPrint(&joined[nj], "{s}/vulkan/icd.d", .{d}) catch continue;
+            n += 1;
+            nj += 1;
+        }
+        for (dirs[0..n]) |dir| {
+            var dir_z: [std.fs.max_path_bytes:0]u8 = undefined;
+            const dz = std.fmt.bufPrintZ(&dir_z, "{s}", .{dir}) catch continue;
+            const d = std.c.opendir(dz) orelse continue;
+            defer _ = std.c.closedir(d);
+            while (readdir(d)) |e| {
+                const name_ = std.mem.sliceTo(&e.name, 0);
+                if (!std.mem.endsWith(u8, name_, ".json")) continue;
+                const path = std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, name_ }) catch continue;
+                const body = sys.readFile(gpa, path, 64 << 10) catch continue;
+                defer gpa.free(body);
+                const key = "\"library_path\"";
+                const at = std.mem.indexOf(u8, body, key) orelse continue;
+                const rest = body[at + key.len ..];
+                const q0 = std.mem.indexOfScalarPos(u8, rest, std.mem.indexOfScalar(u8, rest, ':') orelse continue, '"') orelse continue;
+                const q1 = std.mem.indexOfScalarPos(u8, rest, q0 + 1, '"') orelse continue;
+                if (std.mem.eql(u8, std.fs.path.basename(rest[q0 + 1 .. q1]), lib)) return path;
+            }
+        }
+        return null;
     }
 
     fn openLoader() !sys.DynLib {
@@ -942,3 +1029,14 @@ test "offscreen Vulkan draws what the CPU renderer draws" {
     };
     try std.testing.expectEqual(cpu_px[30 * 320 + 70], gpu_px[30 * 320 + 70]);
 }
+
+const Dl_info = extern struct {
+    dli_fname: ?[*:0]const u8,
+    dli_fbase: ?*anyopaque,
+    dli_sname: ?[*:0]const u8,
+    dli_saddr: ?*anyopaque,
+};
+extern "c" fn dladdr(addr: *const anyopaque, info: *Dl_info) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+extern "c" fn readdir(dir: *std.c.DIR) ?*std.c.dirent;

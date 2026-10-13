@@ -72,13 +72,14 @@ pub const Face = struct {
     ascii_adv: [128]i16,
 
     fn load(gpa: std.mem.Allocator, override: ?[]const u8, paths: []const []const u8) !Face {
-        var data: ?[]u8 = null;
+        _ = gpa;
+        var data: ?[]const u8 = null;
         var index: c_int = 0;
-        errdefer if (data) |d| gpa.free(d);
-        if (override) |p| data = readFace(gpa, p, &index);
+        errdefer if (data) |d| sys.unmapFile(d);
+        if (override) |p| data = readFace(p, &index);
         for (paths) |p| {
             if (data != null) break;
-            data = readFace(gpa, p, &index);
+            data = readFace(p, &index);
         }
         const d = data orelse return error.NoFont;
         const info = mz_font_init(d.ptr, index) orelse return error.BadFont;
@@ -98,14 +99,16 @@ pub const Face = struct {
         return f;
     }
 
-    fn readFace(gpa: std.mem.Allocator, spec: []const u8, index: *c_int) ?[]u8 {
+    /// readFace maps the font file spec names (a path, with #n for the
+    /// nth face of a collection).
+    fn readFace(spec: []const u8, index: *c_int) ?[]const u8 {
         var path = spec;
         index.* = 0;
         if (std.mem.lastIndexOfScalar(u8, spec, '#')) |i| {
             index.* = std.fmt.parseInt(c_int, spec[i + 1 ..], 10) catch 0;
             path = spec[0..i];
         }
-        return sys.readFile(gpa, path, 64 << 20) catch null;
+        return sys.mapFile(path) catch null;
     }
 
     pub fn glyph(f: *const Face, cp: u21) u32 {
@@ -159,7 +162,7 @@ pub const Fonts = struct {
         const same = f.faces[0].info == f.faces[1].info;
         for (f.faces[0..if (same) 1 else 2]) |fc| {
             std.c.free(fc.info);
-            f.gpa.free(fc.data);
+            sys.unmapFile(fc.data);
         }
         f.glyphs.deinit(f.gpa);
         f.coverage.deinit(f.gpa);

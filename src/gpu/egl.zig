@@ -124,6 +124,13 @@ pub const Egl = struct {
         g.window = null;
     }
 
+    /// close releases the context and unloads EGL.
+    pub fn close(g: *Egl) void {
+        g.release();
+        g.lib.close();
+        g.wlegl.close();
+    }
+
     pub fn proc(g: *Egl, name: [*:0]const u8) ?*const anyopaque {
         return g.getProcAddress(name);
     }
