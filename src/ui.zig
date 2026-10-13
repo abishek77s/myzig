@@ -20,6 +20,7 @@
 const std = @import("std");
 const geom = @import("geom.zig");
 const textm = @import("text.zig");
+const textedit = @import("textedit.zig");
 const scene_mod = @import("scene.zig");
 pub const Image = @import("image.zig").Image;
 pub const Rect = geom.Rect;
@@ -219,6 +220,27 @@ pub const InputOpts = struct {
     key: ?[]const u8 = null,
 };
 
+pub const TextAreaOpts = struct {
+    placeholder: []const u8 = "",
+    width: ?f32 = null,
+    /// height is the area's; without it, it is lines tall.
+    height: ?f32 = null,
+    lines: u16 = 6,
+    grow: f32 = 0,
+    /// wrap breaks lines at spaces to fit; without it the text scrolls
+    /// sideways.
+    wrap: bool = true,
+    line_numbers: bool = false,
+    /// code makes Tab indent (and Shift+Tab take it back), Backspace go
+    /// back a tab stop over indentation, and Enter keep a line's
+    /// indentation; Ctrl+Tab moves the focus then.
+    code: bool = false,
+    /// read_only lets the text be selected and copied, not changed.
+    read_only: bool = false,
+    disabled: bool = false,
+    key: ?[]const u8 = null,
+};
+
 /// ListState is what a virtualized list, or a scroll view, keeps between
 /// frames.
 pub const ListState = struct {
@@ -254,20 +276,39 @@ pub const TextInput = struct {
     /// word the double click selected.
     unit: u8 = 1,
     word: [2]u32 = .{ 0, 0 },
+    /// history is what Ctrl+Z undoes and Ctrl+Shift+Z (or Ctrl+Y) redoes.
+    history: textedit.History = .{},
+    /// version counts the changes to the text.
+    version: u32 = 0,
+    // A text area's: its rows on screen, for which version, width and
+    // input method text; how far it is scrolled down; the x the caret
+    // keeps going up and down; and where it was last drawn.
+    rows: std.ArrayListUnmanaged(textedit.Row) = .empty,
+    rows_key: u64 = 0,
+    rows_width: f32 = 0,
+    view: ListState = .{},
+    goal_x: ?f32 = null,
+    rect: Rect = .{},
 
     pub fn deinit(t: *TextInput, gpa: std.mem.Allocator) void {
         t.text.deinit(gpa);
+        t.history.deinit(gpa);
+        t.rows.deinit(gpa);
     }
 
     pub fn value(t: *const TextInput) []const u8 {
         return t.text.items;
     }
 
+    /// set replaces the text with s, the caret at its end, and forgets
+    /// what undo would have taken back.
     pub fn set(t: *TextInput, gpa: std.mem.Allocator, s: []const u8) !void {
         t.text.clearRetainingCapacity();
         try t.text.appendSlice(gpa, s);
         t.caret = @intCast(s.len);
         t.anchor = t.caret;
+        t.history.clear();
+        t.version +%= 1;
     }
 
     pub fn selection(t: *const TextInput) [2]u32 {
@@ -277,9 +318,49 @@ pub const TextInput = struct {
     /// replace puts s where the selection is, the caret after it.
     pub fn replace(t: *TextInput, gpa: std.mem.Allocator, s: []const u8) !void {
         const sel = t.selection();
+        try t.history.record(gpa, sel[0], t.text.items[sel[0]..sel[1]], s, t.caret, t.anchor);
         try t.text.replaceRange(gpa, sel[0], sel[1] - sel[0], s);
         t.caret = sel[0] + @as(u32, @intCast(s.len));
         t.anchor = t.caret;
+        t.version +%= 1;
+    }
+
+    /// undo takes back the last edit; it reports whether there was one.
+    pub fn undo(t: *TextInput, gpa: std.mem.Allocator) bool {
+        const h = &t.history;
+        if (h.done == 0) return false;
+        const e = h.edits.items[h.done - 1];
+        t.text.replaceRange(gpa, e.at, e.inserted_len, h.removedOf(e)) catch return false;
+        h.done -= 1;
+        h.breakGroup();
+        t.caret = e.caret;
+        t.anchor = e.anchor;
+        t.version +%= 1;
+        return true;
+    }
+
+    /// redo puts back the last edit undone.
+    pub fn redo(t: *TextInput, gpa: std.mem.Allocator) bool {
+        const h = &t.history;
+        if (h.done >= h.edits.items.len) return false;
+        const e = h.edits.items[h.done];
+        t.text.replaceRange(gpa, e.at, e.removed_len, h.insertedOf(e)) catch return false;
+        h.done += 1;
+        h.breakGroup();
+        t.caret = e.at + e.inserted_len;
+        t.anchor = t.caret;
+        t.version +%= 1;
+        return true;
+    }
+
+    /// lineAt is the line (between newlines) at i, what a triple click in
+    /// a text area selects.
+    fn lineAt(t: *const TextInput, i: u32) [2]u32 {
+        const s = t.text.items;
+        const at = @min(i, s.len);
+        const lo: u32 = @intCast(if (std.mem.lastIndexOfScalar(u8, s[0..at], '\n')) |k| k + 1 else 0);
+        const hi: u32 = @intCast(std.mem.indexOfScalarPos(u8, s, at, '\n') orelse s.len);
+        return .{ lo, hi };
     }
 
     fn prev(t: *const TextInput, i: u32) u32 {
@@ -348,7 +429,7 @@ pub const Clipboard = struct {
 
 const none: u32 = std.math.maxInt(u32);
 
-const Kind = enum(u8) { box, text, button, list, scroll, checkbox, radio, toggle, slider, progress, input, divider, overlay, select, option, menu_item, image };
+const Kind = enum(u8) { box, text, button, list, scroll, checkbox, radio, toggle, slider, progress, input, divider, overlay, select, option, menu_item, image, area };
 
 /// Place is where an overlay goes: below its anchor (a popup, flipped
 /// above when it does not fit), at the pointer (a tooltip), or centered (a
@@ -360,6 +441,7 @@ const OverlayMode = enum(u2) { popup, modal, tip };
 const popup_salt: u64 = 0x706f707570;
 const blocker_salt: u64 = 0x626c6f636b;
 const tip_salt: u64 = 0x746970;
+const area_salt: u64 = 0x61726561;
 const tip_delay: u64 = 600 * std.time.ns_per_ms;
 
 const Flags = packed struct(u16) {
@@ -374,7 +456,10 @@ const Flags = packed struct(u16) {
     wrap: bool = false,
     /// listens is set on a box that asked for presses of other buttons.
     listens: bool = false,
-    _: u6 = 0,
+    /// a text area's: line numbers, and code editing
+    numbers: bool = false,
+    code: bool = false,
+    _: u4 = 0,
 };
 
 const Node = struct {
@@ -484,6 +569,10 @@ pub const Input = struct {
     /// text_focus is set while a text input has the focus: it takes the
     /// keys that edit text before shortcuts do.
     text_focus: bool = false,
+    /// area_focus is set while it is a text area, which takes the up and
+    /// down keys too; tab_taken while it takes Tab.
+    area_focus: bool = false,
+    tab_taken: bool = false,
     /// clicks counts the presses of the left button in quick succession
     /// at one place, for the press that set pressed: 2 for a double click.
     clicks: u8 = 1,
@@ -605,7 +694,7 @@ pub const Context = struct {
     }
 
     fn takeKey(c: *Context, key: Key, mods: ?Mods) bool {
-        if (c.input.text_focus and editsText(key, mods orelse .{})) return false;
+        if (c.input.text_focus and editsText(key, mods orelse .{}, c.input.area_focus)) return false;
         for (c.input.keys[0..c.input.nkeys]) |*k| {
             if (k.used or k.key != key) continue;
             if (mods) |m| if (@as(u8, @bitCast(m)) != @as(u8, @bitCast(k.mods))) continue;
@@ -616,9 +705,10 @@ pub const Context = struct {
         return false;
     }
 
-    fn editsText(key: Key, mods: Mods) bool {
+    fn editsText(key: Key, mods: Mods, area: bool) bool {
         return switch (key) {
             .left, .right, .home, .end, .backspace, .delete, .space, .enter => true,
+            .up, .down, .page_up, .page_down => area,
             else => @intFromEnum(key) >= @intFromEnum(Key.a) and !mods.ctrl and !mods.alt and !mods.super,
         };
     }
@@ -1001,6 +1091,10 @@ pub const Context = struct {
                             changed = true;
                         }
                     } else continue,
+                    .z, .y => if (k.mods.ctrl) {
+                        const redo = k.key == .y or k.mods.shift;
+                        if (if (redo) st.redo(c.gpa) else st.undo(c.gpa)) changed = true;
+                    } else continue,
                     .space => {}, // its text comes as typed text
                     else => continue,
                 }
@@ -1039,6 +1133,359 @@ pub const Context = struct {
         const n = &c.nodes.items[i];
         n.flags = .{ .hot = in.hot, .focused = in.focused, .disabled = o.disabled, .caret = caret, .password = o.password };
         return changed;
+    }
+
+    /// textArea edits st's text over many lines: what textInput does,
+    /// and Enter for a new line, Up and Down (keeping the caret's column),
+    /// Page Up and Page Down, Home and End on the row (Ctrl: the text's),
+    /// a triple click for the line, Ctrl+Z and Ctrl+Shift+Z (or Ctrl+Y)
+    /// to undo and redo, and the wheel to scroll it. Ctrl+Enter sets
+    /// st.submitted. It reports whether the text changed.
+    pub fn textArea(c: *Context, st: *TextInput, o: TextAreaOpts) bool {
+        const t = c.theme;
+        const off, const len = c.str(o.placeholder);
+        const i = c.add(.{
+            .kind = .area,
+            .str_off = off,
+            .str_len = len,
+            .size = t.font_size,
+            .input = st,
+            .value = @floatFromInt(o.lines),
+            .box = .{ .width = o.width, .height = o.height, .grow = o.grow, .radius = t.radius, .padding_x = t.space(2.5), .padding_y = t.space(2) },
+        }, o.key orelse "textarea");
+        if (i == none) return false;
+        const id = c.nodes.items[i].id;
+        const in = c.interactKeys(id, o.disabled, false);
+        st.submitted = false;
+        const tlen: u32 = @intCast(st.text.items.len);
+        st.caret = @min(st.caret, tlen);
+        st.anchor = @min(st.anchor, tlen);
+        var changed = false;
+        var moved = false;
+        const g = c.areaGeom(&c.nodes.items[i], st.rect, o.line_numbers);
+        const size = t.font_size;
+        c.areaRows(st, st.text.items, g, o.wrap, st.version);
+        // The pointer places the caret, and selects as it drags.
+        if (!o.disabled and st.rect.w > 0 and (c.input.pressed == id or c.input.active == id)) {
+            const at = c.areaOffsetAt(st, st.text.items, g, c.input.x, c.input.y);
+            if (c.input.pressed == id) {
+                st.unit = c.input.clicks;
+                if (st.unit == 2) st.word = st.wordAt(at);
+                if (st.unit >= 3) st.word = st.lineAt(at);
+            }
+            switch (st.unit) {
+                1 => {
+                    st.caret = at;
+                    if (c.input.pressed == id and !c.input.mods.shift) st.anchor = at;
+                },
+                else => {
+                    const w = if (st.unit == 2) st.wordAt(at) else st.lineAt(at);
+                    if (at < st.word[0]) {
+                        st.anchor = st.word[1];
+                        st.caret = w[0];
+                    } else {
+                        st.anchor = st.word[0];
+                        st.caret = @max(w[1], st.word[1]);
+                    }
+                },
+            }
+            if (c.input.pressed == id) c.input.pressed = 0;
+            st.goal_x = null;
+            st.history.breakGroup();
+            moved = true;
+        }
+        if (in.focused and !o.disabled) {
+            const editable = !o.read_only;
+            for (c.input.keys[0..c.input.nkeys]) |*k| {
+                if (k.used) continue;
+                const shift = k.mods.shift;
+                const word = k.mods.ctrl or k.mods.alt;
+                var keep_goal = false;
+                switch (k.key) {
+                    .left => {
+                        const sel = st.selection();
+                        st.caret = if (!shift and sel[0] != sel[1]) sel[0] else if (word) st.prevWord(st.caret) else st.prev(st.caret);
+                        if (!shift) st.anchor = st.caret;
+                    },
+                    .right => {
+                        const sel = st.selection();
+                        st.caret = if (!shift and sel[0] != sel[1]) sel[1] else if (word) st.nextWord(st.caret) else st.next(st.caret);
+                        if (!shift) st.anchor = st.caret;
+                    },
+                    .up, .down, .page_up, .page_down => {
+                        const rows = st.rows.items;
+                        const r = textedit.rowOf(rows, st.caret);
+                        if (st.goal_x == null) st.goal_x = c.fonts.prefixWidth(.regular, size, st.text.items[rows[r].start..rows[r].end], st.caret - rows[r].start);
+                        const page: usize = @max(1, @as(usize, @intFromFloat(@floor(g.view_h / g.line_h))) -| 1);
+                        const step: usize = if (k.key == .up or k.key == .down) 1 else page;
+                        const back = k.key == .up or k.key == .page_up;
+                        if (back and r < step and k.key == .up) {
+                            st.caret = 0;
+                        } else if (!back and r + step >= rows.len and k.key == .down) {
+                            st.caret = @intCast(st.text.items.len);
+                        } else {
+                            const to = if (back) r -| step else @min(rows.len - 1, r + step);
+                            st.caret = c.areaOffsetInRow(st, st.text.items, rows[to], st.goal_x.?);
+                            if (k.key == .page_up or k.key == .page_down) st.view.scrollBy((@as(f32, @floatFromInt(to)) - @as(f32, @floatFromInt(r))) * g.line_h);
+                        }
+                        if (!shift) st.anchor = st.caret;
+                        keep_goal = true;
+                    },
+                    .home, .end => {
+                        const rows = st.rows.items;
+                        const rw = rows[textedit.rowOf(rows, st.caret)];
+                        st.caret = if (k.mods.ctrl)
+                            (if (k.key == .home) 0 else @intCast(st.text.items.len))
+                        else if (k.key == .home)
+                            rw.start
+                        else if (rw.soft and rw.end > rw.start)
+                            st.prev(rw.end)
+                        else
+                            rw.end;
+                        if (!shift) st.anchor = st.caret;
+                    },
+                    .backspace, .delete => if (editable) {
+                        if (st.caret == st.anchor) {
+                            if (k.key == .backspace) {
+                                st.anchor = if (word) st.prevWord(st.caret) else if (o.code) c.dedentTo(st) else st.prev(st.caret);
+                            } else st.anchor = if (word) st.nextWord(st.caret) else st.next(st.caret);
+                        }
+                        if (st.caret != st.anchor) {
+                            st.history.breakGroup();
+                            st.replace(c.gpa, "") catch {};
+                            changed = true;
+                        }
+                    },
+                    .enter => if (k.mods.ctrl) {
+                        st.submitted = true;
+                    } else if (editable) {
+                        var buf: [129]u8 = undefined;
+                        buf[0] = '\n';
+                        var n: usize = 1;
+                        if (o.code) {
+                            // The new line keeps the indentation of this one.
+                            const ln = st.lineAt(st.caret);
+                            var j = ln[0];
+                            while (j < st.caret and n < buf.len and st.text.items[j] == ' ') : (j += 1) {
+                                buf[n] = ' ';
+                                n += 1;
+                            }
+                        }
+                        st.history.breakGroup();
+                        st.replace(c.gpa, buf[0..n]) catch {};
+                        changed = true;
+                    },
+                    .tab => if (o.code and editable and !k.mods.ctrl) {
+                        const ln = st.lineAt(st.caret);
+                        if (shift) {
+                            // Shift+Tab takes up to a tab's spaces off the line.
+                            var j = ln[0];
+                            while (j < ln[1] and j - ln[0] < tab_width and st.text.items[j] == ' ') j += 1;
+                            if (j > ln[0]) {
+                                const caret = st.caret;
+                                const cut = j - ln[0];
+                                st.anchor = ln[0];
+                                st.caret = j;
+                                st.replace(c.gpa, "") catch {};
+                                st.caret = if (caret >= j) caret - cut else ln[0];
+                                st.anchor = st.caret;
+                                changed = true;
+                            }
+                        } else {
+                            const col = st.selection()[0] - ln[0];
+                            const spaces = "    "[0 .. tab_width - col % tab_width];
+                            st.replace(c.gpa, spaces) catch {};
+                            changed = true;
+                        }
+                    } else continue,
+                    .a => if (k.mods.ctrl) {
+                        st.anchor = 0;
+                        st.caret = @intCast(st.text.items.len);
+                    } else continue,
+                    .c, .x => if (k.mods.ctrl) {
+                        const sel = st.selection();
+                        if (sel[0] != sel[1]) c.setClipboard(st.text.items[sel[0]..sel[1]]);
+                        if (k.key == .x and sel[0] != sel[1] and editable) {
+                            st.history.breakGroup();
+                            st.replace(c.gpa, "") catch {};
+                            changed = true;
+                        }
+                    } else continue,
+                    .v => if (k.mods.ctrl) {
+                        if (!editable) continue;
+                        if (c.getClipboard()) |clip| {
+                            defer c.gpa.free(clip);
+                            const clean = normalizeLines(clip);
+                            st.history.breakGroup();
+                            st.replace(c.gpa, clean) catch {};
+                            st.history.breakGroup();
+                            changed = true;
+                        }
+                    } else continue,
+                    .z, .y => if (k.mods.ctrl) {
+                        if (!editable) continue;
+                        const redo = k.key == .y or k.mods.shift;
+                        if (if (redo) st.redo(c.gpa) else st.undo(c.gpa)) changed = true;
+                    } else continue,
+                    .space => {}, // its text comes as typed text
+                    else => continue,
+                }
+                if (!keep_goal) st.goal_x = null;
+                k.used = true;
+                moved = true;
+                // The rows the next key moves through.
+                if (changed) c.areaRows(st, st.text.items, g, o.wrap, st.version);
+            }
+            if (c.input.nchars > 0) {
+                if (editable) {
+                    // Control characters are not text; Enter and Tab came as keys.
+                    var buf: [64]u8 = undefined;
+                    var n: usize = 0;
+                    for (c.input.chars[0..c.input.nchars]) |ch| if (ch >= 0x20 and ch != 0x7f) {
+                        buf[n] = ch;
+                        n += 1;
+                    };
+                    if (n > 0) {
+                        st.replace(c.gpa, buf[0..n]) catch {};
+                        changed = true;
+                        st.goal_x = null;
+                    }
+                }
+                c.input.nchars = 0;
+            }
+        }
+        if (changed or moved) {
+            st.blink_from = c.frame_time;
+            c.acted = true;
+            c.areaRows(st, st.text.items, g, o.wrap, st.version);
+            c.areaFollow(st, st.text.items, g);
+        }
+        // Sideways, without wrapping.
+        if (!o.wrap and in.hot and c.input.wheel_x != 0) {
+            st.scroll = std.math.clamp(st.scroll + c.input.wheel_x, 0, @max(0, st.rows_width - g.inner_w));
+        }
+        var caret = false;
+        if (in.focused) {
+            const since = c.frame_time -| st.blink_from;
+            caret = (since / blink_ns) % 2 == 0;
+            c.wakeAt(st.blink_from + (since / blink_ns + 1) * blink_ns);
+        }
+        const n = &c.nodes.items[i];
+        n.flags = .{ .hot = in.hot, .focused = in.focused, .disabled = o.disabled, .caret = caret, .wrap = o.wrap, .numbers = o.line_numbers, .code = o.code and !o.read_only };
+        return changed;
+    }
+
+    const tab_width = 4;
+
+    /// dedentTo is where Backspace in code goes back to: a tab stop, over
+    /// the spaces that indent the line, else a character.
+    fn dedentTo(c: *const Context, st: *const TextInput) u32 {
+        _ = c;
+        const ln = st.lineAt(st.caret);
+        const col = st.caret - ln[0];
+        if (col == 0) return st.prev(st.caret);
+        for (st.text.items[ln[0]..st.caret]) |ch| if (ch != ' ') return st.prev(st.caret);
+        return st.caret - ((col - 1) % tab_width + 1);
+    }
+
+    /// normalizeLines makes \r\n and \r newlines, and tabs four spaces'
+    /// worth of one (a space: the text is edited in place), in s.
+    fn normalizeLines(s: []u8) []u8 {
+        var n: usize = 0;
+        var k: usize = 0;
+        while (k < s.len) : (k += 1) {
+            var ch = s[k];
+            if (ch == '\r') {
+                ch = '\n';
+                if (k + 1 < s.len and s[k + 1] == '\n') k += 1;
+            } else if (ch == '\t') ch = ' ';
+            s[n] = ch;
+            n += 1;
+        }
+        return s[0..n];
+    }
+
+    /// AreaGeom is where a text area's text goes, from the rect it was
+    /// last drawn in.
+    const AreaGeom = struct {
+        x: f32,
+        top: f32,
+        inner_w: f32,
+        view_h: f32,
+        line_h: f32,
+        gutter: f32,
+    };
+
+    fn areaGeom(c: *Context, n: *const Node, r: Rect, numbers: bool) AreaGeom {
+        const st = n.input.?;
+        const px = n.box.padding_x orelse 0;
+        const py = n.box.padding_y orelse 0;
+        const m = c.fonts.metrics(.regular, n.size);
+        var gutter: f32 = 0;
+        if (numbers) {
+            const lines_: u32 = if (st.rows.items.len > 0) st.rows.items[st.rows.items.len - 1].line + 1 else 1;
+            var digits: u32 = 2;
+            var k = lines_;
+            while (k >= 100) : (k /= 10) digits += 1;
+            gutter = c.fonts.measure(.regular, n.size, "0") * @as(f32, @floatFromInt(digits)) + 16;
+        }
+        return .{
+            .x = r.x + px + gutter,
+            .top = r.y + py,
+            .inner_w = @max(0, r.w - 2 * px - gutter - 6),
+            .view_h = @max(0, r.h - 2 * py),
+            .line_h = m.line_height,
+            .gutter = gutter,
+        };
+    }
+
+    /// areaRows breaks s (st's text, or it with what an input method
+    /// composes; key says which) into st.rows, unless they are.
+    fn areaRows(c: *Context, st: *TextInput, s: []const u8, g: AreaGeom, wrap_: bool, key: u64) void {
+        const width: ?f32 = if (wrap_ and g.inner_w > 0) g.inner_w else null;
+        const wbits: u64 = if (width) |w| @as(u32, @bitCast(w)) else 0xffff_ffff;
+        const k = std.hash.Wyhash.hash(key, std.mem.asBytes(&wbits));
+        if (k == st.rows_key and st.rows.items.len > 0) return;
+        st.rows_width = textedit.wrap(&st.rows, c.gpa, c.fonts, .regular, c.theme.font_size, s, width) catch return;
+        st.rows_key = k;
+    }
+
+    fn areaOffsetInRow(c: *Context, st: *const TextInput, s: []const u8, rw: textedit.Row, x: f32) u32 {
+        _ = st;
+        var at: u32 = rw.start + @as(u32, @intCast(c.fonts.indexAt(.regular, c.theme.font_size, s[rw.start..rw.end], x)));
+        // The end of a row that wrapped shows at the next row's start.
+        if (rw.soft and at == rw.end and at > rw.start) {
+            at -= 1;
+            while (at > rw.start and s[at] & 0xc0 == 0x80) at -= 1;
+        }
+        return at;
+    }
+
+    fn areaOffsetAt(c: *Context, st: *const TextInput, s: []const u8, g: AreaGeom, x: f32, y: f32) u32 {
+        const rows = st.rows.items;
+        if (rows.len == 0) return 0;
+        const fr = @floor((y - g.top + st.view.offset) / g.line_h);
+        const r: usize = if (fr < 0) 0 else @min(rows.len - 1, @as(usize, @intFromFloat(fr)));
+        if (fr < 0) return 0;
+        if (fr >= @as(f32, @floatFromInt(rows.len))) return @intCast(s.len);
+        return c.areaOffsetInRow(st, s, rows[r], x - g.x + st.scroll);
+    }
+
+    /// areaFollow scrolls st's text area so that its caret shows.
+    fn areaFollow(c: *Context, st: *TextInput, s: []const u8, g: AreaGeom) void {
+        const rows = st.rows.items;
+        if (rows.len == 0 or g.view_h <= 0) return;
+        const r = textedit.rowOf(rows, st.caret);
+        const y0 = @as(f32, @floatFromInt(r)) * g.line_h;
+        if (y0 < st.view.offset) st.view.offset = y0;
+        if (y0 + g.line_h > st.view.offset + g.view_h) st.view.offset = y0 + g.line_h - g.view_h;
+        st.view.viewport = g.view_h;
+        st.view.content = @as(f32, @floatFromInt(rows.len)) * g.line_h;
+        st.view.offset = std.math.clamp(st.view.offset, 0, st.view.maxOffset());
+        const cx = c.fonts.prefixWidth(.regular, c.theme.font_size, s[rows[r].start..rows[r].end], st.caret - rows[r].start);
+        if (cx - st.scroll > g.inner_w) st.scroll = cx - g.inner_w;
+        if (cx - st.scroll < 0) st.scroll = cx;
+        st.scroll = std.math.clamp(st.scroll, 0, @max(0, st.rows_width - g.inner_w + 2));
     }
 
     /// composed is st's text with the input method's text at its caret, in
@@ -1471,6 +1918,8 @@ pub const Context = struct {
     fn moveFocus(c: *Context) void {
         for (c.input.keys[0..c.input.nkeys]) |*k| {
             if (k.used or k.key != .tab) continue;
+            // A code editor takes Tab; Ctrl+Tab still moves on.
+            if (c.input.tab_taken and !k.mods.ctrl) continue;
             k.used = true;
             var items = c.hits.items;
             // A modal dialog keeps the focus.
@@ -1542,8 +1991,12 @@ pub const Context = struct {
         // The focus is lost with its control.
         if (c.input.focus != 0 and c.lastRect(c.input.focus) == null) c.input.focus = 0;
         c.input.text_focus = false;
-        if (c.input.focus != 0) for (c.nodes.items) |n| if (n.id == c.input.focus and n.kind == .input) {
+        c.input.area_focus = false;
+        c.input.tab_taken = false;
+        if (c.input.focus != 0) for (c.nodes.items) |n| if (n.id == c.input.focus and (n.kind == .input or n.kind == .area)) {
             c.input.text_focus = true;
+            c.input.area_focus = n.kind == .area;
+            c.input.tab_taken = n.kind == .area and n.flags.code and !n.flags.disabled;
         };
         // The pointer may be over another control now.
         const h = c.hitTest(c.input.x, c.input.y);
@@ -1665,6 +2118,10 @@ pub const Context = struct {
             .input => {
                 w = 240;
                 h = c.fonts.metrics(.regular, n.size).line_height + 2 * c.theme.space(2);
+            },
+            .area => {
+                w = 320;
+                h = c.fonts.metrics(.regular, n.size).line_height * n.value + 2 * (n.box.padding_y orelse 0);
             },
             .image => {}, // its box has its size
             .divider => {
@@ -1876,7 +2333,7 @@ pub const Context = struct {
 
     /// flexes reports whether a row's child takes a share of its free width.
     fn flexes(cn: *const Node) bool {
-        return cn.box.grow > 0 or cn.box.fill or (cn.kind == .text and cn.flags.wrap) or (cn.kind == .input and cn.box.grow > 0);
+        return cn.box.grow > 0 or cn.box.fill or (cn.kind == .text and cn.flags.wrap) or ((cn.kind == .input or cn.kind == .area) and cn.box.grow > 0);
     }
 
     fn childGrow(cn: *const Node) f32 {
@@ -1889,7 +2346,7 @@ pub const Context = struct {
     fn addHit(c: *Context, n: *const Node, focusable: bool) void {
         const r = intersect(n.rect, c.paint_clip);
         if (r.w <= 0 or r.h <= 0) return;
-        const cursor: Cursor = if (n.flags.disabled) .arrow else if (n.kind == .input) .text else .arrow;
+        const cursor: Cursor = if (n.flags.disabled) .arrow else if (n.kind == .input or n.kind == .area) .text else .arrow;
         c.next_hits.append(c.gpa, .{ .id = n.id, .rect = r, .focusable = focusable and !n.flags.disabled, .cursor = cursor }) catch {};
     }
 
@@ -2011,6 +2468,7 @@ pub const Context = struct {
             .divider => s.rect(r, n.color, 0, 0, .transparent),
             .image => c.paintImage(n, s),
             .input => c.paintInput(n, s),
+            .area => c.paintArea(n, s),
             .select => {
                 c.focusRing(s, n, r, n.box.radius);
                 const fade: f32 = if (n.flags.disabled) 0.5 else 1;
@@ -2123,6 +2581,100 @@ pub const Context = struct {
             },
         }
         s.image(dst, img, src, n.box.radius, @intFromFloat(@round(n.value * 255)));
+    }
+
+    fn paintArea(c: *Context, n: *const Node, s: *Scene) void {
+        const t = c.theme;
+        const r = n.rect;
+        const st = n.input.?;
+        const fade: f32 = if (n.flags.disabled) 0.5 else 1;
+        c.focusRing(s, n, r, n.box.radius);
+        const ring = if (n.flags.focused) t.accent else if (n.flags.hot) t.border_strong else t.border;
+        s.rect(r, t.background.withAlpha(fade), n.box.radius, if (n.flags.focused) 1.5 else 1, ring.withAlpha(fade));
+        c.addHit(n, true);
+        st.rect = r;
+        const composing = n.flags.focused and c.input.preedit_len > 0;
+        const shown = if (composing) c.composed(st) else st.text.items;
+        // The rows, at this width: what composes changes them while it shows.
+        var g = c.areaGeom(n, r, n.flags.numbers);
+        const key: u64 = if (composing) std.hash.Wyhash.hash(st.version, shown) else st.version;
+        c.areaRows(st, shown, g, n.flags.wrap, key);
+        g = c.areaGeom(n, r, n.flags.numbers); // as many digits as lines
+        const rows = st.rows.items;
+        st.view.viewport = g.view_h;
+        st.view.content = @as(f32, @floatFromInt(rows.len)) * g.line_h;
+        st.view.offset = std.math.clamp(st.view.offset, 0, st.view.maxOffset());
+        const hr = intersect(r, c.paint_clip);
+        if (hr.w > 0 and hr.h > 0) c.next_hits.append(c.gpa, .{ .id = n.id ^ area_salt, .rect = hr, .list = &st.view }) catch {};
+        const m = c.fonts.metrics(.regular, n.size);
+        const px = n.box.padding_x orelse 0;
+        const clip = Rect{ .x = r.x + 1, .y = r.y + 1, .w = @max(0, r.w - 2), .h = @max(0, r.h - 2) };
+        s.pushClip(clip);
+        defer s.popClip();
+        const caret_at: u32 = if (composing) st.caret + c.input.preedit_caret else st.caret;
+        const sel = st.selection();
+        const first: usize = @intFromFloat(@max(0, @floor(st.view.offset / g.line_h)));
+        const last: usize = @min(rows.len, @as(usize, @intFromFloat(@ceil((st.view.offset + g.view_h) / g.line_h))) + 1);
+        const x0 = g.x - st.scroll;
+        const text_clip = Rect{ .x = g.x - 1, .y = clip.y, .w = @max(0, r.x + r.w - px - g.x + 2), .h = clip.h };
+        if (shown.len == 0) {
+            const ph = c.strings.items[n.str_off..][0..n.str_len];
+            s.textRun(c.fonts, g.x, g.top + m.ascent, ph, n.size, .regular, t.text_muted.withAlpha(fade));
+        }
+        var k = first;
+        while (k < last) : (k += 1) {
+            const rw = rows[k];
+            const y = g.top + @as(f32, @floatFromInt(k)) * g.line_h - st.view.offset;
+            const baseline = y + m.ascent;
+            const row_s = shown[rw.start..rw.end];
+            if (n.flags.numbers and (k == 0 or rows[k - 1].line != rw.line)) {
+                var buf: [12]u8 = undefined;
+                const num = std.fmt.bufPrint(&buf, "{d}", .{rw.line + 1}) catch "";
+                const cur = textedit.rowOf(rows, caret_at);
+                const color = if (n.flags.focused and rows[cur].line == rw.line) t.text_muted.withAlpha(fade) else t.text_muted.withAlpha(0.6 * fade);
+                const nw = c.fonts.measure(.regular, n.size, num);
+                s.textRun(c.fonts, g.x - 10 - nw, baseline, num, n.size, .regular, color);
+            }
+            s.pushClip(text_clip);
+            if (composing) {
+                // What the input method composes, underlined.
+                const a = @max(st.caret, rw.start);
+                const b = @min(st.caret + c.input.preedit_len, rw.end);
+                if (a < b) {
+                    const ux0 = c.fonts.prefixWidth(.regular, n.size, row_s, a - rw.start);
+                    const ux1 = c.fonts.prefixWidth(.regular, n.size, row_s, b - rw.start);
+                    s.rect(.{ .x = x0 + ux0, .y = baseline + 2, .w = ux1 - ux0, .h = 1 }, t.text, 0, 0, .transparent);
+                }
+            } else if (n.flags.focused and sel[0] != sel[1] and sel[0] <= rw.end and sel[1] >= rw.start) {
+                const a = @max(sel[0], rw.start);
+                const b = @min(sel[1], rw.end);
+                const sx0 = c.fonts.prefixWidth(.regular, n.size, row_s, a - rw.start);
+                var sx1 = c.fonts.prefixWidth(.regular, n.size, row_s, b - rw.start);
+                // A selected newline shows as a space's width.
+                if (sel[1] > rw.end and !rw.soft) sx1 += c.fonts.measure(.regular, n.size, " ");
+                if (sx1 > sx0) s.rect(.{ .x = x0 + sx0, .y = y, .w = sx1 - sx0, .h = g.line_h }, t.selection, 0, 0, .transparent);
+            }
+            if (row_s.len > 0) s.textRun(c.fonts, x0, baseline, row_s, n.size, .regular, t.text.withAlpha(fade));
+            s.popClip();
+        }
+        if (rows.len > 0) {
+            const cr = textedit.rowOf(rows, caret_at);
+            const rw = rows[cr];
+            const cx = x0 + c.fonts.prefixWidth(.regular, n.size, shown[rw.start..rw.end], caret_at - rw.start);
+            const cy = g.top + @as(f32, @floatFromInt(cr)) * g.line_h - st.view.offset;
+            if (n.flags.caret or composing) {
+                s.pushClip(text_clip);
+                s.rect(.{ .x = cx - 0.5, .y = cy + (g.line_h - m.ascent - m.descent) / 2, .w = 1.5, .h = m.ascent + m.descent }, t.text, 0, 0, .transparent);
+                s.popClip();
+            }
+            if (n.flags.focused) c.ime_rect = .{ .x = std.math.clamp(cx, g.x, g.x + g.inner_w), .y = std.math.clamp(cy, r.y, r.y + r.h - g.line_h), .w = 1, .h = g.line_h };
+        }
+        if (st.view.content > st.view.viewport and st.view.viewport > 0) {
+            const th = @max(24, r.h * st.view.viewport / st.view.content);
+            const ty = r.y + (r.h - th) * (st.view.offset / st.view.maxOffset());
+            s.rect(.{ .x = r.x + r.w - 8, .y = ty + 2, .w = 5, .h = th - 4 }, t.scrollbar, 2.5, 0, .transparent);
+        }
+        c.texts.append(c.gpa, .{ .off = n.str_off, .len = n.str_len, .rect = r, .id = n.id }) catch {};
     }
 
     fn paintInput(c: *Context, n: *const Node, s: *Scene) void {

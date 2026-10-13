@@ -131,6 +131,11 @@ pub fn Headless(comptime State: type) type {
             h.press(x, y, .left, 1);
         }
 
+        /// clickAtN is the clicks'th click of a quick series at x, y.
+        pub fn clickAtN(h: *Self, x: f32, y: f32, clicks: u8) void {
+            h.press(x, y, .left, clicks);
+        }
+
         /// drag presses at (x0, y0), moves to (x1, y1) in steps, and lets go.
         pub fn drag(h: *Self, x0: f32, y0: f32, x1: f32, y1: f32) void {
             if (h.ctx.pointerMove(x0, y0)) h.frame();

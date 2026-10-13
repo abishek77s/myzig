@@ -49,6 +49,7 @@ zig build counter                        # MyGo's counter-native
 zig build quotes                         # a table of prices streaming every frame
 zig build list                           # 10,000 rows (AUTOSCROLL=1 scrolls them)
 zig build events                         # the input a window gets, as it comes
+zig build editor -- notes.txt            # a text editor: line numbers, undo, Ctrl+S
 zig build test                           # the views, clicked and typed at without a window
 zig build bench -Doptimize=ReleaseFast   # what a frame costs, headless
 ```
@@ -107,7 +108,17 @@ progress bars, selects with a popup list, context menus, tooltips, modal
 dialogs, virtualized lists, scroll views, dividers and spacers; text that
 wraps; a light and a dark theme. Every control takes the keyboard focus,
 which Tab and Shift+Tab move, and Space and Enter press. A double click in
-a text input selects a word, a triple click all of it.
+a text input selects a word, a triple click all of it. Ctrl+Z undoes and
+Ctrl+Shift+Z (or Ctrl+Y) redoes, by words.
+
+**Text editing.** `c.textArea(&doc, .{ .line_numbers = true, .code = true })`
+edits text over many lines: it wraps at spaces (or scrolls sideways),
+scrolls with the wheel and follows the caret, keeps the caret's column
+going up and down, pages, selects with the pointer across lines (a triple
+click takes a line), and undoes and redoes. With `.code`, Tab and Shift+Tab
+indent, Backspace goes back a tab stop, and Enter keeps the indentation.
+Only the rows in view are drawn, so long files stay cheap. An input
+method composes in it as in a text input.
 
 **Images.** `myzig.Image.decode` (or `load`, for a file) takes PNG, JPEG,
 GIF and BMP; `c.image(img, .{ .width = 64, .fit = .cover, .radius = 12 })`
@@ -128,7 +139,7 @@ DPI and Retina scale, typed text through the platform's input method, the
 clipboard (X11's large transfers too), cursor shapes, and frames paced by
 the display. On the Mac,
 shortcuts are the Mac's: ⌘C, ⌘V, ⌘A, ⌥ to move by words, ⌘← and ⌘→ to the
-line's ends, ⌘W and ⌘Q.
+line's ends, ⌘↑ and ⌘↓ to the text's, ⌘W and ⌘Q.
 
 ## How it works
 
@@ -208,7 +219,7 @@ gpui-fast has no window numbers and MyZig's windows draw on the CPU.
 ## Status
 
 MyZig is young. Not there yet: native Wayland, SVG, rich text and
-multi-line text editing, drag and drop, and accessibility. MyGo's webview side (web pages in the system
+syntax highlighting, drag and drop, and accessibility. MyGo's webview side (web pages in the system
 webview with typed IPC) is not ported.
 
 ## License

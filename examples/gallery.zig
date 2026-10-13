@@ -542,3 +542,25 @@ test "the logo decodes and is drawn where its box is" {
     };
     try testing.expect(found);
 }
+
+test "text input: undo and redo" {
+    var fonts = try myzig.text.Fonts.init(testing.allocator);
+    defer fonts.deinit();
+    var s = Gallery{ .gpa = testing.allocator };
+    defer s.deinit();
+    var h = try harness(&s, &fonts);
+    defer h.deinit();
+
+    try h.click("Your name");
+    h.typeText("Ada ");
+    h.typeText("L");
+    h.typeText("ovelace");
+    h.keyMods(.backspace, .{ .ctrl = true });
+    try testing.expectEqualStrings("Ada ", s.name.value());
+    h.keyMods(.z, .{ .ctrl = true });
+    try testing.expectEqualStrings("Ada Lovelace", s.name.value());
+    h.keyMods(.z, .{ .ctrl = true });
+    try testing.expectEqualStrings("Ada ", s.name.value());
+    h.keyMods(.z, .{ .ctrl = true, .shift = true });
+    try testing.expectEqualStrings("Ada Lovelace", s.name.value());
+}
