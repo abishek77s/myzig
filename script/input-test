@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Drives the events example in a real X11 window with xdotool and xclip,
+# and checks what it saw: every mouse button, the wheel both ways, double
+# clicks, typed UTF-8 text, and the clipboard both ways, large pastes (INCR)
+# included. Needs DISPLAY, xdotool and xclip. The command that runs the
+# example is the arguments (`wine zig-out/bin/events.exe` for Windows'),
+# zig-out/bin/events without.
+set -euo pipefail
+[ $# -gt 0 ] || set -- zig-out/bin/events
+log=$(mktemp)
+big=$(mktemp)
+export LANG=C.UTF-8
+# Pieces of 64 KB: a 6 MB copy goes in many.
+MYZIG_CLIPBOARD_CHUNK=65536 "$@" >"$log" 2>/dev/null &
+pid=$!
+trap 'kill $pid 2>/dev/null || true; rm -f "$log" "$big"' EXIT
+for _ in $(seq 150); do
+  wid=$(xdotool search --name '^Events$' 2>/dev/null | head -1 || true)
+  [ -n "$wid" ] && break
+  sleep 0.1
+done
+[ -n "$wid" ] || { echo "no window"; exit 1; }
+sleep 0.5
+step() { "$@"; sleep 0.3; }
+expect() {
+  grep -qF -- "$1" "$log" || { echo "missing: $1"; echo "--- log:"; cut -c1-100 "$log"; exit 1; }
+}
+
+step xdotool mousemove --window "$wid" 200 300 click 3
+expect "right 200,300"
+step xdotool key Escape
+step xdotool mousemove --window "$wid" 200 300 click 2
+expect "middle 200,300"
+step xdotool click 5
+expect "scroll y 48.0"
+step xdotool click 4
+expect "scroll y -48.0"
+step xdotool click 7
+expect "scroll x 48.0"
+step xdotool keydown shift click 4 keyup shift
+expect "scroll x -48.0"
+step xdotool click 8
+expect "back"
+step xdotool click 9
+expect "forward"
+step xdotool mousemove --window "$wid" 50 73 click --repeat 2 --delay 60 1
+expect "click 2"
+
+# Text, then the clipboard out and in.
+step xdotool mousemove --window "$wid" 100 118 click 1
+step xdotool type "héllo wörld"
+expect "text 13 bytes: héllo wörld"
+step xdotool key ctrl+a ctrl+c
+[ "$(xclip -selection clipboard -o)" = "héllo wörld" ] || { echo "copy out failed"; exit 1; }
+head -c 4500000 /dev/zero | tr '\0' 'z' >"$big"
+xclip -selection clipboard -i "$big"
+sleep 0.3
+step xdotool key ctrl+a ctrl+v
+sleep 1
+expect "text 4500000 bytes: zzzz"
+# Copied back out, in pieces.
+step xdotool key ctrl+a ctrl+c
+n=$(xclip -selection clipboard -o | wc -c)
+[ "$n" = 4500000 ] || { echo "large copy out: $n bytes"; exit 1; }
+echo "input: ok"

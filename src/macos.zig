@@ -92,6 +92,8 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
         stats: app.Stats = .{},
         timer: std.time.Timer,
         cursor: ui.Cursor = .arrow,
+        /// ctrl_click is set while a Control-click (a right click) is held.
+        ctrl_click: bool = false,
 
         fn run(state: S, opts: app.WindowOptions) !void {
             const gpa = std.heap.c_allocator;
@@ -386,6 +388,12 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             .{ .name = "mouseDragged:", .imp = &mouseMoved, .types = "v@:@" },
             .{ .name = "mouseMoved:", .imp = &mouseMoved, .types = "v@:@" },
             .{ .name = "mouseExited:", .imp = &mouseExited, .types = "v@:@" },
+            .{ .name = "rightMouseDown:", .imp = &rightMouseDown, .types = "v@:@" },
+            .{ .name = "rightMouseUp:", .imp = &rightMouseUp, .types = "v@:@" },
+            .{ .name = "rightMouseDragged:", .imp = &mouseMoved, .types = "v@:@" },
+            .{ .name = "otherMouseDown:", .imp = &otherMouseDown, .types = "v@:@" },
+            .{ .name = "otherMouseUp:", .imp = &otherMouseUp, .types = "v@:@" },
+            .{ .name = "otherMouseDragged:", .imp = &mouseMoved, .types = "v@:@" },
             .{ .name = "scrollWheel:", .imp = &scrollWheel, .types = "v@:@" },
             .{ .name = "keyDown:", .imp = &keyDown, .types = "v@:@" },
             .{ .name = "flagsChanged:", .imp = &flagsChanged, .types = "v@:@" },
@@ -401,8 +409,8 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             .{ .name = "doCommandBySelector:", .imp = &doCommand, .types = "v@::" },
             .{ .name = "setMarkedText:selectedRange:replacementRange:", .imp = &setMarkedText, .types = "v@:@{_NSRange=QQ}{_NSRange=QQ}" },
             .{ .name = "unmarkText", .imp = &unmarkText, .types = "v@:" },
-            .{ .name = "hasMarkedText", .imp = &no, .types = "c@:" },
-            .{ .name = "markedRange", .imp = &emptyRange, .types = "{_NSRange=QQ}@:" },
+            .{ .name = "hasMarkedText", .imp = &hasMarkedText, .types = "c@:" },
+            .{ .name = "markedRange", .imp = &markedRange, .types = "{_NSRange=QQ}@:" },
             .{ .name = "selectedRange", .imp = &emptyRange, .types = "{_NSRange=QQ}@:" },
             .{ .name = "validAttributesForMarkedText", .imp = &noAttributes, .types = "@@:" },
             .{ .name = "attributedSubstringForProposedRange:actualRange:", .imp = &noSubstring, .types = "@@:{_NSRange=QQ}^{_NSRange=QQ}" },
@@ -421,13 +429,45 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
         }
 
         fn mouseDown(_: Id, _: Sel, ev: Id) callconv(.c) void {
-            g.ctx.setMods(modsOf(msg(UInt, ev, "modifierFlags", .{})));
+            const flags = msg(UInt, ev, "modifierFlags", .{});
+            g.ctx.setMods(modsOf(flags));
+            // Control-click is a right click.
+            g.ctrl_click = flags & flag_control != 0;
+            const clicks: u8 = @intCast(std.math.clamp(msg(objc.NSInteger, ev, "clickCount", .{}), 1, 3));
             const p = point(ev);
-            if (g.ctx.pointerDown(p[0], p[1])) g.need_frame = true;
+            if (g.ctx.pointerPress(p[0], p[1], if (g.ctrl_click) .right else .left, clicks)) g.need_frame = true;
         }
         fn mouseUp(_: Id, _: Sel, ev: Id) callconv(.c) void {
             const p = point(ev);
-            if (g.ctx.pointerUp(p[0], p[1])) g.need_frame = true;
+            if (g.ctx.pointerRelease(p[0], p[1], if (g.ctrl_click) .right else .left)) g.need_frame = true;
+            g.ctrl_click = false;
+        }
+        fn rightMouseDown(_: Id, _: Sel, ev: Id) callconv(.c) void {
+            const p = point(ev);
+            if (g.ctx.pointerPress(p[0], p[1], .right, 1)) g.need_frame = true;
+        }
+        fn rightMouseUp(_: Id, _: Sel, ev: Id) callconv(.c) void {
+            const p = point(ev);
+            if (g.ctx.pointerRelease(p[0], p[1], .right)) g.need_frame = true;
+        }
+        /// otherButton is button 2 (the middle), 3 (back) or 4 (forward).
+        fn otherButton(ev: Id) ?ui.MouseButton {
+            return switch (msg(objc.NSInteger, ev, "buttonNumber", .{})) {
+                2 => .middle,
+                3 => .back,
+                4 => .forward,
+                else => null,
+            };
+        }
+        fn otherMouseDown(_: Id, _: Sel, ev: Id) callconv(.c) void {
+            const b = otherButton(ev) orelse return;
+            const p = point(ev);
+            if (g.ctx.pointerPress(p[0], p[1], b, 1)) g.need_frame = true;
+        }
+        fn otherMouseUp(_: Id, _: Sel, ev: Id) callconv(.c) void {
+            const b = otherButton(ev) orelse return;
+            const p = point(ev);
+            if (g.ctx.pointerRelease(p[0], p[1], b)) g.need_frame = true;
         }
         fn mouseMoved(_: Id, _: Sel, ev: Id) callconv(.c) void {
             const p = point(ev);
@@ -437,13 +477,14 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             if (g.ctx.pointerMove(-1, -1)) g.need_frame = true;
         }
         fn scrollWheel(_: Id, _: Sel, ev: Id) callconv(.c) void {
+            const dx = msg(f64, ev, "scrollingDeltaX", .{});
             const dy = msg(f64, ev, "scrollingDeltaY", .{});
             // A trackpad's deltas are points; a wheel's are lines.
             const precise = msg(BOOL, ev, "hasPreciseScrollingDeltas", .{}) != 0;
-            const px: f32 = @floatCast(if (precise) -dy else -dy * 20);
-            if (px == 0) return;
+            const k: f64 = if (precise) -1 else -20;
+            if (dx == 0 and dy == 0) return;
             const p = point(ev);
-            if (g.ctx.scroll(p[0], p[1], px)) g.need_frame = true;
+            if (g.ctx.scrollXY(p[0], p[1], @floatCast(dx * k), @floatCast(dy * k))) g.need_frame = true;
         }
         fn keyDown(self: Id, _: Sel, ev: Id) callconv(.c) void {
             const flags = msg(UInt, ev, "modifierFlags", .{});
@@ -453,8 +494,10 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                 key = if (key == .left) .home else .end;
                 mods.ctrl = false;
             }
-            if (g.ctx.keyDownMods(key, mods)) g.need_frame = true;
-            if (flags & (flag_command | flag_control) == 0 and g.ctx.input.text_focus) {
+            // While an input method composes, its keys are its own.
+            const composing = g.ctx.input.preedit_len > 0 and g.ctx.input.text_focus;
+            if (!composing and g.ctx.keyDownMods(key, mods)) g.need_frame = true;
+            if ((composing or flags & (flag_command | flag_control) == 0) and g.ctx.input.text_focus) {
                 const arr = send(objc.class("NSArray"), "arrayWithObject:", .{ev});
                 msg(void, self, "interpretKeyEvents:", .{arr});
             }
@@ -499,13 +542,34 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             var s = str;
             if (msg(BOOL, s, "isKindOfClass:", .{objc.class("NSAttributedString")}) != 0) s = send(s, "string", .{});
             const t = objc.utf8(s);
+            if (g.ctx.setPreedit("", 0)) g.need_frame = true;
             // Keys that are not text (Return, Tab) came through keyDown.
             if (t.len == 0 or t[0] < 0x20 or t[0] == 0x7f) return;
             if (g.ctx.typeText(t)) g.need_frame = true;
         }
         fn doCommand(_: Id, _: Sel, _: Sel) callconv(.c) void {}
-        fn setMarkedText(_: Id, _: Sel, _: Id, _: NSRange, _: NSRange) callconv(.c) void {}
-        fn unmarkText(_: Id, _: Sel) callconv(.c) void {}
+        /// setMarkedText is what an input method composes, selected its
+        /// caret (in UTF-16 units of it).
+        fn setMarkedText(_: Id, _: Sel, str: Id, selected: NSRange, _: NSRange) callconv(.c) void {
+            var s = str;
+            if (msg(BOOL, s, "isKindOfClass:", .{objc.class("NSAttributedString")}) != 0) s = send(s, "string", .{});
+            const units = msg(UInt, s, "length", .{});
+            const at = @min(selected.location, units);
+            const caret = objc.utf8(send(s, "substringToIndex:", .{at})).len;
+            if (g.ctx.setPreedit(objc.utf8(s), caret)) g.need_frame = true;
+        }
+        fn unmarkText(_: Id, _: Sel) callconv(.c) void {
+            if (g.ctx.setPreedit("", 0)) g.need_frame = true;
+        }
+        fn hasMarkedText(_: Id, _: Sel) callconv(.c) BOOL {
+            return if (g.ctx.input.preedit_len > 0) objc.YES else objc.NO;
+        }
+        fn markedRange(_: Id, _: Sel) callconv(.c) NSRange {
+            const n = g.ctx.input.preedit_len;
+            if (n == 0) return .{ .location = objc.NSNotFound, .length = 0 };
+            const s = objc.string(g.ctx.input.preedit[0..n]);
+            return .{ .location = 0, .length = msg(UInt, s, "length", .{}) };
+        }
         fn emptyRange(_: Id, _: Sel) callconv(.c) NSRange {
             return .{ .location = objc.NSNotFound, .length = 0 };
         }
@@ -519,9 +583,15 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             return objc.NSNotFound;
         }
         fn firstRect(_: Id, _: Sel, _: NSRange, _: ?*NSRange) callconv(.c) NSRect {
-            // The input method's window goes by the window's corner.
-            const f = msg(NSRect, g.window, "frame", .{});
-            return .{ .origin = f.origin, .size = .{ .width = 0, .height = 0 } };
+            // The input method's window goes by the caret, in screen
+            // coordinates (the view is flipped; the screen is not).
+            const r = g.ctx.ime_rect orelse {
+                const f = msg(NSRect, g.window, "frame", .{});
+                return .{ .origin = f.origin, .size = .{ .width = 0, .height = 0 } };
+            };
+            const in_view = NSRect{ .origin = .{ .x = r.x, .y = r.y }, .size = .{ .width = r.w, .height = r.h } };
+            const in_window = msg(NSRect, g.view, "convertRect:toView:", .{ in_view, @as(Id, null) });
+            return msg(NSRect, g.window, "convertRectToScreen:", .{in_window});
         }
 
         fn clipGet(_: *anyopaque, gpa: std.mem.Allocator) ?[]u8 {

@@ -16,9 +16,10 @@ MyZig handles it; the notes say how, or what is still missing.
 | Hidden windows | Unmap/Visibility stop drawing | ✓ UnmapNotify stops drawing until the next Expose |
 | GPU lost | wgpu device recreated | ✓ the window goes on drawing on the CPU |
 | Keyboard | XKB through xkbcommon, layout changes | core keysyms; Ctrl shortcuts on non-Latin layouts may not match |
-| Text input | XIM with pre-edit | XIM, committed text only |
-| Scrolling | XInput 2 smooth deltas, horizontal | wheel notches (buttons 4 and 5) only |
-| Clipboard | CLIPBOARD and PRIMARY, INCR for large data | CLIPBOARD; pastes larger than one property (INCR) come back empty |
+| Text input | XIM with pre-edit | ✓ XIM: what is composed shows in the input (callbacks), or the method draws it at the caret; its candidate window follows the caret |
+| Mouse | every button | ✓ left, right, middle, back and forward; double and triple clicks |
+| Scrolling | XInput 2 smooth deltas, horizontal | ✓ XInput 2.1 smooth deltas both ways (libXi opened at run time); wheel buttons 4 to 7 without it; Shift scrolls sideways |
+| Clipboard | CLIPBOARD and PRIMARY, INCR for large data | ✓ CLIPBOARD, INCR both ways; no PRIMARY (middle-click paste) |
 
 ## Windows
 
@@ -31,8 +32,8 @@ MyZig handles it; the notes say how, or what is still missing.
 | Minimized | `WM_SIZE` with `SIZE_MINIMIZED` skipped | ✓ skipped (the swapchain keeps its size) |
 | Live resize | a timer in the size-move loop keeps frames coming | WM_PAINT draws each step; animations pause while dragging |
 | DPI | per-monitor v2, `WM_DPICHANGED` | ✓ the same |
-| IME | `WM_IME_COMPOSITION`, candidate window placed | committed text through `WM_CHAR`; the candidate window is not placed |
-| Mouse | all buttons, horizontal wheel, click counts | left button and vertical wheel |
+| IME | `WM_IME_COMPOSITION`, candidate window placed | ✓ `WM_IME_COMPOSITION`: what is composed shows in the input; the candidate window follows the caret |
+| Mouse | all buttons, horizontal wheel, click counts | ✓ the same: left, right, middle, X buttons, `WM_MOUSEHWHEEL`, double and triple clicks |
 
 ## macOS
 
@@ -44,9 +45,10 @@ MyZig handles it; the notes say how, or what is still missing.
 | Hidden windows | occlusion stops the display link | ✓ `windowDidChangeOcclusionState` stops drawing |
 | GPU lost | not handled | ✓ the window goes on drawing on the CPU |
 | Key equivalents | `performKeyEquivalent` and `keyDown` both, deduplicated | `keyDown` (⌘ shortcuts that no menu takes reach it) |
-| Text input | full `NSTextInputClient`, marked text, IME-first for composing sources | `insertText` only; marked text is not shown |
-| Scrolling | precise (trackpad) and line deltas | ✓ the same, 20 points a line |
-| Ctrl-click | a right click | not handled (no right button yet) |
+| Text input | full `NSTextInputClient`, marked text, IME-first for composing sources | ✓ marked text shows in the input, keys go to the method while it composes, `firstRectForCharacterRange` gives the caret |
+| Scrolling | precise (trackpad) and line deltas | ✓ the same, both ways, 20 points a line |
+| Mouse | every button, click counts | ✓ left, right, middle, back and forward; AppKit's click count |
+| Ctrl-click | a right click | ✓ a right click |
 | Live resize | `displayLayer` with transactions | the frame is drawn from `windowDidResize` |
 
 ## What CI checks
@@ -55,4 +57,8 @@ MyZig handles it; the notes say how, or what is still missing.
 frame from every renderer the runner has: CPU, OpenGL (llvmpipe) and
 Vulkan (lavapipe) on Linux; the CPU on Windows; Metal, the CPU and Vulkan
 (MoltenVK) on macOS. The Vulkan and Metal tests compare their pixels with
-the CPU renderer's.
+the CPU renderer's. On Linux, `script/input-test` drives the `events`
+example in a real window with xdotool and xclip: every mouse button, the
+wheel both ways, a double click, typed UTF-8, and the clipboard both ways
+with a 4.5 MB paste that goes in pieces. The same script passes against the
+Windows build under Wine (`script/input-test wine zig-out/bin/events.exe`).

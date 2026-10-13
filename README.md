@@ -48,6 +48,7 @@ zig build gallery                        # every control, with a dark theme
 zig build counter                        # MyGo's counter-native
 zig build quotes                         # a table of prices streaming every frame
 zig build list                           # 10,000 rows (AUTOSCROLL=1 scrolls them)
+zig build events                         # the input a window gets, as it comes
 zig build test                           # the views, clicked and typed at without a window
 zig build bench -Doptimize=ReleaseFast   # what a frame costs, headless
 ```
@@ -102,15 +103,24 @@ Metal's against the CPU's.
 
 **Controls.** Buttons, text inputs (selection, word moves, the clipboard,
 passwords, a blinking caret), checkboxes, radio buttons, toggles, sliders,
-progress bars, selects with a popup list, tooltips, modal dialogs,
-virtualized lists, scroll views, dividers and spacers; text that wraps; a
-light and a dark theme. Every control takes the keyboard focus, which Tab
-and Shift+Tab move, and Space and Enter press.
+progress bars, selects with a popup list, context menus, tooltips, modal
+dialogs, virtualized lists, scroll views, dividers and spacers; text that
+wraps; a light and a dark theme. Every control takes the keyboard focus,
+which Tab and Shift+Tab move, and Space and Enter press. A double click in
+a text input selects a word, a triple click all of it.
+
+**Input.** Every mouse button: `c.pressedWith(.right)` gives where a row
+or column was right-clicked (to open a `Menu` there), the middle button
+too, and `c.navigation()` the side buttons. The wheel and the trackpad
+scroll by their exact deltas, both ways. An input method's text shows in
+the text input, underlined, while it composes, and its candidate window
+follows the caret.
 
 **Platforms.** Linux on X11 (Wayland through XWayland), Windows 10 and
 later, and macOS 13 and later (Apple silicon and Intel), with per-monitor
 DPI and Retina scale, typed text through the platform's input method, the
-clipboard, cursor shapes, and frames paced by the display. On the Mac,
+clipboard (X11's large transfers too), cursor shapes, and frames paced by
+the display. On the Mac,
 shortcuts are the Mac's: ⌘C, ⌘V, ⌘A, ⌥ to move by words, ⌘← and ⌘→ to the
 line's ends, ⌘W and ⌘Q.
 
@@ -153,7 +163,9 @@ show.
 out like Zed's: `zig fmt`, then on Linux, Windows and macOS the tests (with
 the Vulkan test on lavapipe and the Metal test on the Mac runner's GPU),
 the headless frame benchmark, and the gallery's first frame from each
-renderer in a real window, uploaded as screenshots; cross-compiles to
+renderer in a real window, uploaded as screenshots; on Linux, mouse,
+keyboard and clipboard input sent to a real window by xdotool
+(`script/input-test`); cross-compiles to
 every target from Linux; and one `tests_pass` job for branch protection.
 `.github/workflows/release.yml` builds a tarball for Linux, zips for
 Windows (x86_64, ARM64) and signed `.app` bundles for macOS (Apple
@@ -190,8 +202,7 @@ gpui-fast has no window numbers and MyZig's windows draw on the CPU.
 ## Status
 
 MyZig is young. Not there yet: native Wayland, images, rich text and
-multi-line text editing, input method composition (pre-edit), drag and
-drop, and accessibility. MyGo's webview side (web pages in the system
+multi-line text editing, drag and drop, and accessibility. MyGo's webview side (web pages in the system
 webview with typed IPC) is not ported.
 
 ## License

@@ -77,13 +77,34 @@ pub fn Headless(comptime State: type) type {
         }
 
         pub fn click(h: *Self, label: []const u8) !void {
+            return h.clickN(label, 1);
+        }
+
+        /// clickN is the clicks'th click of a quick series on label: 2 for
+        /// a double click.
+        pub fn clickN(h: *Self, label: []const u8, clicks: u8) !void {
             const r = h.ctx.find(label) orelse return error.NotFound;
-            const cx = r.x + r.w / 2;
-            const cy = r.y + r.h / 2;
-            if (h.ctx.pointerMove(cx, cy)) h.frame();
-            _ = h.ctx.pointerDown(cx, cy);
+            h.press(r.x + r.w / 2, r.y + r.h / 2, .left, clicks);
+        }
+
+        /// rightClick presses and releases the right button on label.
+        pub fn rightClick(h: *Self, label: []const u8) !void {
+            const r = h.ctx.find(label) orelse return error.NotFound;
+            h.press(r.x + r.w / 2, r.y + r.h / 2, .right, 1);
+        }
+
+        fn press(h: *Self, x: f32, y: f32, button: ui.MouseButton, clicks: u8) void {
+            if (h.ctx.pointerMove(x, y)) h.frame();
+            _ = h.ctx.pointerPress(x, y, button, clicks);
             h.frame();
-            _ = h.ctx.pointerUp(cx, cy);
+            _ = h.ctx.pointerRelease(x, y, button);
+            h.frame();
+        }
+
+        /// compose shows s as an input method's text being composed, its
+        /// caret at its end; "" ends it.
+        pub fn compose(h: *Self, s: []const u8) void {
+            _ = h.ctx.setPreedit(s, s.len);
             h.frame();
         }
 
@@ -107,17 +128,13 @@ pub fn Headless(comptime State: type) type {
 
         /// clickAt clicks at x, y (logical pixels).
         pub fn clickAt(h: *Self, x: f32, y: f32) void {
-            if (h.ctx.pointerMove(x, y)) h.frame();
-            _ = h.ctx.pointerDown(x, y);
-            h.frame();
-            _ = h.ctx.pointerUp(x, y);
-            h.frame();
+            h.press(x, y, .left, 1);
         }
 
         /// drag presses at (x0, y0), moves to (x1, y1) in steps, and lets go.
         pub fn drag(h: *Self, x0: f32, y0: f32, x1: f32, y1: f32) void {
             if (h.ctx.pointerMove(x0, y0)) h.frame();
-            _ = h.ctx.pointerDown(x0, y0);
+            _ = h.ctx.pointerPress(x0, y0, .left, 1);
             h.frame();
             const steps = 4;
             for (1..steps + 1) |i| {
@@ -135,6 +152,12 @@ pub fn Headless(comptime State: type) type {
 
         pub fn scroll(h: *Self, x: f32, y: f32, dy: f32) void {
             if (h.ctx.scroll(x, y, dy)) h.frame();
+        }
+
+        /// navigate presses the mouse's back or forward button.
+        pub fn navigate(h: *Self, nav: ui.Nav) void {
+            _ = h.ctx.pointerPress(0, 0, if (nav == .back) .back else .forward, 1);
+            h.frame();
         }
 
         pub fn hasText(h: *const Self, s: []const u8) bool {

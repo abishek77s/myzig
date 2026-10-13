@@ -26,6 +26,7 @@ pub const Gallery = struct {
     saves: u32 = 0,
     region: usize = 0,
     confirm_clear: bool = false,
+    log_menu: ui.Menu = .{},
 
     pub fn deinit(s: *Gallery) void {
         s.name.deinit(s.gpa);
@@ -132,8 +133,23 @@ pub fn view(s: *Gallery, c: *ui.Context) void {
         c.text("Activity", .{ .size = 16, .bold = true });
         c.scrollView(&s.log_scroll, .{ .gap = 6, .padding = 10, .background = t.surface, .radius = t.radius, .key = "log" });
         defer c.end();
+        // A right click opens the log's menu.
+        if (c.pressedWith(.right)) |at| s.log_menu.openAt(at);
         if (s.log.items.len == 0) c.text("Nothing yet", .{ .color = t.text_muted });
         for (s.log.items) |l| c.text(l, .{});
+    }
+    if (c.beginMenu(&s.log_menu)) {
+        defer c.endMenu();
+        if (c.menuItem("Save", .{ .shortcut = "Ctrl+S" })) {
+            s.saves += 1;
+            s.note("Saved ({d})", .{s.saves});
+        }
+        c.menuSeparator();
+        if (c.menuItem("Clear log…", .{ .disabled = s.log.items.len == 0 })) s.confirm_clear = true;
+    }
+    if (c.shortcutMods(.s, .{ .ctrl = true })) {
+        s.saves += 1;
+        s.note("Saved ({d})", .{s.saves});
     }
 }
 
@@ -386,4 +402,116 @@ test "one option of an open select is highlighted, where the pointer is" {
     };
     try testing.expectEqual(@as(usize, 1), hot);
     try testing.expectEqualStrings("South America", which);
+}
+
+test "a right click on the log opens its menu; keys and clicks choose" {
+    var fonts = try myzig.text.Fonts.init(testing.allocator);
+    defer fonts.deinit();
+    var s = Gallery{ .gpa = testing.allocator };
+    defer s.deinit();
+    var h = try harness(&s, &fonts);
+    defer h.deinit();
+    // Not on the controls: the log's menu is the log's.
+    try h.rightClick("Save");
+    try testing.expect(!s.log_menu.open);
+    try h.rightClick("Nothing yet");
+    try testing.expect(s.log_menu.open);
+    try testing.expect(h.hasText("Ctrl+S"));
+    // The menu's Save, over the button's.
+    var item: ?ui.Rect = null;
+    for (h.ctx.texts.items) |tx| if (std.mem.eql(u8, h.ctx.strings.items[tx.off..][0..tx.len], "Save")) {
+        item = tx.rect;
+    };
+    h.clickAt(item.?.x + 4, item.?.y + item.?.h / 2);
+    try testing.expectEqual(@as(u32, 1), s.saves);
+    try testing.expect(!h.hasText("Ctrl+S"));
+    // The keyboard: down twice skips nothing (the disabled item is still
+    // an item), Enter chooses.
+    try h.rightClick("Saved (1)");
+    h.key(.down);
+    h.key(.down);
+    h.key(.enter);
+    try testing.expect(s.confirm_clear);
+    try testing.expect(!s.log_menu.open);
+    h.key(.escape);
+    // Escape and a click outside close it.
+    try h.rightClick("Saved (1)");
+    h.key(.escape);
+    try testing.expect(!s.log_menu.open);
+    try h.rightClick("Saved (1)");
+    try h.click("Components");
+    try testing.expect(!s.log_menu.open);
+    try testing.expectEqual(@as(u32, 1), s.saves);
+}
+
+test "text input: a double click selects a word, a triple all" {
+    var fonts = try myzig.text.Fonts.init(testing.allocator);
+    defer fonts.deinit();
+    var s = Gallery{ .gpa = testing.allocator };
+    defer s.deinit();
+    var h = try harness(&s, &fonts);
+    defer h.deinit();
+    try h.click("Your name");
+    h.typeText("Ada Lovelace");
+    const r = h.rectOf("Your name").?;
+    // On "Ada".
+    const x = r.x + 16;
+    const y = r.y + r.h / 2;
+    for (1..3) |n| {
+        if (h.ctx.pointerMove(x, y)) h.frame();
+        _ = h.ctx.pointerPress(x, y, .left, @intCast(n));
+        h.frame();
+        _ = h.ctx.pointerRelease(x, y, .left);
+        h.frame();
+    }
+    try testing.expectEqual([2]u32{ 0, 3 }, s.name.selection());
+    _ = h.ctx.pointerPress(x, y, .left, 3);
+    h.frame();
+    _ = h.ctx.pointerRelease(x, y, .left);
+    h.frame();
+    try testing.expectEqual([2]u32{ 0, 12 }, s.name.selection());
+}
+
+test "text input: an input method's text shows at the caret until committed" {
+    var fonts = try myzig.text.Fonts.init(testing.allocator);
+    defer fonts.deinit();
+    var s = Gallery{ .gpa = testing.allocator };
+    defer s.deinit();
+    var h = try harness(&s, &fonts);
+    defer h.deinit();
+    try h.click("Your name");
+    h.typeText("A");
+    h.compose("にほ");
+    try testing.expectEqualStrings("A", s.name.value());
+    var shown = false;
+    for (h.scene.ops.items) |op| if (op.kind == .text and std.mem.eql(u8, h.scene.string(&op), "Aにほ")) {
+        shown = true;
+    };
+    try testing.expect(shown);
+    // The candidate window goes by the caret, after the composed text.
+    const ime = h.ctx.ime_rect.?;
+    try testing.expect(ime.x > h.rectOf("Your name").?.x + 20);
+    h.compose("");
+    h.typeText("日本");
+    try testing.expectEqualStrings("A日本", s.name.value());
+}
+
+test "the mouse's side buttons reach the view" {
+    var fonts = try myzig.text.Fonts.init(testing.allocator);
+    defer fonts.deinit();
+    const Nav = struct {
+        back: u32 = 0,
+        fn view(st: *@This(), c: *ui.Context) void {
+            if (c.navigation()) |n| if (n == .back) {
+                st.back += 1;
+            };
+            c.textf("{d}", .{st.back}, .{});
+        }
+    };
+    var st = Nav{};
+    var h = try myzig.Headless(Nav).init(testing.allocator, &fonts, &st, Nav.view, 200, 100, 1);
+    defer h.deinit();
+    h.navigate(.back);
+    try testing.expectEqual(@as(u32, 1), st.back);
+    try testing.expect(h.hasText("1"));
 }

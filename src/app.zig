@@ -20,6 +20,8 @@ const backend = @import("gpu/backend.zig");
 const glr = backend.glr;
 const vulkan = backend.vulkan;
 const Glx = @import("gpu/glx.zig").Glx;
+const xi = @import("x11/xi.zig");
+const Ime = @import("x11/xim.zig").Ime;
 
 pub const WindowOptions = struct {
     title: [:0]const u8 = "MyZig",
@@ -103,17 +105,12 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     _ = x.XStoreName(dpy, win, opts.title.ptr);
     var wm_delete = x.XInternAtom(dpy, "WM_DELETE_WINDOW", 0);
     _ = x.XSetWMProtocols(dpy, win, @ptrCast(&wm_delete), 1);
-    _ = x.XSelectInput(dpy, win, x.KeyPressMask | x.ButtonPressMask | x.ButtonReleaseMask | x.PointerMotionMask | x.LeaveWindowMask | x.ExposureMask | x.StructureNotifyMask | x.FocusChangeMask);
-    // Text comes through an input method, in UTF-8, where there is one;
-    // it is opened when a text input first takes the focus (it loads the
-    // compose tables, a megabyte an app without text input does without).
-    var im: ?*anyopaque = null;
-    var ic: ?*anyopaque = null;
-    var im_tried = false;
-    defer if (ic) |i| x.XDestroyIC(i);
-    defer if (im) |m| {
-        _ = x.XCloseIM(m);
-    };
+    _ = x.XSelectInput(dpy, win, x.KeyPressMask | x.ButtonPressMask | x.ButtonReleaseMask | x.PointerMotionMask | x.EnterWindowMask | x.LeaveWindowMask | x.ExposureMask | x.StructureNotifyMask | x.FocusChangeMask | x.PropertyChangeMask);
+    // Smooth (and sideways) scrolling, where the server has XI 2.1; the
+    // wheel's buttons otherwise.
+    var smooth = if (env.get("MYZIG_NO_XI2") == null) xi.Smooth.open(dpy, win) else null;
+    defer if (smooth) |*s| s.close();
+    if (env.get("MYZIG_STATS") != null) if (smooth) |s| std.debug.print("myzig: smooth scrolling (XI2, {d} axes)\n", .{s.naxes});
     // Cursors are made when first shown (making one loads the cursor
     // theme); the arrow is the window's default, none of its own.
     var cursors = [_]c_ulong{ 0, 0, 0 };
@@ -129,6 +126,12 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     defer fonts.deinit();
     var ctx = ui.Context.init(gpa, &fonts);
     defer ctx.deinit();
+    // Text comes through an input method, in UTF-8, where there is one;
+    // it is opened when a text input first takes the focus (it loads the
+    // compose tables, a megabyte an app without text input does without).
+    var ime = Ime{ .ctx = &ctx };
+    var im_tried = false;
+    defer ime.close();
     var clip = Clipboard.init(gpa, dpy, win);
     defer clip.deinit();
     ctx.clipboard = clip.interface();
@@ -197,7 +200,12 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
         // Drain the events the server sent.
         while (x.XPending(dpy) > 0) {
             _ = x.XNextEvent(dpy, &ev);
-            if (x.XFilterEvent(&ev, 0) != 0) continue; // the input method's
+            if (x.XFilterEvent(&ev, 0) != 0) {
+                // The input method's; it may have composed.
+                if (ime.changed) need_frame = true;
+                ime.changed = false;
+                continue;
+            }
             const k = scale;
             switch (ev.type) {
                 // Hidden windows draw nothing: a GPU's present could wait
@@ -223,41 +231,70 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                 x.MotionNotify => {
                     if (ctx.pointerMove(@as(f32, @floatFromInt(ev.motion.x)) / k, @as(f32, @floatFromInt(ev.motion.y)) / k)) need_frame = true;
                 },
+                x.EnterNotify => if (smooth) |*s| s.reset(),
                 x.LeaveNotify => {
+                    if (smooth) |*s| s.reset();
                     if (ctx.pointerMove(-1, -1)) need_frame = true;
                 },
                 x.ButtonPress => {
-                    ctx.setMods(modsOf(ev.button.state));
+                    const mods = modsOf(ev.button.state);
+                    ctx.setMods(mods);
                     const px = @as(f32, @floatFromInt(ev.button.x)) / k;
                     const py = @as(f32, @floatFromInt(ev.button.y)) / k;
+                    const notch: f32 = 48;
                     switch (ev.button.detail) {
-                        1 => if (ctx.pointerDown(px, py)) {
-                            need_frame = true;
+                        4, 5, 6, 7 => if (smooth == null) {
+                            // A notch; Shift turns the wheel sideways.
+                            const d: f32 = if (ev.button.detail % 2 == 0) -notch else notch;
+                            const sideways = ev.button.detail >= 6 or mods.shift;
+                            if (ctx.scrollXY(px, py, if (sideways) d else 0, if (sideways) 0 else d)) need_frame = true;
                         },
-                        4 => if (ctx.scroll(px, py, -48)) {
-                            need_frame = true;
+                        else => if (buttonOf(ev.button.detail)) |b| {
+                            if (ctx.pointerPress(px, py, b, 0)) need_frame = true;
                         },
-                        5 => if (ctx.scroll(px, py, 48)) {
-                            need_frame = true;
-                        },
-                        else => {},
                     }
                 },
-                x.ButtonRelease => if (ev.button.detail == 1) {
+                x.ButtonRelease => if (buttonOf(ev.button.detail)) |b| {
                     // A click is reported by the next frame the view builds.
-                    if (ctx.pointerUp(@as(f32, @floatFromInt(ev.button.x)) / k, @as(f32, @floatFromInt(ev.button.y)) / k)) need_frame = true;
+                    if (ctx.pointerRelease(@as(f32, @floatFromInt(ev.button.x)) / k, @as(f32, @floatFromInt(ev.button.y)) / k, b)) need_frame = true;
+                },
+                xi.GenericEvent => if (smooth) |*s| {
+                    const cookie: *xi.GenericEventCookie = @ptrCast(&ev);
+                    if (cookie.extension != s.opcode or xi.XGetEventData(dpy, cookie) == 0) continue;
+                    defer xi.XFreeEventData(dpy, cookie);
+                    if (cookie.evtype == xi.XI_DeviceChanged) {
+                        s.scan(dpy);
+                        continue;
+                    }
+                    if (cookie.evtype != xi.XI_Motion) continue;
+                    const de: *const xi.DeviceEvent = @ptrCast(@alignCast(cookie.data.?));
+                    const px: f32 = @floatCast(de.event_x / k);
+                    const py: f32 = @floatCast(de.event_y / k);
+                    if (ctx.pointerMove(px, py)) need_frame = true;
+                    const d = s.scroll(de);
+                    if (d[0] != 0 or d[1] != 0) {
+                        const shift = de.mods.effective & x.ShiftMask != 0;
+                        var dx: f32 = @floatCast(d[0] * 48);
+                        var dy: f32 = @floatCast(d[1] * 48);
+                        if (shift and dx == 0) {
+                            dx = dy;
+                            dy = 0;
+                        }
+                        if (ctx.scrollXY(px, py, dx, dy)) need_frame = true;
+                    }
                 },
                 x.KeyPress => {
                     const mods = modsOf(ev.key.state);
                     if (ctx.keyDownMods(mapKey(x.XLookupKeysym(&ev.key, 0)), mods)) need_frame = true;
                     if (!mods.ctrl and !mods.alt and !mods.super) {
                         var tb: [64]u8 = undefined;
-                        const n = keyText(ic, &ev.key, &tb);
+                        const n = keyText(ime.ic, &ev.key, &tb);
                         if (n > 0 and ctx.typeText(tb[0..n])) need_frame = true;
                     }
                 },
-                x.FocusIn => if (ic) |i| x.XSetICFocus(i),
-                x.FocusOut => if (ic) |i| x.XUnsetICFocus(i),
+                x.FocusIn => if (ime.ic) |i| x.XSetICFocus(i),
+                x.FocusOut => if (ime.ic) |i| x.XUnsetICFocus(i),
+                x.PropertyNotify => clip.propertyChanged(&ev.property),
                 x.SelectionRequest => clip.answer(&ev.selection_request),
                 x.SelectionClear => clip.owned.clearRetainingCapacity(),
                 x.ClientMessage => {
@@ -326,12 +363,9 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
             if (ctx.animating or ctx.requested) need_frame = true;
             if (ctx.input.text_focus and !im_tried) {
                 im_tried = true;
-                _ = x.setlocale(0, ""); // LC_CTYPE
-                _ = x.XSetLocaleModifiers("");
-                im = x.XOpenIM(dpy, null, null, null);
-                if (im) |m| ic = x.XCreateIC(m, "inputStyle", @as(c_long, x.XIMPreeditNothing | x.XIMStatusNothing), "clientWindow", win, "focusWindow", win, @as(?*anyopaque, null));
-                if (ic) |i| x.XSetICFocus(i);
+                ime.open(dpy, win);
             }
+            if (ctx.ime_rect) |r| ime.follow(r, scale);
             if (ctx.cursor != cursor) {
                 cursor = ctx.cursor;
                 const ci = @intFromEnum(cursor);
@@ -465,6 +499,19 @@ fn freeBuffer(dpy: *x.Display, buf: *Buffer) void {
     buf.* = .{};
 }
 
+/// buttonOf is the pointer button an X button number is; 4 to 7 are the
+/// wheel's.
+fn buttonOf(detail: c_uint) ?ui.MouseButton {
+    return switch (detail) {
+        1 => .left,
+        2 => .middle,
+        3 => .right,
+        8 => .back,
+        9 => .forward,
+        else => null,
+    };
+}
+
 fn modsOf(state: c_uint) ui.Mods {
     return .{ .shift = state & x.ShiftMask != 0, .ctrl = state & x.ControlMask != 0, .alt = state & x.Mod1Mask != 0, .super = state & x.Mod4Mask != 0 };
 }
@@ -537,6 +584,7 @@ pub fn printStats(label: []const u8, s: Stats, elapsed_ns: u64) void {
 
 /// Clipboard is X11's CLIPBOARD selection: copying owns it, and the window
 /// answers the requests of the apps that paste; pasting asks its owner.
+/// Text larger than a request goes in pieces (INCR), both ways.
 const Clipboard = struct {
     gpa: std.mem.Allocator,
     dpy: *x.Display,
@@ -545,10 +593,21 @@ const Clipboard = struct {
     utf8: x.Atom,
     targets: x.Atom,
     text_atom: x.Atom,
+    incr: x.Atom,
     property: x.Atom,
     owned: std.ArrayListUnmanaged(u8) = .empty,
+    /// chunk is the most a property carries at once.
+    chunk: usize,
+    transfers: std.ArrayListUnmanaged(Transfer) = .empty,
+
+    /// Transfer is text going to an app in pieces: the next goes when it
+    /// deletes the last.
+    const Transfer = struct { requestor: x.Window, property: x.Atom, type: x.Atom, data: []u8, sent: usize = 0, done: bool = false };
 
     fn init(gpa: std.mem.Allocator, dpy: *x.Display, win: x.Window) Clipboard {
+        var max = x.XExtendedMaxRequestSize(dpy);
+        if (max == 0) max = x.XMaxRequestSize(dpy);
+        const limit: usize = if (env.get("MYZIG_CLIPBOARD_CHUNK")) |v| std.fmt.parseInt(usize, v, 10) catch 1 << 18 else 1 << 18;
         return .{
             .gpa = gpa,
             .dpy = dpy,
@@ -557,11 +616,15 @@ const Clipboard = struct {
             .utf8 = x.XInternAtom(dpy, "UTF8_STRING", 0),
             .targets = x.XInternAtom(dpy, "TARGETS", 0),
             .text_atom = x.XInternAtom(dpy, "TEXT", 0),
+            .incr = x.XInternAtom(dpy, "INCR", 0),
             .property = x.XInternAtom(dpy, "MYZIG_CLIPBOARD", 0),
+            .chunk = @max(1024, @min(limit, @as(usize, @intCast(max)) * 4 - 1024)),
         };
     }
 
     fn deinit(c: *Clipboard) void {
+        for (c.transfers.items) |t| c.gpa.free(t.data);
+        c.transfers.deinit(c.gpa);
         c.owned.deinit(c.gpa);
     }
 
@@ -581,26 +644,79 @@ const Clipboard = struct {
         const owner = x.XGetSelectionOwner(c.dpy, c.clipboard);
         if (owner == c.win) return gpa.dupe(u8, c.owned.items) catch null;
         if (owner == 0) return null;
+        _ = x.XDeleteProperty(c.dpy, c.win, c.property);
         _ = x.XConvertSelection(c.dpy, c.clipboard, c.utf8, c.property, c.win, 0);
         _ = x.XFlush(c.dpy);
         // The owner answers with SelectionNotify; wait for it, briefly.
         var ev: x.XEvent = undefined;
-        var waited: u32 = 0;
-        while (x.XCheckTypedWindowEvent(c.dpy, c.win, x.SelectionNotify, &ev) == 0) : (waited += 1) {
-            if (waited > 250) return null;
-            std.Thread.sleep(std.time.ns_per_ms);
-        }
+        if (!c.wait(x.SelectionNotify, 0, &ev)) return null;
         if (ev.selection.property == 0) return null;
-        var actual: x.Atom = 0;
-        var format: c_int = 0;
-        var n: c_ulong = 0;
-        var after: c_ulong = 0;
-        var data: ?[*]u8 = null;
-        if (x.XGetWindowProperty(c.dpy, c.win, c.property, 0, 1 << 20, 1, x.AnyPropertyType, &actual, &format, &n, &after, &data) != 0) return null;
-        const p = data orelse return null;
-        defer _ = x.XFree(p);
-        if (format != 8) return null;
-        return gpa.dupe(u8, p[0..n]) catch null;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(gpa);
+        const kind = c.read(gpa, &out) orelse {
+            out.deinit(gpa);
+            return null;
+        };
+        if (kind == c.incr) {
+            // In pieces: deleting the property asks for the next, and an
+            // empty one ends it.
+            out.clearRetainingCapacity();
+            _ = x.XDeleteProperty(c.dpy, c.win, c.property);
+            _ = x.XFlush(c.dpy);
+            while (true) {
+                if (!c.wait(x.PropertyNotify, c.property, &ev)) {
+                    out.deinit(gpa);
+                    return null;
+                }
+                const before = out.items.len;
+                const piece = c.read(gpa, &out) orelse {
+                    out.deinit(gpa);
+                    return null;
+                };
+                // A notice from before the transfer: no property.
+                if (piece == 0) continue;
+                _ = x.XDeleteProperty(c.dpy, c.win, c.property);
+                _ = x.XFlush(c.dpy);
+                if (out.items.len == before) break;
+            }
+        } else _ = x.XDeleteProperty(c.dpy, c.win, c.property);
+        return out.toOwnedSlice(gpa) catch null;
+    }
+
+    /// wait waits for an event of type to the window (a PropertyNotify:
+    /// a new value of prop), for at most a second without one.
+    fn wait(c: *Clipboard, ev_type: c_int, prop: x.Atom, ev: *x.XEvent) bool {
+        var waited: u32 = 0;
+        while (waited < 1000) {
+            if (x.XCheckTypedWindowEvent(c.dpy, c.win, ev_type, ev) != 0) {
+                if (ev_type != x.PropertyNotify) return true;
+                if (ev.property.atom == prop and ev.property.state == x.PropertyNewValue) return true;
+                continue;
+            }
+            std.Thread.sleep(std.time.ns_per_ms);
+            waited += 1;
+        }
+        return false;
+    }
+
+    /// read appends the property's text to out, and returns its type.
+    fn read(c: *Clipboard, gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) ?x.Atom {
+        var offset: c_long = 0;
+        while (true) {
+            var actual: x.Atom = 0;
+            var format: c_int = 0;
+            var n: c_ulong = 0;
+            var after: c_ulong = 0;
+            var data: ?[*]u8 = null;
+            if (x.XGetWindowProperty(c.dpy, c.win, c.property, offset, 1 << 20, 0, x.AnyPropertyType, &actual, &format, &n, &after, &data) != 0) return null;
+            defer if (data) |p| {
+                _ = x.XFree(p);
+            };
+            if (actual == c.incr) return actual;
+            if (format == 8) if (data) |p| out.appendSlice(gpa, p[0..n]) catch return null;
+            if (after == 0) return actual;
+            offset += @intCast(n / 4);
+        }
     }
 
     /// answer gives the text owned to the app that asked for it.
@@ -622,10 +738,46 @@ const Clipboard = struct {
             _ = x.XChangeProperty(c.dpy, req.requestor, prop, x.XA_ATOM, 32, x.PropModeReplace, @ptrCast(&atoms), atoms.len);
             reply.selection.property = prop;
         } else if (req.target == c.utf8 or req.target == x.XA_STRING or req.target == c.text_atom) {
-            _ = x.XChangeProperty(c.dpy, req.requestor, prop, if (req.target == c.text_atom) c.utf8 else req.target, 8, x.PropModeReplace, c.owned.items.ptr, @intCast(c.owned.items.len));
-            reply.selection.property = prop;
+            const kind = if (req.target == c.text_atom) c.utf8 else req.target;
+            if (c.owned.items.len > c.chunk) incr: {
+                const data = c.gpa.dupe(u8, c.owned.items) catch break :incr;
+                c.transfers.append(c.gpa, .{ .requestor = req.requestor, .property = prop, .type = kind, .data = data }) catch {
+                    c.gpa.free(data);
+                    break :incr;
+                };
+                // Its deletes of the property ask for each piece.
+                _ = x.XSelectInput(c.dpy, req.requestor, x.PropertyChangeMask);
+                const size = [_]c_long{@intCast(data.len)};
+                _ = x.XChangeProperty(c.dpy, req.requestor, prop, c.incr, 32, x.PropModeReplace, @ptrCast(&size), 1);
+                reply.selection.property = prop;
+            } else {
+                _ = x.XChangeProperty(c.dpy, req.requestor, prop, kind, 8, x.PropModeReplace, c.owned.items.ptr, @intCast(c.owned.items.len));
+                reply.selection.property = prop;
+            }
         }
         _ = x.XSendEvent(c.dpy, req.requestor, 0, 0, &reply);
         _ = x.XFlush(c.dpy);
+    }
+
+    /// propertyChanged sends the next piece of a transfer whose last the
+    /// app deleted.
+    fn propertyChanged(c: *Clipboard, ev: *const x.PropertyEvent) void {
+        if (ev.state != x.PropertyDelete) return;
+        for (c.transfers.items, 0..) |*t, i| {
+            if (t.requestor != ev.window or t.property != ev.atom) continue;
+            if (t.done) {
+                _ = x.XSelectInput(c.dpy, t.requestor, 0);
+                c.gpa.free(t.data);
+                _ = c.transfers.swapRemove(i);
+                return;
+            }
+            const n = @min(c.chunk, t.data.len - t.sent);
+            _ = x.XChangeProperty(c.dpy, t.requestor, t.property, t.type, 8, x.PropModeReplace, t.data.ptr + t.sent, @intCast(n));
+            t.sent += n;
+            // The last piece is an empty one.
+            if (n == 0) t.done = true;
+            _ = x.XFlush(c.dpy);
+            return;
+        }
     }
 };
