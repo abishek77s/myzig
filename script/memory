@@ -6,6 +6,7 @@
 [ $# -gt 0 ] || set -- ""
 printf '%-8s %-8s %10s %10s  %s\n' app renderer pss private gpu_libs
 for r in "$@"; do
+  line=
   for app in counter quotes list gallery editor; do
     MYZIG_RENDERER=$r zig-out/bin/$app >/dev/null 2>&1 &
     pid=$!
@@ -16,5 +17,7 @@ for r in "$@"; do
     kill $pid
     wait $pid 2>/dev/null
     printf '%-8s %-8s %8sKB %8sKB  %s\n' $app "${r:-default}" "$pss" "$priv" "$libs"
+    line="$line$app ${pss}/${priv} KB [$libs]; "
   done
+  [ -n "$GITHUB_ACTIONS" ] && echo "::notice title=Linux memory, ${r:-default} (PSS/private)::$line"
 done
