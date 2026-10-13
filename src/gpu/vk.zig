@@ -82,6 +82,7 @@ pub const StructureType = enum(i32) {
     swapchain_create_info_khr = 1000001000,
     present_info_khr = 1000001001,
     xlib_surface_create_info_khr = 1000004000,
+    wayland_surface_create_info_khr = 1000006000,
     win32_surface_create_info_khr = 1000009000,
     metal_surface_create_info_ext = 1000217000,
 };
@@ -120,6 +121,14 @@ pub const XlibSurfaceCreateInfoKHR = extern struct {
     flags: Flags = 0,
     dpy: *anyopaque,
     window: c_ulong,
+};
+
+pub const WaylandSurfaceCreateInfoKHR = extern struct {
+    s_type: StructureType = .wayland_surface_create_info_khr,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    display: *anyopaque,
+    surface: *anyopaque,
 };
 
 pub const Win32SurfaceCreateInfoKHR = extern struct {
@@ -744,6 +753,7 @@ pub const InstanceFns = struct {
     GetPhysicalDeviceSurfacePresentModesKHR: ?*const fn (PhysicalDevice, SurfaceKHR, *u32, ?[*]PresentMode) callconv(CC) Result,
     DestroySurfaceKHR: ?*const fn (Instance, SurfaceKHR, ?*const anyopaque) callconv(CC) void,
     CreateXlibSurfaceKHR: ?*const fn (Instance, *const XlibSurfaceCreateInfoKHR, ?*const anyopaque, *SurfaceKHR) callconv(CC) Result,
+    CreateWaylandSurfaceKHR: ?*const fn (Instance, *const WaylandSurfaceCreateInfoKHR, ?*const anyopaque, *SurfaceKHR) callconv(CC) Result,
     CreateWin32SurfaceKHR: ?*const fn (Instance, *const Win32SurfaceCreateInfoKHR, ?*const anyopaque, *SurfaceKHR) callconv(CC) Result,
     CreateMetalSurfaceEXT: ?*const fn (Instance, *const MetalSurfaceCreateInfoEXT, ?*const anyopaque, *SurfaceKHR) callconv(CC) Result,
 };

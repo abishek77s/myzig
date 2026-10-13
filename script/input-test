@@ -4,7 +4,10 @@
 # clicks, typed UTF-8 text, and the clipboard both ways, large pastes (INCR)
 # included. Needs DISPLAY, xdotool and xclip. The command that runs the
 # example is the arguments (`wine zig-out/bin/events.exe` for Windows'),
-# zig-out/bin/events without.
+# zig-out/bin/events without. script/wayland-test runs it in a Wayland
+# compositor: INPUT_WINDOW_ID is then the X11 window input goes to, and
+# CLIPBOARD=wayland copies and pastes with wl-copy and wl-paste. TYPED is
+# the text typed.
 set -euo pipefail
 [ $# -gt 0 ] || set -- zig-out/bin/events
 log=$(mktemp)
@@ -14,8 +17,15 @@ export LANG=C.UTF-8
 MYZIG_CLIPBOARD_CHUNK=65536 "$@" >"$log" 2>/dev/null &
 pid=$!
 trap 'kill $pid 2>/dev/null || true; rm -f "$log" "$big"' EXIT
+if [ "${CLIPBOARD:-}" = wayland ]; then
+  clip_in() { wl-copy <"$1"; }
+  clip_out() { wl-paste --no-newline; }
+else
+  clip_in() { xclip -selection clipboard -i "$1"; }
+  clip_out() { xclip -selection clipboard -o; }
+fi
 for _ in $(seq 150); do
-  wid=$(xdotool search --name '^Events$' 2>/dev/null | head -1 || true)
+  wid=${INPUT_WINDOW_ID:-$(xdotool search --name '^Events$' 2>/dev/null | head -1 || true)}
   [ -n "$wid" ] && break
   sleep 0.1
 done
@@ -48,18 +58,19 @@ expect "click 2"
 
 # Text, then the clipboard out and in.
 step xdotool mousemove --window "$wid" 100 118 click 1
-step xdotool type "héllo wörld"
-expect "text 13 bytes: héllo wörld"
+typed=${TYPED:-héllo wörld}
+step xdotool type "$typed"
+expect "text $(printf %s "$typed" | wc -c) bytes: $typed"
 step xdotool key ctrl+a ctrl+c
-[ "$(xclip -selection clipboard -o)" = "héllo wörld" ] || { echo "copy out failed"; exit 1; }
+[ "$(clip_out)" = "$typed" ] || { echo "copy out failed"; exit 1; }
 head -c 4500000 /dev/zero | tr '\0' 'z' >"$big"
-xclip -selection clipboard -i "$big"
+clip_in "$big"
 sleep 0.3
 step xdotool key ctrl+a ctrl+v
 sleep 1
 expect "text 4500000 bytes: zzzz"
 # Copied back out, in pieces.
 step xdotool key ctrl+a ctrl+c
-n=$(xclip -selection clipboard -o | wc -c)
+n=$(clip_out | wc -c)
 [ "$n" = 4500000 ] || { echo "large copy out: $n bytes"; exit 1; }
 echo "input: ok"

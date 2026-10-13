@@ -39,9 +39,11 @@ pub fn main() !void {
 
 You need [Zig](https://ziglang.org/download/) 0.15.2. Nothing else on
 Windows or macOS (no Xcode, no SDK); on Linux, the X11 development
-libraries (`libx11-dev libxext-dev` on Debian and Ubuntu). GPU drivers and
-macOS's frameworks are opened at run time, so building needs no Vulkan SDK,
-OpenGL headers or Metal toolchain.
+libraries (`libx11-dev libxext-dev` on Debian and Ubuntu). GPU drivers,
+Wayland's libraries and macOS's frameworks are opened at run time, so
+building needs no Vulkan SDK, OpenGL headers, Wayland headers or Metal
+toolchain. In a Wayland session the window is a Wayland one;
+`MYZIG_BACKEND=x11` asks for X11 (through XWayland) instead.
 
 ```sh
 zig build gallery                        # every control, with a dark theme
@@ -133,7 +135,8 @@ scroll by their exact deltas, both ways. An input method's text shows in
 the text input, underlined, while it composes, and its candidate window
 follows the caret.
 
-**Platforms.** Linux on X11 (Wayland through XWayland), Windows 10 and
+**Platforms.** Linux on Wayland (natively, decorating the window itself
+where the compositor does not) and X11, Windows 10 and
 later, and macOS 13 and later (Apple silicon and Intel), with per-monitor
 DPI and Retina scale, typed text through the platform's input method, the
 clipboard (X11's large transfers too), cursor shapes, and frames paced by
@@ -218,7 +221,7 @@ gpui-fast has no window numbers and MyZig's windows draw on the CPU.
 
 ## Status
 
-MyZig is young. Not there yet: native Wayland, SVG, rich text and
+MyZig is young. Not there yet: SVG, rich text and
 syntax highlighting, drag and drop, and accessibility. MyGo's webview side (web pages in the system
 webview with typed IPC) is not ported.
 

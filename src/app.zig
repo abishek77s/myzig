@@ -531,7 +531,7 @@ fn keyText(ic: ?*anyopaque, ev: *x.InputEvent, out: *[64]u8) usize {
     return o;
 }
 
-fn mapKey(sym: c_ulong) ui.Key {
+pub fn mapKey(sym: c_ulong) ui.Key {
     if (sym >= 'a' and sym <= 'z') return ui.Key.letter(@intCast(sym));
     if (sym >= 'A' and sym <= 'Z') return ui.Key.letter(@intCast(sym));
     return switch (sym) {
