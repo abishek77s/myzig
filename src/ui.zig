@@ -232,6 +232,11 @@ pub const TextInput = struct {
     /// submitted is set by Enter, until the next frame.
     submitted: bool = false,
     blink_from: u64 = 0,
+    /// unit is what a drag selects by, from the click that began it:
+    /// characters, words (a double click) or all (a triple); word is the
+    /// word the double click selected.
+    unit: u8 = 1,
+    word: [2]u32 = .{ 0, 0 },
 
     pub fn deinit(t: *TextInput, gpa: std.mem.Allocator) void {
         t.text.deinit(gpa);
@@ -277,6 +282,27 @@ pub const TextInput = struct {
         return j;
     }
 
+    /// wordAt is the word (or run of spaces, or of punctuation) at i, what
+    /// a double click selects.
+    fn wordAt(t: *const TextInput, i: u32) [2]u32 {
+        const s = t.text.items;
+        const n: u32 = @intCast(s.len);
+        if (n == 0) return .{ 0, 0 };
+        const at = if (i >= n) n - 1 else i;
+        const k = class(s[at]);
+        var lo = at;
+        while (lo > 0 and class(s[lo - 1]) == k) lo -= 1;
+        var hi = at;
+        while (hi < n and class(s[hi]) == k) hi += 1;
+        return .{ lo, hi };
+    }
+
+    fn class(b: u8) u2 {
+        if (b == ' ' or b == '\t') return 0;
+        if (std.ascii.isAlphanumeric(b) or b == '_' or b >= 0x80) return 1;
+        return 2;
+    }
+
     /// word boundaries, for Ctrl with the arrow keys and Backspace.
     fn prevWord(t: *const TextInput, i: u32) u32 {
         var j = i;
@@ -305,12 +331,12 @@ pub const Clipboard = struct {
 
 const none: u32 = std.math.maxInt(u32);
 
-const Kind = enum(u8) { box, text, button, list, scroll, checkbox, radio, toggle, slider, progress, input, divider, overlay, select, option };
+const Kind = enum(u8) { box, text, button, list, scroll, checkbox, radio, toggle, slider, progress, input, divider, overlay, select, option, menu_item };
 
 /// Place is where an overlay goes: below its anchor (a popup, flipped
 /// above when it does not fit), at the pointer (a tooltip), or centered (a
 /// modal dialog).
-const Place = enum(u2) { below, pointer, center };
+const Place = enum(u2) { below, pointer, center, at };
 const OverlayMode = enum(u2) { popup, modal, tip };
 
 // Ids derived from a control's, for what it opens.
@@ -329,7 +355,9 @@ const Flags = packed struct(u16) {
     caret: bool = false,
     password: bool = false,
     wrap: bool = false,
-    _: u7 = 0,
+    /// listens is set on a box that asked for presses of other buttons.
+    listens: bool = false,
+    _: u6 = 0,
 };
 
 const Node = struct {
@@ -346,6 +374,9 @@ const Node = struct {
     // text, buttons and labels
     str_off: u32 = 0,
     str_len: u32 = 0,
+    // a menu item's shortcut
+    sub_off: u32 = 0,
+    sub_len: u32 = 0,
     size: f32 = 0,
     weight: textm.Weight = .regular,
     color: Color = .transparent,
@@ -378,10 +409,45 @@ const Hit = struct {
     blocks: bool = false,
     /// modal is set on a modal dialog's: the focus stays above it.
     modal: bool = false,
+    /// passive is set on a box's that listens for other buttons: it does
+    /// not take the pointer from what is in it.
+    passive: bool = false,
 };
 
 /// Cursor is the pointer's shape over what it is over.
 pub const Cursor = enum(u8) { arrow, text, pointer };
+
+/// MouseButton is a pointer button: the platforms report every one, and
+/// back and forward (the side buttons) as navigation.
+pub const MouseButton = enum(u3) { left, right, middle, back, forward };
+
+pub const Point = struct { x: f32 = 0, y: f32 = 0 };
+
+/// Nav is what a mouse's side buttons asked for.
+pub const Nav = enum(u2) { back, forward };
+
+/// Menu is a context menu's state: open it where the pointer was pressed.
+///
+///     if (c.pressedWith(.right)) |at| s.menu.openAt(at);
+///     if (c.beginMenu(&s.menu)) {
+///         defer c.endMenu();
+///         if (c.menuItem("Copy", .{ .shortcut = "Ctrl+C" })) copy(s);
+///     }
+pub const Menu = struct {
+    open: bool = false,
+    at: Point = .{},
+
+    pub fn openAt(m: *Menu, at: Point) void {
+        m.open = true;
+        m.at = at;
+    }
+};
+
+pub const MenuItemOpts = struct {
+    shortcut: []const u8 = "",
+    disabled: bool = false,
+    key: ?[]const u8 = null,
+};
 
 pub const Input = struct {
     x: f32 = -1,
@@ -399,6 +465,26 @@ pub const Input = struct {
     /// text_focus is set while a text input has the focus: it takes the
     /// keys that edit text before shortcuts do.
     text_focus: bool = false,
+    /// clicks counts the presses of the left button in quick succession
+    /// at one place, for the press that set pressed: 2 for a double click.
+    clicks: u8 = 1,
+    last_press_ns: i128 = 0,
+    last_press: Point = .{ .x = -100, .y = -100 },
+    /// aux is the box a button other than the left one went down on, since
+    /// the last frame, and aux_at where.
+    aux: u64 = 0,
+    aux_button: MouseButton = .right,
+    aux_at: Point = .{},
+    nav: ?Nav = null,
+    /// wheel_x is the horizontal scrolling since the last frame, in
+    /// logical pixels, for views that scroll sideways.
+    wheel_x: f32 = 0,
+    /// preedit is the text an input method is composing, UTF-8, and
+    /// preedit_caret where its caret is in it: the focused text input shows
+    /// it at its caret, underlined, until the method commits it as typed text.
+    preedit: [256]u8 = undefined,
+    preedit_len: u16 = 0,
+    preedit_caret: u16 = 0,
     mods: Mods = .{},
     keys: [16]KeyEvent = undefined,
     nkeys: u8 = 0,
@@ -447,6 +533,16 @@ pub const Context = struct {
     /// tip_id is the control the pointer rests on, since tip_since.
     tip_id: u64 = 0,
     tip_since: u64 = 0,
+    /// ime_rect is where the focused text input's caret is, after a frame,
+    /// in logical pixels: the platforms put an input method's candidate
+    /// window by it.
+    ime_rect: ?Rect = null,
+    /// menu is the open menu's id, menu_items how many items it had in the
+    /// last frame, menu_index the next item's.
+    menu: u64 = 0,
+    menu_items: usize = 0,
+    menu_index: usize = 0,
+    menu_state: ?*Menu = null,
 
     const TextSpan = struct { off: u32, len: u32, rect: Rect, id: u64 };
 
@@ -774,8 +870,33 @@ pub const Context = struct {
                 const x = c.input.x - (r.x + pad) + st.scroll;
                 var at: u32 = @intCast(c.fonts.indexAt(.regular, t.font_size, display, x));
                 if (o.password) at = byteOfChar(st.text.items, at / 3);
-                st.caret = at;
-                if (c.input.pressed == id and !c.input.mods.shift) st.anchor = at;
+                const n_: u32 = @intCast(st.text.items.len);
+                if (c.input.pressed == id) {
+                    // A double click selects a word, a triple all of it;
+                    // a drag from there goes by words, or keeps all.
+                    st.unit = if (o.password and c.input.clicks == 2) 3 else c.input.clicks;
+                    if (st.unit == 2) st.word = st.wordAt(at);
+                }
+                switch (st.unit) {
+                    2 => {
+                        const w = st.wordAt(at);
+                        if (at < st.word[0]) {
+                            st.anchor = st.word[1];
+                            st.caret = w[0];
+                        } else {
+                            st.anchor = st.word[0];
+                            st.caret = @max(w[1], st.word[1]);
+                        }
+                    },
+                    3 => {
+                        st.anchor = 0;
+                        st.caret = n_;
+                    },
+                    else => {
+                        st.caret = at;
+                        if (c.input.pressed == id and !c.input.mods.shift) st.anchor = at;
+                    },
+                }
                 if (c.input.pressed == id) c.input.pressed = 0;
                 moved = true;
             }
@@ -862,8 +983,9 @@ pub const Context = struct {
         }
         // Keep the caret in view.
         if (c.lastRect(id)) |r| {
-            const shown = if (o.password) c.dots(st.text.items) else st.text.items;
-            const caret_at = if (o.password) charCount(st.text.items[0..st.caret]) * 3 else st.caret;
+            const composing = in.focused and !o.password and c.input.preedit_len > 0;
+            const shown = if (o.password) c.dots(st.text.items) else if (composing) c.composed(st) else st.text.items;
+            const caret_at = if (o.password) charCount(st.text.items[0..st.caret]) * 3 else if (composing) st.caret + c.input.preedit_caret else st.caret;
             const cx = c.fonts.prefixWidth(.regular, t.font_size, shown, caret_at);
             const inner = @max(0, r.w - 2 * pad - 2);
             if (cx - st.scroll > inner) st.scroll = cx - inner;
@@ -881,6 +1003,18 @@ pub const Context = struct {
         const n = &c.nodes.items[i];
         n.flags = .{ .hot = in.hot, .focused = in.focused, .disabled = o.disabled, .caret = caret, .password = o.password };
         return changed;
+    }
+
+    /// composed is st's text with the input method's text at its caret, in
+    /// the frame's strings.
+    fn composed(c: *Context, st: *const TextInput) []const u8 {
+        const off = c.strings.items.len;
+        const s = st.text.items;
+        const at = @min(st.caret, s.len);
+        c.strings.appendSlice(c.gpa, s[0..at]) catch return s;
+        c.strings.appendSlice(c.gpa, c.input.preedit[0..c.input.preedit_len]) catch return s;
+        c.strings.appendSlice(c.gpa, s[at..]) catch return s;
+        return c.strings.items[off..];
     }
 
     /// dots is a password's text shown: a dot (U+2022, 3 bytes) a
@@ -1157,6 +1291,121 @@ pub const Context = struct {
         c.end();
     }
 
+    // ---- other buttons ----
+
+    /// pressedWith reports where button (right or middle) went down on the
+    /// row or column being built, since the last frame, unless a box in it
+    /// that also asks took it: a right click opens a context menu so.
+    pub fn pressedWith(c: *Context, btn: MouseButton) ?Point {
+        if (c.stack.items.len == 0) return null;
+        const n = &c.nodes.items[c.stack.items[c.stack.items.len - 1]];
+        n.flags.listens = true;
+        if (c.input.aux == 0 or c.input.aux != n.id or c.input.aux_button != btn) return null;
+        c.input.aux = 0;
+        c.acted = true;
+        return c.input.aux_at;
+    }
+
+    /// navigation reports a press of the mouse's back or forward button
+    /// since the last frame.
+    pub fn navigation(c: *Context) ?Nav {
+        const nav = c.input.nav orelse return null;
+        c.input.nav = null;
+        c.acted = true;
+        return nav;
+    }
+
+    /// beginMenu shows m's menu at its point while it is open: it reports
+    /// whether it does, and then the caller adds menuItems and ends it with
+    /// endMenu. The arrows move in it, Enter or a click chooses, and
+    /// Escape or a click outside close it.
+    pub fn beginMenu(c: *Context, m: *Menu) bool {
+        const id = std.hash.Wyhash.hash(0x6d656e75, std.mem.asBytes(&@intFromPtr(m)));
+        if (!m.open) {
+            if (c.menu == id) c.menu = 0;
+            return false;
+        }
+        if (c.menu != id) {
+            // Just opened: nothing is highlighted, and the keys are its.
+            c.menu = id;
+            c.menu_items = 0;
+            c.highlight = std.math.maxInt(usize);
+            c.input.focus = 0;
+        }
+        if (c.input.clicked == id ^ blocker_salt) {
+            c.input.clicked = 0;
+            return c.closeMenu(m);
+        }
+        for (c.input.keys[0..c.input.nkeys]) |*k| {
+            if (k.used) continue;
+            const none_lit = std.math.maxInt(usize);
+            switch (k.key) {
+                .escape => {
+                    k.used = true;
+                    return c.closeMenu(m);
+                },
+                .down => c.highlight = if (c.highlight == none_lit or c.highlight + 1 >= c.menu_items) 0 else c.highlight + 1,
+                .up => c.highlight = if (c.highlight == none_lit or c.highlight == 0) c.menu_items -| 1 else c.highlight - 1,
+                else => continue,
+            }
+            k.used = true;
+            c.acted = true;
+        }
+        c.menu_index = 0;
+        c.menu_state = m;
+        c.beginOverlay(id, .{ .x = m.at.x, .y = m.at.y }, .at, .popup, .{ .padding = 4, .@"align" = .stretch });
+        return true;
+    }
+
+    fn closeMenu(c: *Context, m: *Menu) bool {
+        m.open = false;
+        c.menu = 0;
+        c.acted = true;
+        return false;
+    }
+
+    pub fn endMenu(c: *Context) void {
+        c.menu_items = c.menu_index;
+        c.menu_state = null;
+        c.end();
+    }
+
+    /// menuItem adds an item to the menu being built, with the shortcut
+    /// that does the same shown by it; it reports whether it was chosen,
+    /// which closes the menu.
+    pub fn menuItem(c: *Context, label: []const u8, o: MenuItemOpts) bool {
+        const t = c.theme;
+        const off, const len = c.str(label);
+        const so, const sl = c.str(o.shortcut);
+        const i = c.add(.{ .kind = .menu_item, .str_off = off, .str_len = len, .sub_off = so, .sub_len = sl, .size = t.font_size, .color = t.text }, o.key orelse label);
+        if (i == none) return false;
+        const index = c.menu_index;
+        c.menu_index += 1;
+        const id = c.nodes.items[i].id;
+        var in = c.interactKeys(id, o.disabled, false);
+        if (in.hot and c.input.hot != 0) c.highlight = index;
+        if (!o.disabled and index == c.highlight) for (c.input.keys[0..c.input.nkeys]) |*k| {
+            if (!k.used and (k.key == .enter or k.key == .space)) {
+                k.used = true;
+                in.clicked = true;
+            }
+        };
+        const n = &c.nodes.items[i];
+        n.flags = .{ .hot = index == c.highlight, .disabled = o.disabled };
+        if (n.flags.disabled) n.color = t.text_muted;
+        if (in.clicked) if (c.menu_state) |m| {
+            _ = c.closeMenu(m);
+        };
+        return in.clicked;
+    }
+
+    /// menuSeparator is a line between groups of a menu's items.
+    pub fn menuSeparator(c: *Context) void {
+        c.column(.{ .padding_y = 4 });
+        c.divider();
+        c.end();
+    }
+
     // ---- frames ----
 
     /// build runs view for a frame of width×height, twice when it acted on
@@ -1171,6 +1420,9 @@ pub const Context = struct {
             c.input.nchars = 0;
             c.input.clicked = 0;
             c.input.pressed = 0;
+            c.input.aux = 0;
+            c.input.nav = null;
+            c.input.wheel_x = 0;
             c.acted = false;
             c.beginFrame(width, height, now);
             c.frames -= 1;
@@ -1236,6 +1488,10 @@ pub const Context = struct {
         c.input.nchars = 0;
         c.input.clicked = 0;
         c.input.pressed = 0;
+        c.input.aux = 0;
+        c.input.nav = null;
+        c.input.wheel_x = 0;
+        c.ime_rect = null;
         if (c.nodes.items.len == 0) return;
         _ = c.measure(0, c.width);
         c.arrange(0, .{ .x = 0, .y = 0, .w = c.width, .h = c.height });
@@ -1290,6 +1546,13 @@ pub const Context = struct {
                 x = (c.width - w) / 2;
                 y = (c.height - h) / 2;
             },
+            .at => {
+                // At the point, flipped left or up where it does not fit.
+                x = on.anchor.x;
+                y = on.anchor.y;
+                if (x + w > c.width - margin and on.anchor.x - w >= margin) x = on.anchor.x - w;
+                if (y + h > c.height - margin and on.anchor.y - h >= margin) y = on.anchor.y - h;
+            },
         }
         x = std.math.clamp(x, margin, @max(margin, c.width - w - margin));
         y = std.math.clamp(y, margin, @max(margin, c.height - h - margin));
@@ -1304,6 +1567,7 @@ pub const Context = struct {
     }
 
     const check_size: f32 = 16;
+    const menu_pad: f32 = 10;
     const toggle_w: f32 = 36;
     const toggle_h: f32 = 20;
     const label_gap: f32 = 8;
@@ -1356,6 +1620,11 @@ pub const Context = struct {
             .option => {
                 w = c.labelWidth(n) + 28 + 12;
                 h = c.fonts.metrics(.regular, n.size).line_height + 12;
+            },
+            .menu_item => {
+                w = c.labelWidth(n) + 2 * menu_pad;
+                if (n.sub_len > 0) w += 32 + c.fonts.measure(.regular, n.size, c.strings.items[n.sub_off..][0..n.sub_len]);
+                h = c.fonts.metrics(.regular, n.size).line_height + 10;
             },
             .input => {
                 w = 240;
@@ -1719,6 +1988,18 @@ pub const Context = struct {
                 s.stroke(chev, flip, 1.5, t.text_muted.withAlpha(fade));
                 c.addHit(n, true);
             },
+            .menu_item => {
+                if (n.flags.hot and !n.flags.disabled) s.rect(r, t.surface_hover, 4, 0, .transparent);
+                c.paintLabel(s, n, r.x + menu_pad, r);
+                if (n.sub_len > 0) {
+                    const sub = c.strings.items[n.sub_off..][0..n.sub_len];
+                    const m = c.fonts.metrics(.regular, n.size);
+                    const sw = c.fonts.measure(.regular, n.size, sub);
+                    s.textRun(c.fonts, r.x + r.w - menu_pad - sw, r.y + (r.h - m.line_height) / 2 + m.ascent, sub, n.size, .regular, t.text_muted);
+                    c.texts.append(c.gpa, .{ .off = n.sub_off, .len = n.sub_len, .rect = r, .id = n.id }) catch {};
+                }
+                c.addHit(n, false);
+            },
             .option => {
                 if (n.flags.hot) s.rect(r, t.surface_hover, 4, 0, .transparent);
                 if (n.flags.on) s.stroke(.{ .x = r.x + 9, .y = r.y + r.h / 2 - 4, .w = 10, .h = 8 }, .{ .{ 0, 0.5, 0.36, 0.95 }, .{ 0.36, 0.95, 1, 0.05 } }, 1.75, t.accent);
@@ -1746,6 +2027,10 @@ pub const Context = struct {
             },
             .box, .list, .scroll => {
                 s.rect(r, n.box.background, n.box.radius, n.box.border, n.box.border_color);
+                if (n.flags.listens) {
+                    const hr = intersect(r, c.paint_clip);
+                    if (hr.w > 0 and hr.h > 0) c.next_hits.append(c.gpa, .{ .id = n.id, .rect = hr, .passive = true }) catch {};
+                }
                 const scrolls = n.kind == .list or n.kind == .scroll;
                 const saved = c.paint_clip;
                 if (scrolls) {
@@ -1787,7 +2072,8 @@ pub const Context = struct {
         const m = c.fonts.metrics(.regular, n.size);
         const baseline = r.y + (r.h - m.line_height) / 2 + m.ascent;
         const x0 = inner.x - st.scroll;
-        const shown = if (n.flags.password) c.dots(st.text.items) else st.text.items;
+        const composing = n.flags.focused and !n.flags.password and c.input.preedit_len > 0;
+        const shown = if (n.flags.password) c.dots(st.text.items) else if (composing) c.composed(st) else st.text.items;
         const at = struct {
             fn f(nn: *const Node, ss: *const TextInput, byte: u32) usize {
                 return if (nn.flags.password) charCount(ss.text.items[0..byte]) * 3 else byte;
@@ -1798,17 +2084,24 @@ pub const Context = struct {
             s.textRun(c.fonts, inner.x, baseline, ph, n.size, .regular, t.text_muted.withAlpha(fade));
         } else {
             const sel = st.selection();
-            if (n.flags.focused and sel[0] != sel[1]) {
+            if (composing) {
+                // What the input method composes, underlined.
+                const ux0 = c.fonts.prefixWidth(.regular, n.size, shown, st.caret);
+                const ux1 = c.fonts.prefixWidth(.regular, n.size, shown, st.caret + c.input.preedit_len);
+                s.rect(.{ .x = x0 + ux0, .y = baseline + 2, .w = ux1 - ux0, .h = 1 }, t.text, 0, 0, .transparent);
+            } else if (n.flags.focused and sel[0] != sel[1]) {
                 const sx0 = c.fonts.prefixWidth(.regular, n.size, shown, at(n, st, sel[0]));
                 const sx1 = c.fonts.prefixWidth(.regular, n.size, shown, at(n, st, sel[1]));
                 s.rect(.{ .x = x0 + sx0, .y = baseline - m.ascent, .w = sx1 - sx0, .h = m.line_height }, t.selection, 0, 0, .transparent);
             }
             s.textRun(c.fonts, x0, baseline, shown, n.size, .regular, t.text.withAlpha(fade));
         }
-        if (n.flags.caret) {
-            const cx = c.fonts.prefixWidth(.regular, n.size, shown, at(n, st, st.caret));
+        const caret_byte = if (composing) st.caret + c.input.preedit_caret else at(n, st, st.caret);
+        const cx = c.fonts.prefixWidth(.regular, n.size, shown, caret_byte);
+        if (n.flags.caret or (composing and n.flags.focused)) {
             s.rect(.{ .x = x0 + cx - 0.5, .y = baseline - m.ascent, .w = 1.5, .h = m.ascent + m.descent }, t.text, 0, 0, .transparent);
         }
+        if (n.flags.focused) c.ime_rect = .{ .x = @min(x0 + cx, inner.x + inner.w), .y = baseline - m.ascent, .w = 1, .h = m.line_height };
         c.texts.append(c.gpa, .{ .off = n.str_off, .len = n.str_len, .rect = r, .id = n.id }) catch {};
     }
 
@@ -1819,7 +2112,7 @@ pub const Context = struct {
         while (i > 0) {
             i -= 1;
             const h = c.hits.items[i];
-            if (h.list == null and h.rect.contains(x, y)) return h.id;
+            if (h.list == null and !h.passive and h.rect.contains(x, y)) return h.id;
         }
         return 0;
     }
@@ -1840,7 +2133,43 @@ pub const Context = struct {
         return true;
     }
 
+    /// pointerDown is the left button's press; pointerPress takes any
+    /// button and the platform's click count (0 counts here).
     pub fn pointerDown(c: *Context, x: f32, y: f32) bool {
+        return c.pointerPress(x, y, .left, 0);
+    }
+
+    pub fn pointerPress(c: *Context, x: f32, y: f32, btn: MouseButton, clicks: u8) bool {
+        switch (btn) {
+            .left => {},
+            .back, .forward => {
+                c.input.nav = if (btn == .back) .back else .forward;
+                return true;
+            },
+            .right, .middle => {
+                _ = c.pointerMove(x, y);
+                // The innermost box that listens takes it.
+                var i = c.hits.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const h = c.hits.items[i];
+                    if (!h.rect.contains(x, y)) continue;
+                    if (h.blocks) break;
+                    if (!h.passive) continue;
+                    c.input.aux = h.id;
+                    c.input.aux_button = btn;
+                    c.input.aux_at = .{ .x = x, .y = y };
+                    return true;
+                }
+                return false;
+            },
+        }
+        // Presses close in time and place count as one double (triple) click.
+        const now = std.time.nanoTimestamp();
+        const near = @abs(x - c.input.last_press.x) <= 4 and @abs(y - c.input.last_press.y) <= 4;
+        c.input.clicks = if (clicks > 0) clicks else if (near and now - c.input.last_press_ns < 500 * std.time.ns_per_ms) c.input.clicks % 3 + 1 else 1;
+        c.input.last_press_ns = now;
+        c.input.last_press = .{ .x = x, .y = y };
         _ = c.pointerMove(x, y);
         c.input.active = c.input.hot;
         c.input.pressed = c.input.hot;
@@ -1851,6 +2180,11 @@ pub const Context = struct {
     }
 
     pub fn pointerUp(c: *Context, x: f32, y: f32) bool {
+        return c.pointerRelease(x, y, .left);
+    }
+
+    pub fn pointerRelease(c: *Context, x: f32, y: f32, btn: MouseButton) bool {
+        if (btn != .left) return c.pointerMove(x, y);
         _ = c.pointerMove(x, y);
         const was = c.input.active;
         c.input.active = 0;
@@ -1859,6 +2193,19 @@ pub const Context = struct {
     }
 
     pub fn scroll(c: *Context, x: f32, y: f32, dy: f32) bool {
+        return c.scrollXY(x, y, 0, dy);
+    }
+
+    /// scrollXY scrolls what is under the pointer by dy, and keeps dx for
+    /// views that scroll sideways (wheel_x); both in logical pixels, a
+    /// trackpad's exact deltas or a wheel's notches.
+    pub fn scrollXY(c: *Context, x: f32, y: f32, dx: f32, dy: f32) bool {
+        var moved = false;
+        if (dx != 0) {
+            c.input.wheel_x += dx;
+            moved = true;
+        }
+        if (dy == 0) return moved;
         var i = c.hits.items.len;
         while (i > 0) {
             i -= 1;
@@ -1870,7 +2217,7 @@ pub const Context = struct {
                 if (st.offset != before) return true;
             };
         }
-        return false;
+        return moved;
     }
 
     pub fn keyDown(c: *Context, k: Key) bool {
@@ -1885,6 +2232,19 @@ pub const Context = struct {
         c.input.keys[c.input.nkeys] = .{ .key = k, .mods = mods };
         c.input.nkeys += 1;
         return true;
+    }
+
+    /// setPreedit sets the text an input method is composing, and its caret
+    /// (a byte offset in it); "" when it is done. It reports whether that
+    /// changed what the window shows.
+    pub fn setPreedit(c: *Context, s: []const u8, caret: usize) bool {
+        var n = @min(s.len, c.input.preedit.len);
+        while (n < s.len and n > 0 and s[n] & 0xc0 == 0x80) n -= 1;
+        const same = n == c.input.preedit_len and std.mem.eql(u8, s[0..n], c.input.preedit[0..n]) and @min(caret, n) == c.input.preedit_caret;
+        @memcpy(c.input.preedit[0..n], s[0..n]);
+        c.input.preedit_len = @intCast(n);
+        c.input.preedit_caret = @intCast(@min(caret, n));
+        return !same and c.input.text_focus;
     }
 
     /// setMods records the modifiers held, for the pointer (Shift-click).

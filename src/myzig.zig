@@ -45,4 +45,8 @@ test {
     _ = ui;
     _ = scene;
     _ = text;
+    if (@import("builtin").os.tag == .linux) {
+        _ = @import("x11/xim.zig");
+        _ = @import("x11/xi.zig");
+    }
 }

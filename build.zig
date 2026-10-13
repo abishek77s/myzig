@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
         mod.linkSystemLibrary("gdi32", .{});
         mod.linkSystemLibrary("dwmapi", .{});
         mod.linkSystemLibrary("winmm", .{});
+        mod.linkSystemLibrary("imm32", .{});
     } else if (target.result.os.tag == .macos) {
         // Cocoa, Metal and the Objective-C runtime are opened at run time
         // (src/mac/objc.zig): building for macOS needs no SDK.
@@ -26,7 +27,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const only = b.option([]const u8, "only", "Build only this example (and no benchmark)");
-    const examples = [_][]const u8{ "counter", "quotes", "list", "gallery" };
+    const examples = [_][]const u8{ "counter", "quotes", "list", "gallery", "events" };
     const test_step = b.step("test", "Run the tests");
     inline for (examples) |name| {
         const exe = b.addExecutable(.{

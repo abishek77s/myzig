@@ -100,6 +100,13 @@ extern "kernel32" fn GlobalAlloc(flags: u32, bytes: usize) callconv(WINAPI) HAND
 extern "kernel32" fn GlobalFree(mem: HANDLE) callconv(WINAPI) HANDLE;
 extern "kernel32" fn GlobalLock(mem: HANDLE) callconv(WINAPI) ?*anyopaque;
 extern "kernel32" fn GlobalUnlock(mem: HANDLE) callconv(WINAPI) BOOL;
+const COMPOSITIONFORM = extern struct { dwStyle: u32, ptCurrentPos: POINT, rcArea: RECT };
+const CANDIDATEFORM = extern struct { dwIndex: u32, dwStyle: u32, ptCurrentPos: POINT, rcArea: RECT };
+extern "imm32" fn ImmGetContext(h: HWND) callconv(WINAPI) HANDLE;
+extern "imm32" fn ImmReleaseContext(h: HWND, imc: HANDLE) callconv(WINAPI) BOOL;
+extern "imm32" fn ImmGetCompositionStringW(imc: HANDLE, index: u32, buf: ?*anyopaque, len: u32) callconv(WINAPI) i32;
+extern "imm32" fn ImmSetCompositionWindow(imc: HANDLE, f: *const COMPOSITIONFORM) callconv(WINAPI) BOOL;
+extern "imm32" fn ImmSetCandidateWindow(imc: HANDLE, f: *const CANDIDATEFORM) callconv(WINAPI) BOOL;
 extern "winmm" fn timeBeginPeriod(ms: u32) callconv(WINAPI) u32;
 extern "dwmapi" fn DwmFlush() callconv(WINAPI) i32;
 
@@ -124,6 +131,21 @@ const WM_MOUSEMOVE = 0x0200;
 const WM_LBUTTONDOWN = 0x0201;
 const WM_LBUTTONUP = 0x0202;
 const WM_MOUSEWHEEL = 0x020A;
+const WM_RBUTTONDOWN = 0x0204;
+const WM_RBUTTONUP = 0x0205;
+const WM_MBUTTONDOWN = 0x0207;
+const WM_MBUTTONUP = 0x0208;
+const WM_XBUTTONDOWN = 0x020B;
+const WM_XBUTTONUP = 0x020C;
+const WM_MOUSEHWHEEL = 0x020E;
+const WM_IME_STARTCOMPOSITION = 0x010D;
+const WM_IME_ENDCOMPOSITION = 0x010E;
+const WM_IME_COMPOSITION = 0x010F;
+const GCS_COMPSTR = 0x0008;
+const GCS_CURSORPOS = 0x0080;
+const GCS_RESULTSTR = 0x0800;
+const CFS_POINT = 0x0002;
+const CFS_EXCLUDE = 0x0080;
 const WM_MOUSELEAVE = 0x02A3;
 const WM_DPICHANGED = 0x02E0;
 const WS_OVERLAPPEDWINDOW = 0x00CF0000;
@@ -169,6 +191,9 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
         gpu: ?backend.Gpu = null,
         high_surrogate: u16 = 0,
         cursors: [3]HANDLE = undefined,
+        /// buttons are the pointer buttons held, which capture the pointer.
+        buttons: u8 = 0,
+        ime_at: ui.Rect = .{ .x = -1 },
 
         fn run(state: S, opts: app.WindowOptions) !void {
             const gpa = std.heap.c_allocator;
@@ -369,6 +394,63 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             w.stats.present_ns += w.timer.read() - t2;
             w.stats.pixels += w.rend.stats.pixels - px;
             if (w.ctx.animating or w.ctx.requested) w.need_frame = true;
+            if (w.ctx.ime_rect) |r| w.placeIme(r);
+        }
+
+        /// placeIme puts the input method's windows by the caret, at r.
+        fn placeIme(w: *Self, r: ui.Rect) void {
+            if (r.x == w.ime_at.x and r.y == w.ime_at.y and r.h == w.ime_at.h) return;
+            w.ime_at = r;
+            const imc = ImmGetContext(w.hwnd) orelse return;
+            defer _ = ImmReleaseContext(w.hwnd, imc);
+            const k = w.scale;
+            const x: i32 = @intFromFloat(r.x * k);
+            const y: i32 = @intFromFloat(r.y * k);
+            const b: i32 = @intFromFloat((r.y + r.h) * k);
+            _ = ImmSetCompositionWindow(imc, &.{ .dwStyle = CFS_POINT, .ptCurrentPos = .{ .x = x, .y = y }, .rcArea = .{} });
+            _ = ImmSetCandidateWindow(imc, &.{ .dwIndex = 0, .dwStyle = CFS_EXCLUDE, .ptCurrentPos = .{ .x = x, .y = b }, .rcArea = .{ .left = x, .top = y, .right = x + 1, .bottom = b } });
+        }
+
+        /// imeText is the input method's string index (composed, or
+        /// committed), UTF-8 into out, and where its cursor is in it.
+        fn imeText(w: *Self, index: u32, out: []u8) struct { usize, usize } {
+            const imc = ImmGetContext(w.hwnd) orelse return .{ 0, 0 };
+            defer _ = ImmReleaseContext(w.hwnd, imc);
+            var wide: [256]u16 = undefined;
+            const bytes = ImmGetCompositionStringW(imc, index, &wide, @sizeOf(@TypeOf(wide)));
+            if (bytes <= 0) return .{ 0, 0 };
+            const units: usize = @min(wide.len, @as(usize, @intCast(bytes)) / 2);
+            const cursor: usize = if (index == GCS_COMPSTR) @intCast(@max(0, ImmGetCompositionStringW(imc, GCS_CURSORPOS, null, 0))) else units;
+            var n: usize = 0;
+            var at: usize = 0;
+            var i: usize = 0;
+            while (i < units) {
+                if (i <= cursor) at = n;
+                var cp: u21 = wide[i];
+                i += 1;
+                if (cp >= 0xd800 and cp < 0xdc00 and i < units and wide[i] >= 0xdc00 and wide[i] < 0xe000) {
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (wide[i] - 0xdc00);
+                    i += 1;
+                }
+                n += std.unicode.utf8Encode(cp, out[n..]) catch break;
+            }
+            if (cursor >= units) at = n;
+            return .{ n, at };
+        }
+
+        fn press(w: *Self, hwnd: HWND, lp: LPARAM, b: ui.MouseButton) void {
+            w.ctx.setMods(mods());
+            if (w.buttons == 0) _ = SetCapture(hwnd);
+            w.buttons |= @as(u8, 1) << @intFromEnum(b);
+            const p = w.point(lp);
+            if (w.ctx.pointerPress(p[0], p[1], b, 0)) w.need_frame = true;
+        }
+
+        fn release(w: *Self, lp: LPARAM, b: ui.MouseButton) void {
+            w.buttons &= ~(@as(u8, 1) << @intFromEnum(b));
+            if (w.buttons == 0) _ = ReleaseCapture();
+            const p = w.point(lp);
+            if (w.ctx.pointerRelease(p[0], p[1], b)) w.need_frame = true;
         }
 
         fn blit(w: *Self, dc: HDC, r: geom.IRect) void {
@@ -438,26 +520,57 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                     if (w.ctx.pointerMove(-1, -1)) w.need_frame = true;
                     return 0;
                 },
-                WM_LBUTTONDOWN => {
-                    w.ctx.setMods(mods());
-                    _ = SetCapture(hwnd);
-                    const p = w.point(lp);
-                    if (w.ctx.pointerDown(p[0], p[1])) w.need_frame = true;
+                WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN => {
+                    w.press(hwnd, lp, if (m == WM_LBUTTONDOWN) .left else if (m == WM_RBUTTONDOWN) .right else .middle);
                     return 0;
                 },
-                WM_LBUTTONUP => {
-                    _ = ReleaseCapture();
-                    const p = w.point(lp);
-                    if (w.ctx.pointerUp(p[0], p[1])) w.need_frame = true;
+                WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP => {
+                    w.release(lp, if (m == WM_LBUTTONUP) .left else if (m == WM_RBUTTONUP) .right else .middle);
                     return 0;
                 },
-                WM_MOUSEWHEEL => {
+                WM_XBUTTONDOWN, WM_XBUTTONUP => {
+                    // XBUTTON1 is back, XBUTTON2 forward.
+                    const b: ui.MouseButton = if ((wp >> 16) & 0xffff == 1) .back else .forward;
+                    if (m == WM_XBUTTONDOWN) w.press(hwnd, lp, b) else w.release(lp, b);
+                    return 1;
+                },
+                WM_MOUSEWHEEL, WM_MOUSEHWHEEL => {
+                    // 120 a notch; precise wheels and trackpads send less.
                     const delta: i16 = @bitCast(@as(u16, @truncate(wp >> 16)));
                     var pt = POINT{ .x = @as(i16, @truncate(lp)), .y = @as(i16, @truncate(lp >> 16)) };
                     _ = ScreenToClient(hwnd, &pt);
-                    const dy = -@as(f32, @floatFromInt(delta)) / 120 * 48;
-                    if (w.ctx.scroll(@as(f32, @floatFromInt(pt.x)) / w.scale, @as(f32, @floatFromInt(pt.y)) / w.scale, dy)) w.need_frame = true;
+                    const d = @as(f32, @floatFromInt(delta)) / 120 * 48;
+                    const px = @as(f32, @floatFromInt(pt.x)) / w.scale;
+                    const py = @as(f32, @floatFromInt(pt.y)) / w.scale;
+                    // Shift turns the wheel sideways.
+                    const sideways = m == WM_MOUSEHWHEEL or (wp & 0x0004 != 0);
+                    const moved = if (m == WM_MOUSEHWHEEL) w.ctx.scrollXY(px, py, d, 0) else if (sideways) w.ctx.scrollXY(px, py, -d, 0) else w.ctx.scrollXY(px, py, 0, -d);
+                    if (moved) w.need_frame = true;
                     return 0;
+                },
+                // The input method's text is shown in the text input, not
+                // in a window of its own.
+                WM_IME_STARTCOMPOSITION => {
+                    if (w.ctx.ime_rect) |r| w.placeIme(r);
+                    return 0;
+                },
+                WM_IME_COMPOSITION => {
+                    var buf: [1024]u8 = undefined;
+                    if (lp & GCS_RESULTSTR != 0) {
+                        const n, _ = w.imeText(GCS_RESULTSTR, &buf);
+                        _ = w.ctx.setPreedit("", 0);
+                        _ = w.ctx.typeText(buf[0..n]);
+                        w.need_frame = true;
+                    }
+                    if (lp & GCS_COMPSTR != 0) {
+                        const n, const at = w.imeText(GCS_COMPSTR, &buf);
+                        if (w.ctx.setPreedit(buf[0..n], at)) w.need_frame = true;
+                    }
+                    return 0;
+                },
+                WM_IME_ENDCOMPOSITION => {
+                    if (w.ctx.setPreedit("", 0)) w.need_frame = true;
+                    return DefWindowProcW(hwnd, m, wp, lp);
                 },
                 WM_KEYDOWN => {
                     if (w.ctx.keyDownMods(mapKey(wp), mods())) w.need_frame = true;

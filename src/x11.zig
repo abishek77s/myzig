@@ -45,6 +45,7 @@ pub const XEvent = extern union {
     client: ClientMessageEvent,
     selection_request: SelectionRequestEvent,
     selection: SelectionEvent,
+    property: PropertyEvent,
     pad: [24]c_long,
 };
 
@@ -85,6 +86,7 @@ pub const ExposeEvent = extern struct { type: c_int, serial: c_ulong, send_event
 pub const ClientMessageEvent = extern struct { type: c_int, serial: c_ulong, send_event: c_int, display: ?*Display, window: Window, message_type: Atom, format: c_int, data: [5]c_long };
 
 pub const SelectionRequestEvent = extern struct { type: c_int, serial: c_ulong, send_event: c_int, display: ?*Display, owner: Window, requestor: Window, selection: Atom, target: Atom, property: Atom, time: c_ulong };
+pub const PropertyEvent = extern struct { type: c_int, serial: c_ulong, send_event: c_int, display: ?*Display, window: Window, atom: Atom, time: c_ulong, state: c_int };
 pub const SelectionEvent = extern struct { type: c_int, serial: c_ulong, send_event: c_int, display: ?*Display, requestor: Window, selection: Atom, target: Atom, property: Atom, time: c_ulong };
 
 pub const KeyPress = 2;
@@ -112,7 +114,11 @@ pub const XBufferOverflow = -1;
 pub const ButtonPress = 4;
 pub const ButtonRelease = 5;
 pub const MotionNotify = 6;
+pub const EnterNotify = 7;
 pub const LeaveNotify = 8;
+pub const PropertyNotify = 28;
+pub const PropertyNewValue = 0;
+pub const PropertyDelete = 1;
 pub const Expose = 12;
 pub const GraphicsExpose = 13;
 pub const ConfigureNotify = 22;
@@ -123,7 +129,9 @@ pub const ClientMessage = 33;
 pub const KeyPressMask = 1 << 0;
 pub const ButtonPressMask = 1 << 2;
 pub const ButtonReleaseMask = 1 << 3;
+pub const EnterWindowMask = 1 << 4;
 pub const LeaveWindowMask = 1 << 5;
+pub const PropertyChangeMask = 1 << 22;
 pub const PointerMotionMask = 1 << 6;
 pub const ExposureMask = 1 << 15;
 pub const StructureNotifyMask = 1 << 17;
@@ -179,6 +187,8 @@ pub extern "X11" fn XGetSelectionOwner(d: *Display, selection: Atom) Window;
 pub extern "X11" fn XConvertSelection(d: *Display, selection: Atom, target: Atom, property: Atom, requestor: Window, time: c_ulong) c_int;
 pub extern "X11" fn XChangeProperty(d: *Display, w: Window, property: Atom, type: Atom, format: c_int, mode: c_int, data: [*]const u8, n: c_int) c_int;
 pub extern "X11" fn XGetWindowProperty(d: *Display, w: Window, property: Atom, offset: c_long, length: c_long, delete: c_int, req_type: Atom, actual_type: *Atom, actual_format: *c_int, nitems: *c_ulong, bytes_after: *c_ulong, prop: *?[*]u8) c_int;
+pub extern "X11" fn XMaxRequestSize(d: *Display) c_long;
+pub extern "X11" fn XExtendedMaxRequestSize(d: *Display) c_long;
 pub extern "X11" fn XDeleteProperty(d: *Display, w: Window, property: Atom) c_int;
 pub extern "X11" fn XSendEvent(d: *Display, w: Window, propagate: c_int, mask: c_long, ev: *XEvent) c_int;
 pub extern "X11" fn XCheckTypedWindowEvent(d: *Display, w: Window, type: c_int, ev: *XEvent) c_int;
