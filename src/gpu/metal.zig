@@ -134,6 +134,7 @@ pub const Renderer = struct {
     extent: [2]u32 = .{ 0, 0 },
     /// capture copies each frame into readback, for read().
     capture: bool = false,
+    readable: bool = false,
     readback: Id = null,
     readback_size: usize = 0,
     last: Id = null,
@@ -193,9 +194,13 @@ pub const Renderer = struct {
         if (layer) |l| {
             msg(void, l, "setDevice:", .{device});
             msg(void, l, "setPixelFormat:", .{@as(UInt, pixel_bgra8)});
-            msg(void, l, "setFramebufferOnly:", .{objc.NO});
             msg(void, l, "setDisplaySyncEnabled:", .{if (opts.vsync) objc.YES else objc.NO});
             msg(void, l, "setMaximumDrawableCount:", .{@as(UInt, 3)});
+            // Opaque, so the compositor can show it directly; sized with
+            // the view it hosts.
+            msg(void, l, "setOpaque:", .{objc.YES});
+            msg(void, l, "setNeedsDisplayOnBoundsChange:", .{objc.YES});
+            msg(void, l, "setAutoresizingMask:", .{@as(u32, 2 | 16)}); // width and height sizable
         }
         return r;
     }
@@ -294,6 +299,11 @@ pub const Renderer = struct {
             if (r.extent[0] != w or r.extent[1] != h) {
                 msg(void, l, "setDrawableSize:", .{objc.NSSize{ .width = @floatFromInt(w), .height = @floatFromInt(h) }});
                 r.extent = .{ w, h };
+            }
+            // Drawables are only read back when a frame is captured.
+            if (r.capture and !r.readable) {
+                msg(void, l, "setFramebufferOnly:", .{objc.NO});
+                r.readable = true;
             }
             drawable = send(l, "nextDrawable", .{});
             if (drawable == null) return; // the window is hidden

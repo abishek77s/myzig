@@ -117,6 +117,9 @@ const WM_CLOSE = 0x0010;
 const WM_QUIT = 0x0012;
 const WM_ERASEBKGND = 0x0014;
 const WM_KEYDOWN = 0x0100;
+const WM_SYSKEYDOWN = 0x0104;
+const WM_SYSCHAR = 0x0106;
+const WM_GETMINMAXINFO = 0x0024;
 const WM_MOUSEMOVE = 0x0200;
 const WM_LBUTTONDOWN = 0x0201;
 const WM_LBUTTONUP = 0x0202;
@@ -339,7 +342,19 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             const t2 = w.timer.read();
             if (w.gpu) |*r| {
                 if (w.rend.damage.items.len > 0) {
-                    r.draw(&w.sc, &w.fonts, w.width, w.height) catch |e| std.log.err("myzig: {s} frame: {s}", .{ r.api(), @errorName(e) });
+                    r.draw(&w.sc, &w.fonts, w.width, w.height) catch |e| {
+                        // The device was lost (a driver update or reset, a GPU
+                        // removed): the window draws on the CPU from now on.
+                        std.log.err("myzig: {s} frame: {s}; drawing on the CPU", .{ r.api(), @errorName(e) });
+                        w.closeGpu();
+                        w.rend.raster = true;
+                        w.rend.retain_pixels = true;
+                        const cw = w.width;
+                        const ch = w.height;
+                        w.width = 0;
+                        w.resize(cw, ch);
+                        return;
+                    };
                     if (r.* == .gl) w.wgl.?.swap();
                 }
             } else if (GetDC(w.hwnd)) |dc| {
@@ -379,6 +394,8 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                 },
                 WM_ERASEBKGND => return 1,
                 WM_SIZE => {
+                    // Minimized: keep the canvas (and swapchain) as it is.
+                    if (wp == 1) return 0;
                     const cw: i32 = @intCast(lp & 0xffff);
                     const ch: i32 = @intCast((lp >> 16) & 0xffff);
                     if (w.hwnd == hwnd) w.resize(cw, ch);
@@ -444,6 +461,25 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                 },
                 WM_KEYDOWN => {
                     if (w.ctx.keyDownMods(mapKey(wp), mods())) w.need_frame = true;
+                    return 0;
+                },
+                WM_SYSKEYDOWN => {
+                    // Alt with a key, and F10. Windows keeps Alt+F4 and
+                    // Alt+Space; F10 alone would enter the absent menu bar.
+                    if (w.ctx.keyDownMods(mapKey(wp), mods())) w.need_frame = true;
+                    if (wp == 0x79) return 0;
+                    return DefWindowProcW(hwnd, m, wp, lp);
+                },
+                WM_SYSCHAR => {
+                    // Alt+letter would beep for a menu that is not there.
+                    if (wp == ' ') return DefWindowProcW(hwnd, m, wp, lp);
+                    return 0;
+                },
+                WM_GETMINMAXINFO => {
+                    // Small enough for any layout, large enough to stay one.
+                    const info: *[5]POINT = @ptrFromInt(@as(usize, @bitCast(lp)));
+                    const k = w.scale; // set before the window is made
+                    info[3] = .{ .x = @intFromFloat(160 * k), .y = @intFromFloat(120 * k) };
                     return 0;
                 },
                 WM_CHAR => {

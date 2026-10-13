@@ -86,6 +86,9 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
         scale: f32 = 1,
         need_frame: bool = true,
         quit: bool = false,
+        /// visible is cleared while the window is covered or minimized:
+        /// it draws nothing then (a drawable may never come).
+        visible: bool = true,
         stats: app.Stats = .{},
         timer: std.time.Timer,
         cursor: ui.Cursor = .arrow,
@@ -114,7 +117,6 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             defer objc.release(g.window);
             msg(void, g.window, "setReleasedWhenClosed:", .{objc.NO});
             msg(void, g.window, "setTitle:", .{objc.string(opts.title)});
-            msg(void, g.window, "setAcceptsMouseMovedEvents:", .{objc.YES});
             msg(void, g.window, "center", .{});
             g.view = send(send(cls, "alloc", .{}), "initWithFrame:", .{content});
             defer objc.release(g.view);
@@ -267,6 +269,22 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             w.rend.retain_pixels = false;
         }
 
+        /// loseGpu draws on the CPU from now on, after the GPU renderer
+        /// failed (a GPU removed, say).
+        fn loseGpu(w: *Self) void {
+            if (w.gpu) |*r| r.deinit();
+            w.gpu = null;
+            CG.load() catch return;
+            w.layer = send(objc.class("CALayer"), "layer", .{});
+            msg(void, w.layer, "setContentsGravity:", .{objc.constant("kCAGravityTopLeft")});
+            msg(void, w.layer, "setContentsScale:", .{@as(f64, w.scale)});
+            msg(void, w.view, "setLayer:", .{w.layer});
+            w.rend.raster = true;
+            w.rend.retain_pixels = true;
+            w.width = 0;
+            w.resize();
+        }
+
         fn freeCanvas(w: *Self) void {
             if (w.bitmap) |b| CG.context_release(b);
             w.bitmap = null;
@@ -308,7 +326,11 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             _ = w.rend.render(&w.sc, &w.fonts, &cv);
             const t2 = w.timer.read();
             if (w.gpu) |*r| {
-                if (w.rend.damage.items.len > 0) r.draw(&w.sc, &w.fonts, w.width, w.height) catch |e| std.log.err("myzig: {s} frame: {s}", .{ r.api(), @errorName(e) });
+                if (w.rend.damage.items.len > 0 and w.visible) r.draw(&w.sc, &w.fonts, w.width, w.height) catch |e| {
+                    std.log.err("myzig: {s} frame: {s}; drawing on the CPU", .{ r.api(), @errorName(e) });
+                    w.loseGpu();
+                    return;
+                };
             } else if (w.rend.damage.items.len > 0) {
                 // The layer shows a copy of the canvas, swapped in without
                 // the fade Core Animation would give it.
@@ -373,6 +395,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             .{ .name = "windowShouldClose:", .imp = &shouldClose, .types = "c@:@" },
             .{ .name = "windowDidResize:", .imp = &didResize, .types = "v@:@" },
             .{ .name = "windowDidChangeBackingProperties:", .imp = &didChangeBacking, .types = "v@:@" },
+            .{ .name = "windowDidChangeOcclusionState:", .imp = &didChangeOcclusion, .types = "v@:@" },
             // NSTextInputClient: typed text, through the input method.
             .{ .name = "insertText:replacementRange:", .imp = &insertText, .types = "v@:@{_NSRange=QQ}" },
             .{ .name = "doCommandBySelector:", .imp = &doCommand, .types = "v@::" },
@@ -417,7 +440,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             const dy = msg(f64, ev, "scrollingDeltaY", .{});
             // A trackpad's deltas are points; a wheel's are lines.
             const precise = msg(BOOL, ev, "hasPreciseScrollingDeltas", .{}) != 0;
-            const px: f32 = @floatCast(if (precise) -dy else -dy * 40);
+            const px: f32 = @floatCast(if (precise) -dy else -dy * 20);
             if (px == 0) return;
             const p = point(ev);
             if (g.ctx.scroll(p[0], p[1], px)) g.need_frame = true;
@@ -463,6 +486,14 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             msg(void, g.layer, "setContentsScale:", .{@as(f64, g.scale)});
             g.width = 0; // the canvas is made again
             g.resize();
+        }
+        fn didChangeOcclusion(_: Id, _: Sel, _: Id) callconv(.c) void {
+            const visible = msg(UInt, g.window, "occlusionState", .{}) & 2 != 0; // NSWindowOcclusionStateVisible
+            if (visible and !g.visible) {
+                g.rend.invalidate();
+                g.need_frame = true;
+            }
+            g.visible = visible;
         }
         fn insertText(_: Id, _: Sel, str: Id, _: NSRange) callconv(.c) void {
             var s = str;

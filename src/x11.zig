@@ -116,6 +116,8 @@ pub const LeaveNotify = 8;
 pub const Expose = 12;
 pub const GraphicsExpose = 13;
 pub const ConfigureNotify = 22;
+pub const UnmapNotify = 18;
+pub const MapNotify = 19;
 pub const ClientMessage = 33;
 
 pub const KeyPressMask = 1 << 0;
@@ -143,6 +145,17 @@ pub extern "X11" fn XPending(d: *Display) c_int;
 pub extern "X11" fn XNextEvent(d: *Display, ev: *XEvent) c_int;
 pub extern "X11" fn XFlush(d: *Display) c_int;
 pub extern "X11" fn XSync(d: *Display, discard: c_int) c_int;
+pub const XErrorEvent = extern struct {
+    type: c_int,
+    display: ?*Display,
+    resourceid: c_ulong,
+    serial: c_ulong,
+    error_code: u8,
+    request_code: u8,
+    minor_code: u8,
+};
+pub const ErrorHandler = *const fn (*Display, *XErrorEvent) callconv(.c) c_int;
+pub extern "X11" fn XSetErrorHandler(h: ?ErrorHandler) ?ErrorHandler;
 pub extern "X11" fn XConnectionNumber(d: *Display) c_int;
 pub extern "X11" fn XCreateGC(d: *Display, drawable: Window, mask: c_ulong, values: ?*anyopaque) GC;
 pub extern "X11" fn XCreateImage(d: *Display, v: *Visual, depth: c_uint, format: c_int, offset: c_int, data: ?[*]u8, w: c_uint, h: c_uint, pad: c_int, bpl: c_int) ?*XImage;
