@@ -19,5 +19,5 @@ for r in "$@"; do
     printf '%-8s %-8s %8sKB %8sKB  %s\n' $app "${r:-default}" "$pss" "$priv" "$libs"
     line="$line$app ${pss}/${priv} KB [$libs]; "
   done
-  [ -n "$GITHUB_ACTIONS" ] && echo "::notice title=Linux memory, ${r:-default} (PSS/private)::$line"
+  [ -n "$GITHUB_ACTIONS" ] && echo "::notice title=Linux memory ${r:-default} (PSS / private)::$line"
 done

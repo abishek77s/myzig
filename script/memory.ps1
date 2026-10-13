@@ -15,7 +15,7 @@ foreach ($r in $Renderers) {
         Start-Sleep -Seconds 4
         $perf = Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter "IDProcess=$($p.Id)"
         $p.Refresh()
-        $gpu = ($p.Modules | Where-Object { $_.ModuleName -match "vulkan|opengl|nvoglv|ig[0-9a-z]+icd|amdvlk|atig|nvgl" } | ForEach-Object { $_.ModuleName }) -join " "
+        $gpu = ($p.Modules | Where-Object { $_.ModuleName -match "vulkan|opengl|nvoglv|ig[0-9a-z]+icd|amdvlk|atig|nvgl|d3d11|d3d10warp|dxgi|d3dcompiler|nvwgf|amdxx|igd10" } | ForEach-Object { $_.ModuleName }) -join " "
         $rows += [pscustomobject]@{
             app = $app
             renderer = if ($r) { $r } else { "default" }
@@ -32,7 +32,7 @@ $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Output
 # As annotations too, which the checks API returns.
 foreach ($g in ($rows | Group-Object renderer)) {
     $line = ($g.Group | ForEach-Object { "$($_.app) $($_.private_ws_mb)/$($_.commit_mb)/$($_.ws_mb) MB [$($_.gpu_libs)]" }) -join "; "
-    Write-Output "::notice title=Windows memory, $($g.Name) (private WS/commit/WS)::$line"
+    Write-Output "::notice title=Windows memory $($g.Name) (private WS / commit / WS)::$line"
 }
 if ($env:GITHUB_STEP_SUMMARY) {
     "### Windows memory (private working set, as Task Manager shows)" | Out-File -Append $env:GITHUB_STEP_SUMMARY

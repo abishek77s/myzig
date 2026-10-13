@@ -35,7 +35,7 @@ pub const Upload = struct { x: u32, y: u32, w: u32, h: u32, off: u32 };
 /// Atlas places glyphs in a square texture of one byte a texel, on shelves.
 pub const Atlas = struct {
     gpa: std.mem.Allocator,
-    size: u32 = 1024,
+    size: u32 = 512,
     x: u32 = 1,
     y: u32 = 1,
     shelf: u32 = 0,

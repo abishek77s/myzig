@@ -124,7 +124,7 @@ jobs:
       # What each example's window holds, per renderer, as Task Manager
       # counts it.
       shell: pwsh
-      run: script/memory.ps1 -Renderers "",cpu,gl,vulkan
+      run: script/memory.ps1 -Renderers "",cpu,d3d11,gl,vulkan
     - name: steps::upload_screenshots
       if: always()
       uses: actions/upload-artifact@v4
