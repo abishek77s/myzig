@@ -11,6 +11,7 @@
 //! buffers its instances and new glyphs are written to.
 
 const std = @import("std");
+const sys = @import("../sys.zig");
 const builtin = @import("builtin");
 const scene = @import("../scene.zig");
 const text = @import("../text.zig");
@@ -71,7 +72,7 @@ const Target = struct {
 
 pub const Renderer = struct {
     gpa: std.mem.Allocator,
-    lib: std.DynLib,
+    lib: sys.DynLib,
     get_instance_proc: *const fn (?vk.Instance, [*:0]const u8) callconv(vk.CC) ?*const anyopaque,
     i: vk.InstanceFns = undefined,
     d: vk.DeviceFns = undefined,
@@ -206,7 +207,7 @@ pub const Renderer = struct {
         return r.props.device_type == .cpu;
     }
 
-    fn openLoader() !std.DynLib {
+    fn openLoader() !sys.DynLib {
         const names: []const []const u8 = switch (builtin.os.tag) {
             .windows => &.{"vulkan-1.dll"},
             // The loader, else MoltenVK itself; Homebrew's prefixes are
@@ -221,7 +222,7 @@ pub const Renderer = struct {
             },
             else => &.{ "libvulkan.so.1", "libvulkan.so" },
         };
-        for (names) |n| return std.DynLib.open(n) catch continue;
+        for (names) |n| return sys.DynLib.open(n) catch continue;
         return error.NoVulkan;
     }
 
@@ -275,7 +276,7 @@ pub const Renderer = struct {
                 r.i = try vk.load(vk.InstanceFns, r, instanceProc);
                 return;
             }
-            std.log.warn("myzig: no Vulkan validation layer", .{});
+            sys.log(.warn, "myzig: no Vulkan validation layer", .{});
             info.enabled_layer_count = 0;
         }
         var res = base.CreateInstance(&info, null, &r.instance);
@@ -884,7 +885,7 @@ test "offscreen Vulkan draws what the CPU renderer draws" {
     const geom = @import("../geom.zig");
     const raster = @import("../raster.zig");
     var r = Renderer.init(gpa, .offscreen, 320, 120, .{ .validation = env.has("MYZIG_VK_VALIDATION") }) catch |e| {
-        std.debug.print("no Vulkan device ({s}); skipped\n", .{@errorName(e)});
+        sys.print("no Vulkan device ({s}); skipped\n", .{@errorName(e)});
         return error.SkipZigTest;
     };
     defer r.deinit();
@@ -928,16 +929,15 @@ test "offscreen Vulkan draws what the CPU renderer draws" {
         worst = @max(worst, @abs(da - db));
     };
     if (env.get("MYZIG_DUMP")) |path| {
-        var f = try std.fs.cwd().createFile(path, .{});
-        defer f.close();
         var buf: [4096]u8 = undefined;
-        var fw = f.writer(&buf);
+        var fw = try sys.create(path, &buf);
+        defer fw.close();
         try fw.interface.print("P6\n320 240\n255\n", .{});
         for ([_][]const u32{ gpu_px, cpu_px }) |px| for (px) |p| try fw.interface.writeAll(&.{ @truncate(p >> 16), @truncate(p >> 8), @truncate(p) });
         try fw.interface.flush();
     }
     std.testing.expect(worst <= 8) catch |e| {
-        std.debug.print("Vulkan and CPU pixels differ by up to {d}\n", .{worst});
+        sys.print("Vulkan and CPU pixels differ by up to {d}\n", .{worst});
         return e;
     };
     try std.testing.expectEqual(cpu_px[30 * 320 + 70], gpu_px[30 * 320 + 70]);

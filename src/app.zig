@@ -8,6 +8,7 @@
 //! have read them.
 
 const std = @import("std");
+const sys = @import("sys.zig");
 const env = @import("env.zig");
 const x = @import("x11.zig");
 const ui = @import("ui.zig");
@@ -61,7 +62,7 @@ var x_errors: u32 = 0;
 
 fn onXError(_: *x.Display, e: *x.XErrorEvent) callconv(.c) c_int {
     x_errors += 1;
-    if (x_errors <= 8) std.log.warn("myzig: X error {d} (request {d}.{d})", .{ e.error_code, e.request_code, e.minor_code });
+    if (x_errors <= 8) sys.log(.warn, "myzig: X error {d} (request {d}.{d})", .{ e.error_code, e.request_code, e.minor_code });
     return 0;
 }
 
@@ -110,7 +111,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     // wheel's buttons otherwise.
     var smooth = if (env.get("MYZIG_NO_XI2") == null) xi.Smooth.open(dpy, win) else null;
     defer if (smooth) |*s| s.close();
-    if (env.get("MYZIG_STATS") != null) if (smooth) |s| std.debug.print("myzig: smooth scrolling (XI2, {d} axes)\n", .{s.naxes});
+    if (env.get("MYZIG_STATS") != null) if (smooth) |s| sys.print("myzig: smooth scrolling (XI2, {d} axes)\n", .{s.naxes});
     // Cursors are made when first shown (making one loads the cursor
     // theme); the arrow is the window's default, none of its own.
     var cursors = [_]c_ulong{ 0, 0, 0 };
@@ -149,7 +150,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
             .vsync = !uncapped,
             .validation = env.has("MYZIG_VK_VALIDATION"),
         }) catch |e| {
-            if (choice.forced) std.log.warn("myzig: no Vulkan ({s}); drawing on the CPU", .{@errorName(e)});
+            if (choice.forced) sys.log(.warn, "myzig: no Vulkan ({s}); drawing on the CPU", .{@errorName(e)});
             break :vk;
         };
         if (!choice.forced and r.software()) {
@@ -160,7 +161,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     }
     if (gpu == null and glx != null and vi != null) gpu: {
         glx.?.context(dpy, win) catch |e| {
-            std.log.warn("myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(e)});
+            sys.log(.warn, "myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(e)});
             break :gpu;
         };
         const gl = glr.Gl.load(&glx.?, Glx.proc) catch break :gpu;
@@ -172,7 +173,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
         }
         gpu = .{ .gl = r };
     }
-    if (gpu) |*g| if (print_stats) std.debug.print("myzig: drawing with {s} on {s}\n", .{ g.api(), g.name() });
+    if (gpu) |*g| if (print_stats) sys.print("myzig: drawing with {s} on {s}\n", .{ g.api(), g.name() });
     defer if (glx) |*g| g.release(dpy);
     if (gpu != null) rend.raster = false;
     const dump = env.get("MYZIG_DUMP");
@@ -186,7 +187,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
 
     var stats = Stats{};
     var window_stats = Stats{};
-    var timer = try std.time.Timer.start();
+    var timer = try sys.Timer.start();
     var last_print: u64 = 0;
     const period: u64 = 16_666_667;
     var next_frame: u64 = 0;
@@ -334,7 +335,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                     g.draw(&sc, &fonts, w, h) catch |e| {
                         // The device was lost (a driver reset, a GPU
                         // unplugged): the window draws on the CPU from now on.
-                        std.log.err("myzig: {s} frame: {s}; drawing on the CPU", .{ g.api(), @errorName(e) });
+                        sys.log(.err, "myzig: {s} frame: {s}; drawing on the CPU", .{ g.api(), @errorName(e) });
                         g.deinit();
                         gpu = null;
                         if (glx) |*gx| gx.release(dpy);
@@ -397,7 +398,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     }
 }
 
-pub fn buildAndDraw(state: anytype, comptime view: anytype, ctx: *ui.Context, sc: *scene.Scene, rend: *scene.Renderer, fonts: *text.Fonts, buf: *Buffer, scale: f32, timer: *std.time.Timer, stats: *Stats) void {
+pub fn buildAndDraw(state: anytype, comptime view: anytype, ctx: *ui.Context, sc: *scene.Scene, rend: *scene.Renderer, fonts: *text.Fonts, buf: *Buffer, scale: f32, timer: *sys.Timer, stats: *Stats) void {
     const t0 = timer.read();
     const lw = @as(f32, @floatFromInt(buf.width)) / scale;
     const lh = @as(f32, @floatFromInt(buf.height)) / scale;
@@ -415,7 +416,7 @@ pub fn buildAndDraw(state: anytype, comptime view: anytype, ctx: *ui.Context, sc
     stats.pixels += rend.stats.pixels - px_before;
 }
 
-fn presentDamage(dpy: *x.Display, win: x.Window, gc: x.GC, buf: *Buffer, scrolls: []const scene.Scroll, damage: []const geom.IRect, use_shm: bool, stats: *Stats, timer: *std.time.Timer) void {
+fn presentDamage(dpy: *x.Display, win: x.Window, gc: x.GC, buf: *Buffer, scrolls: []const scene.Scroll, damage: []const geom.IRect, use_shm: bool, stats: *Stats, timer: *sys.Timer) void {
     const t0 = timer.read();
     const img = buf.img orelse return;
     // Scrolled layers move on the server: nothing crosses the connection.
@@ -558,10 +559,9 @@ pub fn mapKey(sym: c_ulong) ui.Key {
 /// writePixels writes a canvas of 0x00RRGGBB pixels to path, as a PPM
 /// image: what MYZIG_DUMP=path saves of a window's first frame.
 pub fn writePixels(path: []const u8, pixels: []const u32, w: i32, h: i32, stride: usize) !void {
-    var f = try std.fs.cwd().createFile(path, .{});
-    defer f.close();
     var wbuf: [64 << 10]u8 = undefined;
-    var fw = f.writer(&wbuf);
+    var fw = try sys.create(path, &wbuf);
+    defer fw.close();
     try fw.interface.print("P6\n{d} {d}\n255\n", .{ w, h });
     for (0..@intCast(h)) |y| for (pixels[y * stride ..][0..@intCast(w)]) |p| {
         try fw.interface.writeAll(&.{ @truncate(p >> 16), @truncate(p >> 8), @truncate(p) });
@@ -572,7 +572,7 @@ pub fn writePixels(path: []const u8, pixels: []const u32, w: i32, h: i32, stride
 pub fn printStats(label: []const u8, s: Stats, elapsed_ns: u64) void {
     const secs = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
     const f = @as(f64, @floatFromInt(@max(1, s.frames)));
-    std.debug.print("myzig {s}: fps={d:.1} build={d:.3}ms raster={d:.3}ms present={d:.3}ms px/frame={d:.0}\n", .{
+    sys.print("myzig {s}: fps={d:.1} build={d:.3}ms raster={d:.3}ms present={d:.3}ms px/frame={d:.0}\n", .{
         label,
         @as(f64, @floatFromInt(s.frames)) / secs,
         @as(f64, @floatFromInt(s.build_ns)) / f / 1e6,
@@ -693,7 +693,7 @@ const Clipboard = struct {
                 if (ev.property.atom == prop and ev.property.state == x.PropertyNewValue) return true;
                 continue;
             }
-            std.Thread.sleep(std.time.ns_per_ms);
+            sys.sleep(std.time.ns_per_ms);
             waited += 1;
         }
         return false;

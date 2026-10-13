@@ -3,6 +3,8 @@
 //! compose sequences included.
 
 const std = @import("std");
+const env = @import("../env.zig");
+const sys = @import("../sys.zig");
 
 const Context = opaque {};
 const Keymap = opaque {};
@@ -94,8 +96,8 @@ pub const Keyboard = struct {
 
     /// setKeymap takes the keymap the compositor shares in fd.
     pub fn setKeymap(k: *Keyboard, fd: i32, size: u32) void {
-        defer std.posix.close(fd);
-        const map = std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, fd, 0) catch return;
+        defer sys.close(fd);
+        const map = std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) catch return;
         defer std.posix.munmap(map);
         const text: [*:0]const u8 = @ptrCast(map.ptr);
         const km = k.lib.keymap_new_from_string(k.ctx.?, text, 1, 0) orelse return;
@@ -107,7 +109,7 @@ pub const Keyboard = struct {
         k.keymap = km;
         k.state = st;
         if (k.compose_lib) |cl| if (k.compose == null) {
-            const locale = std.posix.getenv("LC_ALL") orelse std.posix.getenv("LC_CTYPE") orelse std.posix.getenv("LANG") orelse "C";
+            const locale = env.get("LC_ALL") orelse env.get("LC_CTYPE") orelse env.get("LANG") orelse "C";
             var buf: [64]u8 = undefined;
             const z = std.fmt.bufPrintZ(&buf, "{s}", .{locale}) catch "C";
             k.compose_table = cl.compose_table_new_from_locale(k.ctx.?, z, 0);

@@ -3,6 +3,7 @@
 //! benchmarks use it.
 
 const std = @import("std");
+const sys = @import("sys.zig");
 const ui = @import("ui.zig");
 const text = @import("text.zig");
 const scene = @import("scene.zig");
@@ -63,7 +64,7 @@ pub fn Headless(comptime State: type) type {
 
         /// frameAt is frame at the time now (ns), for timers.
         pub fn frameAt(h: *Self, now: u64) void {
-            var timer = std.time.Timer.start() catch unreachable;
+            var timer = sys.Timer.start() catch unreachable;
             h.ctx.build(h.state, h.view, @as(f32, @floatFromInt(h.width)) / h.scale, @as(f32, @floatFromInt(h.height)) / h.scale, now);
             h.scene.reset(h.width, h.height, h.scale, h.ctx.theme.background);
             h.ctx.endFrame(&h.scene);
@@ -171,10 +172,9 @@ pub fn Headless(comptime State: type) type {
 
         /// writePPM saves the last frame, to look at it.
         pub fn writePPM(h: *const Self, path: []const u8) !void {
-            var f = try std.fs.cwd().createFile(path, .{});
-            defer f.close();
             var wbuf: [64 << 10]u8 = undefined;
-            var fw = f.writer(&wbuf);
+            var fw = try sys.create(path, &wbuf);
+            defer fw.close();
             const w = &fw.interface;
             try w.print("P6\n{d} {d}\n255\n", .{ h.width, h.height });
             for (h.pixels) |p| try w.writeAll(&.{ @truncate(p >> 16), @truncate(p >> 8), @truncate(p) });

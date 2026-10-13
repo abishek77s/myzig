@@ -4,6 +4,7 @@
 //! CPU never maps the driver.
 
 const std = @import("std");
+const sys = @import("../sys.zig");
 const scene = @import("../scene.zig");
 const text = @import("../text.zig");
 const inst = @import("instances.zig");
@@ -63,7 +64,7 @@ pub const Gl = struct {
         var g: Gl = undefined;
         inline for (std.meta.fields(Gl)) |f| {
             const p = proc(ctx, "gl" ++ f.name) orelse {
-                std.log.err("myzig: OpenGL has no gl{s}", .{f.name});
+                sys.log(.err, "myzig: OpenGL has no gl{s}", .{f.name});
                 return error.MissingFunction;
             };
             @field(g, f.name) = @ptrCast(@alignCast(p));
@@ -139,7 +140,7 @@ pub const Renderer = struct {
             var log: [1024]u8 = undefined;
             var n: GLsizei = 0;
             gl.GetProgramInfoLog(r.program, log.len, &n, &log);
-            std.log.err("myzig: OpenGL link: {s}", .{log[0..@intCast(n)]});
+            sys.log(.err, "myzig: OpenGL link: {s}", .{log[0..@intCast(n)]});
             return error.ShaderLink;
         }
         gl.UseProgram(r.program);
@@ -203,7 +204,7 @@ pub const Renderer = struct {
             var log: [1024]u8 = undefined;
             var n: GLsizei = 0;
             gl.GetShaderInfoLog(s, log.len, &n, &log);
-            std.log.err("myzig: OpenGL shader: {s}", .{log[0..@intCast(n)]});
+            sys.log(.err, "myzig: OpenGL shader: {s}", .{log[0..@intCast(n)]});
             return error.ShaderCompile;
         }
         return s;

@@ -3,6 +3,7 @@
 //! platform's side (the GLX or WGL context OpenGL presents with).
 
 const std = @import("std");
+const sys = @import("../sys.zig");
 const builtin = @import("builtin");
 const scene = @import("../scene.zig");
 const text = @import("../text.zig");
@@ -86,10 +87,9 @@ pub fn writePPM(gpa: std.mem.Allocator, g: *Gpu, w: i32, h: i32, path: []const u
     const px = try gpa.alloc(u32, @intCast(w * h));
     defer gpa.free(px);
     g.read(w, h, px);
-    var f = try std.fs.cwd().createFile(path, .{});
-    defer f.close();
     var wbuf: [64 << 10]u8 = undefined;
-    var fw = f.writer(&wbuf);
+    var fw = try sys.create(path, &wbuf);
+    defer fw.close();
     try fw.interface.print("P6\n{d} {d}\n255\n", .{ w, h });
     for (px) |p| try fw.interface.writeAll(&.{ @truncate(p >> 16), @truncate(p >> 8), @truncate(p) });
     try fw.interface.flush();

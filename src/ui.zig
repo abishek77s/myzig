@@ -18,6 +18,7 @@
 //! move it, Space and Enter press, arrows step a slider.
 
 const std = @import("std");
+const sys = @import("sys.zig");
 const geom = @import("geom.zig");
 const textm = @import("text.zig");
 const textedit = @import("textedit.zig");
@@ -2786,7 +2787,7 @@ pub const Context = struct {
             },
         }
         // Presses close in time and place count as one double (triple) click.
-        const now = std.time.nanoTimestamp();
+        const now = sys.nanos();
         const near = @abs(x - c.input.last_press.x) <= 4 and @abs(y - c.input.last_press.y) <= 4;
         c.input.clicks = if (clicks > 0) clicks else if (near and now - c.input.last_press_ns < 500 * std.time.ns_per_ms) c.input.clicks % 3 + 1 else 1;
         c.input.last_press_ns = now;

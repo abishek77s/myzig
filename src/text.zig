@@ -6,6 +6,7 @@
 //! last one shapes nothing (the retained text measurement of gpui-fast).
 
 const std = @import("std");
+const sys = @import("sys.zig");
 const env = @import("env.zig");
 
 extern fn mz_font_init(data: [*]const u8, index: c_int) ?*anyopaque;
@@ -104,7 +105,7 @@ pub const Face = struct {
             index.* = std.fmt.parseInt(c_int, spec[i + 1 ..], 10) catch 0;
             path = spec[0..i];
         }
-        return std.fs.cwd().readFileAlloc(gpa, path, 64 << 20) catch null;
+        return sys.readFile(gpa, path, 64 << 20) catch null;
     }
 
     pub fn glyph(f: *const Face, cp: u21) u32 {

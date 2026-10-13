@@ -7,6 +7,10 @@ const counter = @import("counter");
 const quotes = @import("quotes");
 const list = @import("list");
 
+// Small release binaries: MyZig prints panics and log messages.
+pub const panic = myzig.panic;
+pub const std_options = myzig.std_options;
+
 fn bench(comptime State: type, name: []const u8, fonts: *myzig.text.Fonts, state: *State, view: anytype, w: u32, h: u32, full: bool, window: bool) !void {
     const gpa = std.heap.c_allocator;
     var hl = try myzig.Headless(State).init(gpa, fonts, state, view, w, h, 2);
@@ -21,15 +25,15 @@ fn bench(comptime State: type, name: []const u8, fonts: *myzig.text.Fonts, state
     if (myzig.env.get("DAMAGE") != null) for (0..8) |_| {
         const p0 = hl.renderer.stats.pixels;
         hl.frame();
-        std.debug.print("px {d} ", .{hl.renderer.stats.pixels - p0});
-        std.debug.print("{s}: {d} ops, damage:", .{ name, hl.scene.ops.items.len });
-        for (hl.renderer.damage.items) |d| std.debug.print(" [{d},{d} {d}x{d}]", .{ d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0 });
-        std.debug.print("\n", .{});
+        myzig.sys.print("px {d} ", .{hl.renderer.stats.pixels - p0});
+        myzig.sys.print("{s}: {d} ops, damage:", .{ name, hl.scene.ops.items.len });
+        for (hl.renderer.damage.items) |d| myzig.sys.print(" [{d},{d} {d}x{d}]", .{ d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0 });
+        myzig.sys.print("\n", .{});
     };
     hl.build_ns = 0;
     hl.raster_ns = 0;
     hl.pixels_drawn = 0;
-    var timer = try std.time.Timer.start();
+    var timer = try myzig.sys.Timer.start();
     var n: u64 = 0;
     while (timer.read() < 2 * std.time.ns_per_s) : (n += 1) {
         if (full) hl.renderer.invalidate();
@@ -37,7 +41,7 @@ fn bench(comptime State: type, name: []const u8, fonts: *myzig.text.Fonts, state
     }
     const ns = timer.read();
     const nf: f64 = @floatFromInt(n);
-    std.debug.print("{s:<24} {d:>8.3} ms/frame (build+layout+paint {d:.3}, raster {d:.3}, {d:.0} px)\n", .{
+    myzig.sys.print("{s:<24} {d:>8.3} ms/frame (build+layout+paint {d:.3}, raster {d:.3}, {d:.0} px)\n", .{
         name,
         @as(f64, @floatFromInt(ns)) / nf / 1e6,
         @as(f64, @floatFromInt(hl.build_ns)) / nf / 1e6,

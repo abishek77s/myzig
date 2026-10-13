@@ -12,6 +12,7 @@
 //! Command with an arrow goes to the line's start or end.
 
 const std = @import("std");
+const sys = @import("sys.zig");
 const objc = @import("mac/objc.zig");
 const env = @import("env.zig");
 const ui = @import("ui.zig");
@@ -90,7 +91,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
         /// it draws nothing then (a drawable may never come).
         visible: bool = true,
         stats: app.Stats = .{},
-        timer: std.time.Timer,
+        timer: sys.Timer,
         cursor: ui.Cursor = .arrow,
         /// ctrl_click is set while a Control-click (a right click) is held.
         ctrl_click: bool = false,
@@ -101,7 +102,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             const pool = objc.Pool.push();
             defer pool.pop();
 
-            g = .{ .state = state, .fonts = try text.Fonts.init(gpa), .ctx = undefined, .sc = .{ .gpa = gpa }, .rend = .{ .gpa = gpa }, .timer = try std.time.Timer.start() };
+            g = .{ .state = state, .fonts = try text.Fonts.init(gpa), .ctx = undefined, .sc = .{ .gpa = gpa }, .rend = .{ .gpa = gpa }, .timer = try sys.Timer.start() };
             g.ctx = ui.Context.init(gpa, &g.fonts);
             defer g.ctx.deinit();
             defer g.fonts.deinit();
@@ -136,7 +137,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             g.openGpu(gpa);
             if (g.gpu == null) {
                 CG.load() catch |e| {
-                    std.log.err("myzig: {s}", .{@errorName(e)});
+                    sys.log(.err, "myzig: {s}", .{@errorName(e)});
                     return e;
                 };
                 g.layer = send(objc.class("CALayer"), "layer", .{});
@@ -189,7 +190,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                 }
                 // The first frame may have been drawn by windowDidResize.
                 if (dump) |path| if (g.stats.frames > 0) {
-                    g.writeDump(gpa, path) catch |e| std.log.err("myzig: {s}: {s}", .{ path, @errorName(e) });
+                    g.writeDump(gpa, path) catch |e| sys.log(.err, "myzig: {s}: {s}", .{ path, @errorName(e) });
                     break;
                 };
                 if (g.need_frame and (uncapped or now >= next_frame)) {
@@ -253,20 +254,20 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                     .vsync = vsync,
                     .validation = env.has("MYZIG_VK_VALIDATION"),
                 }) catch |e| {
-                    std.log.warn("myzig: no Vulkan ({s}); drawing with Metal", .{@errorName(e)});
+                    sys.log(.warn, "myzig: no Vulkan ({s}); drawing with Metal", .{@errorName(e)});
                     break :vk;
                 };
                 w.gpu = .{ .vulkan = r };
             }
             if (w.gpu == null) {
                 const r = metal.Renderer.init(gpa, layer, .{ .vsync = vsync }) catch |e| {
-                    std.log.warn("myzig: no Metal ({s}); drawing on the CPU", .{@errorName(e)});
+                    sys.log(.warn, "myzig: no Metal ({s}); drawing on the CPU", .{@errorName(e)});
                     return;
                 };
                 w.gpu = .{ .metal = r };
             }
             w.layer = layer;
-            if (env.has("MYZIG_STATS")) std.debug.print("myzig: drawing with {s} on {s}\n", .{ w.gpu.?.api(), w.gpu.?.name() });
+            if (env.has("MYZIG_STATS")) sys.print("myzig: drawing with {s} on {s}\n", .{ w.gpu.?.api(), w.gpu.?.name() });
             w.rend.raster = false;
             w.rend.retain_pixels = false;
         }
@@ -329,7 +330,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             const t2 = w.timer.read();
             if (w.gpu) |*r| {
                 if (w.rend.damage.items.len > 0 and w.visible) r.draw(&w.sc, &w.fonts, w.width, w.height) catch |e| {
-                    std.log.err("myzig: {s} frame: {s}; drawing on the CPU", .{ r.api(), @errorName(e) });
+                    sys.log(.err, "myzig: {s} frame: {s}; drawing on the CPU", .{ r.api(), @errorName(e) });
                     w.loseGpu();
                     return;
                 };

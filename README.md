@@ -33,11 +33,17 @@ pub fn main() !void {
     var s = Counter{};
     try myzig.run(&s, view, .{ .title = "Counter", .width = 360, .height = 260 });
 }
+
+// Optional: in release builds, print panics and log messages with MyZig's
+// small stderr writer rather than Zig's (std.Io and stack traces, about
+// 130 KB of every binary).
+pub const panic = myzig.panic;
+pub const std_options = myzig.std_options;
 ```
 
 ## Getting started
 
-You need [Zig](https://ziglang.org/download/) 0.15.2. Nothing else on
+You need [Zig](https://ziglang.org/download/) 0.16.0. Nothing else on
 Windows or macOS (no Xcode, no SDK); on Linux, the X11 development
 libraries (`libx11-dev libxext-dev` on Debian and Ubuntu). GPU drivers,
 Wayland's libraries and macOS's frameworks are opened at run time, so

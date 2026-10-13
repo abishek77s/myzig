@@ -8,6 +8,10 @@ const std = @import("std");
 const myzig = @import("myzig");
 const ui = myzig.ui;
 
+// Small release binaries: MyZig prints panics and log messages.
+pub const panic = myzig.panic;
+pub const std_options = myzig.std_options;
+
 pub const Size = enum { small, medium, large };
 
 pub const regions = [_][]const u8{ "Europe", "North America", "South America", "Asia Pacific", "Africa" };

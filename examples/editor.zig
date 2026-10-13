@@ -6,6 +6,10 @@ const std = @import("std");
 const myzig = @import("myzig");
 const ui = myzig.ui;
 
+// Small release binaries: MyZig prints panics and log messages.
+pub const panic = myzig.panic;
+pub const std_options = myzig.std_options;
+
 pub const Editor = struct {
     gpa: std.mem.Allocator,
     doc: ui.TextInput = .{},
@@ -20,7 +24,7 @@ pub const Editor = struct {
     }
 
     pub fn open(s: *Editor, path: []const u8) !void {
-        const bytes = try std.fs.cwd().readFileAlloc(s.gpa, path, 64 << 20);
+        const bytes = try myzig.sys.readFile(s.gpa, path, 64 << 20);
         defer s.gpa.free(bytes);
         try s.doc.set(s.gpa, bytes);
         s.doc.caret = 0;
@@ -34,7 +38,7 @@ pub const Editor = struct {
             s.message = "No file to save to: open one with zig build editor -- <path>";
             return;
         };
-        std.fs.cwd().writeFile(.{ .sub_path = path, .data = s.doc.value() }) catch {
+        myzig.sys.writeFile(path, s.doc.value()) catch {
             s.message = "Could not save";
             return;
         };
@@ -90,11 +94,11 @@ pub fn view(s: *Editor, c: *ui.Context) void {
     }
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.c_allocator;
     var s = Editor{ .gpa = gpa };
     defer s.deinit();
-    var args = try std.process.argsWithAllocator(gpa);
+    var args = try init.args.iterateAllocator(gpa);
     defer args.deinit();
     _ = args.skip();
     if (args.next()) |path| {
@@ -223,7 +227,7 @@ test "the wheel scrolls a long text, and the caret keeps in view" {
     defer s.deinit();
     var text: std.ArrayListUnmanaged(u8) = .empty;
     defer text.deinit(testing.allocator);
-    for (0..300) |i| try text.writer(testing.allocator).print("line {d}\n", .{i});
+    for (0..300) |i| try text.print(testing.allocator, "line {d}\n", .{i});
     try s.doc.set(testing.allocator, text.items);
     s.doc.caret = 0;
     s.doc.anchor = 0;

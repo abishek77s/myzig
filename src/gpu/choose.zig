@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const env = @import("../env.zig");
+const sys = @import("../sys.zig");
 
 pub const Kind = enum { cpu, gl, vulkan, metal };
 
@@ -37,7 +38,7 @@ fn hasGpu() bool {
     if (builtin.os.tag == .windows) return true;
     const paths = [_][]const u8{ "/dev/dri/renderD128", "/dev/nvidia0" };
     for (paths) |p| {
-        std.fs.accessAbsolute(p, .{}) catch continue;
+        if (!sys.exists(p)) continue;
         return true;
     }
     return false;
