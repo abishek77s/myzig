@@ -10,12 +10,13 @@ const std = @import("std");
 const geom = @import("geom.zig");
 const text = @import("text.zig");
 const raster = @import("raster.zig");
+const Image = @import("image.zig").Image;
 const Rect = geom.Rect;
 const IRect = geom.IRect;
 const Color = geom.Color;
 
 pub const Op = struct {
-    kind: enum(u8) { rect, text, stroke },
+    kind: enum(u8) { rect, text, stroke, image },
     weight: text.Weight = .regular,
     color: Color,
     border_color: Color = .transparent,
@@ -33,6 +34,8 @@ pub const Op = struct {
     /// seg is a stroke's two segments, x0 y0 x1 y1 each, in fractions of
     /// rect (so they move with it); its width is border.
     seg: [2][4]f32 = .{ .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
+    /// image is an image op's; seg[0] the part of it shown, in texels.
+    image: ?*Image = null,
 };
 
 /// Layer is a scrolled area: its ops hash where they are in its content,
@@ -165,6 +168,17 @@ pub const Scene = struct {
         s.finish(&op, str);
     }
 
+    /// image paints the part src (x0 y0 x1 y1, in texels) of img into r, its
+    /// corners rounded by radius, at opacity (0..255).
+    pub fn image(s: *Scene, r: Rect, img: *Image, src: [4]f32, radius: f32, opacity: u8) void {
+        if (opacity == 0 or r.w <= 0 or r.h <= 0) return;
+        const c = s.clip();
+        const b = IRect.fromRect(r, s.scale).intersect(c);
+        if (b.isEmpty()) return;
+        var op = Op{ .kind = .image, .color = .{ .r = 255, .g = 255, .b = 255, .a = opacity }, .rect = r, .radius = radius, .seg = .{ src, .{ 0, 0, 0, 0 } }, .image = img, .clip = c, .bounds = b };
+        s.finish(&op, "");
+    }
+
     pub fn string(s: *const Scene, op: *const Op) []const u8 {
         return s.strings.items[op.str_off..][0..op.str_len];
     }
@@ -182,7 +196,8 @@ fn hashOp(op: *const Op, str: []const u8, layer_key: u64, offset: ?f32) u64 {
     h.update(std.mem.asBytes(&op.size));
     h.update(std.mem.asBytes(&op.weight));
     h.update(std.mem.asBytes(&op.clip));
-    if (op.kind == .stroke) h.update(std.mem.asBytes(&op.seg));
+    if (op.kind == .stroke or op.kind == .image) h.update(std.mem.asBytes(&op.seg));
+    if (op.image) |img| h.update(std.mem.asBytes(&img.id));
     h.update(str);
     return h.final();
 }
@@ -426,6 +441,15 @@ pub fn drawOp(s: *const Scene, fonts: *text.Fonts, cv: *const raster.Canvas, op:
                 cv.rrect(x, y, w, h, rad, op.color, clip);
             }
         },
+        .image => raster.image(cv, op.image.?, .{
+            .x = op.rect.x * k,
+            .y = op.rect.y * k,
+            .w = op.rect.w * k,
+            .h = op.rect.h * k,
+            .src = op.seg[0],
+            .radius = op.radius * k,
+            .opacity = op.color.a,
+        }, clip),
         .stroke => {
             const r = op.rect;
             var segs: [2][4]f32 = undefined;

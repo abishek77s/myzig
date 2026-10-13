@@ -24,6 +24,7 @@ pub const text = @import("text.zig");
 pub const scene = @import("scene.zig");
 pub const raster = @import("raster.zig");
 pub const Headless = @import("headless.zig").Headless;
+pub const Image = @import("image.zig").Image;
 pub const env = @import("env.zig");
 pub const app = @import("app.zig");
 pub const WindowOptions = app.WindowOptions;
@@ -38,6 +39,7 @@ pub const run = switch (@import("builtin").os.tag) {
 
 test {
     _ = geom;
+    _ = @import("image.zig");
     _ = raster;
     _ = @import("gpu/instances.zig");
     _ = @import("gpu/vulkan.zig");

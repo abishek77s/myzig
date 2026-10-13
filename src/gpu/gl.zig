@@ -103,6 +103,10 @@ const GL_DEPTH_TEST = 0x0B71;
 const GL_RENDERER = 0x1F01;
 const GL_VERSION = 0x1F02;
 const GL_SCISSOR_TEST = 0x0C11;
+const GL_TEXTURE1 = 0x84C1;
+const GL_LINEAR = 0x2601;
+const GL_RGBA8 = 0x8058;
+const GL_BGRA = 0x80E1;
 
 pub const Renderer = struct {
     gl: Gl,
@@ -111,6 +115,10 @@ pub const Renderer = struct {
     vao: GLuint = 0,
     vbo: GLuint = 0,
     texture: GLuint = 0,
+    /// images is the image atlas's texture, on unit 1.
+    images_tex: GLuint = 0,
+    images: inst.ImageAtlas,
+    images_size: u32 = 0,
     u_viewport: GLint = -1,
     atlas: inst.Atlas,
     instances: std.ArrayListUnmanaged(inst.Instance) = .empty,
@@ -118,7 +126,7 @@ pub const Renderer = struct {
     tex_size: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, gl: Gl) !Renderer {
-        var r = Renderer{ .gl = gl, .gpa = gpa, .atlas = .{ .gpa = gpa } };
+        var r = Renderer{ .gl = gl, .gpa = gpa, .atlas = .{ .gpa = gpa }, .images = .{ .gpa = gpa } };
         const vs = try r.shader(GL_VERTEX_SHADER, inst.glsl_vertex);
         const fs = try r.shader(GL_FRAGMENT_SHADER, inst.glsl_fragment);
         r.program = gl.CreateProgram();
@@ -137,6 +145,7 @@ pub const Renderer = struct {
         gl.UseProgram(r.program);
         r.u_viewport = gl.GetUniformLocation(r.program, "u_viewport");
         gl.Uniform1i(gl.GetUniformLocation(r.program, "u_atlas"), 0);
+        gl.Uniform1i(gl.GetUniformLocation(r.program, "u_images"), 1);
         gl.GenVertexArrays(1, &r.vao);
         gl.BindVertexArray(r.vao);
         gl.GenBuffers(1, &r.vbo);
@@ -153,6 +162,14 @@ pub const Renderer = struct {
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl.GenTextures(1, &r.images_tex);
+        gl.ActiveTexture(GL_TEXTURE1);
+        gl.BindTexture(GL_TEXTURE_2D, r.images_tex);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl.ActiveTexture(GL_TEXTURE0);
         gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
         gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
         gl.Disable(GL_DEPTH_TEST);
@@ -164,6 +181,7 @@ pub const Renderer = struct {
 
     pub fn deinit(r: *Renderer) void {
         r.atlas.deinit();
+        r.images.deinit();
         r.instances.deinit(r.gpa);
         r.staging.deinit(r.gpa);
     }
@@ -194,7 +212,7 @@ pub const Renderer = struct {
     /// draw draws s into the current framebuffer, of width×height pixels.
     pub fn draw(r: *Renderer, s: *const scene.Scene, fonts: *text.Fonts, width: i32, height: i32) !void {
         const gl = r.gl;
-        try inst.build(s, fonts, &r.atlas, &r.instances);
+        try inst.build(s, fonts, &r.atlas, &r.images, &r.instances);
         gl.BindTexture(GL_TEXTURE_2D, r.texture);
         if (r.atlas.grown or r.tex_size != r.atlas.size) {
             gl.TexImage2D(GL_TEXTURE_2D, 0, GL_R8, @intCast(r.atlas.size), @intCast(r.atlas.size), 0, GL_RED, GL_UNSIGNED_BYTE, null);
@@ -206,6 +224,26 @@ pub const Renderer = struct {
             gl.TexSubImage2D(GL_TEXTURE_2D, 0, @intCast(u.x), @intCast(u.y), @intCast(u.w), @intCast(u.h), GL_RED, GL_UNSIGNED_BYTE, px.ptr);
         }
         r.atlas.uploads.clearRetainingCapacity();
+        // Images, on unit 1: one texel until one is drawn.
+        const images_size = if (r.images.used) r.images.size else 1;
+        if (r.images_size != images_size or (r.images.grown and r.images.used) or r.images.uploads.items.len > 0) {
+            gl.ActiveTexture(GL_TEXTURE1);
+            defer gl.ActiveTexture(GL_TEXTURE0);
+            gl.BindTexture(GL_TEXTURE_2D, r.images_tex);
+            if (r.images_size != images_size or r.images.grown) {
+                const sz: GLsizei = @intCast(images_size);
+                const zero = try r.gpa.alloc(u8, @as(usize, images_size) * images_size * 4);
+                defer r.gpa.free(zero);
+                @memset(zero, 0);
+                gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sz, sz, 0, GL_BGRA, GL_UNSIGNED_BYTE, zero.ptr);
+                r.images_size = images_size;
+                r.images.grown = false;
+            }
+            for (r.images.uploads.items) |u| {
+                gl.TexSubImage2D(GL_TEXTURE_2D, 0, @intCast(u.x), @intCast(u.y), @intCast(u.image.width), @intCast(u.image.height), GL_BGRA, GL_UNSIGNED_BYTE, u.image.pixels.ptr);
+            }
+            r.images.uploads.clearRetainingCapacity();
+        }
 
         gl.Viewport(0, 0, width, height);
         const bg = s.background;

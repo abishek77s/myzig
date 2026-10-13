@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.addCSourceFile(.{ .file = b.path("vendor/stb_truetype.c"), .flags = &.{ "-O2", "-fno-sanitize=undefined" } });
+    mod.addCSourceFile(.{ .file = b.path("vendor/stb_image.c"), .flags = &.{ "-O2", "-fno-sanitize=undefined" } });
     if (target.result.os.tag == .windows) {
         mod.linkSystemLibrary("user32", .{});
         mod.linkSystemLibrary("gdi32", .{});

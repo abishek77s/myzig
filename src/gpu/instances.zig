@@ -7,6 +7,7 @@
 const std = @import("std");
 const scene = @import("../scene.zig");
 const text = @import("../text.zig");
+const Image = @import("../image.zig").Image;
 
 pub const Instance = extern struct {
     /// rect is the quad in device pixels: x, y, width, height.
@@ -17,7 +18,9 @@ pub const Instance = extern struct {
     border_color: [4]f32,
     /// params are the radius and the border width in device pixels, and
     /// the kind: 0 for a box, 1 for a glyph, 2 for a stroke (whose width
-    /// is the border's), 3 for a shadow (of the box in uv, blurred by w).
+    /// is the border's), 3 for a shadow (of the box in uv, blurred by w),
+    /// 4 for an image (sampled from the image atlas at uv, its opacity
+    /// color's alpha).
     params: [4]f32,
     /// uv is the glyph's place in the atlas, normalized: uv_x, uv_y, u1, v1;
     /// for a stroke its first segment, and border_color its second, in
@@ -78,6 +81,62 @@ pub const Atlas = struct {
     }
 };
 
+pub const ImageUpload = struct { x: u32, y: u32, image: *Image };
+
+/// ImageAtlas places images in a square texture of four bytes a texel
+/// (premultiplied BGRA, as Image's pixels are in memory), on shelves. An
+/// image stays until the atlas fills: then it starts over, larger, up to
+/// max texels a side. Images larger than half of max go in shrunk.
+pub const ImageAtlas = struct {
+    gpa: std.mem.Allocator,
+    size: u32 = 512,
+    max: u32 = 4096,
+    x: u32 = 0,
+    y: u32 = 0,
+    shelf: u32 = 0,
+    places: std.AutoHashMapUnmanaged(u32, [2]u16) = .empty,
+    uploads: std.ArrayListUnmanaged(ImageUpload) = .empty,
+    /// grown is set when the texture must be made again at size.
+    grown: bool = true,
+    /// used is set once an image was drawn: until then a renderer keeps a
+    /// texture of one texel.
+    used: bool = false,
+
+    pub fn deinit(a: *ImageAtlas) void {
+        a.places.deinit(a.gpa);
+        a.uploads.deinit(a.gpa);
+    }
+
+    fn reset(a: *ImageAtlas, size: u32) void {
+        a.size = size;
+        a.x = 0;
+        a.y = 0;
+        a.shelf = 0;
+        a.places.clearRetainingCapacity();
+        a.uploads.clearRetainingCapacity();
+        a.grown = true;
+    }
+
+    fn place(a: *ImageAtlas, img: *Image) ?[2]u16 {
+        if (a.places.get(img.id)) |p| return p;
+        // A texel apart, so that sampling at an edge reads no neighbour.
+        const w = img.width + 1;
+        const h = img.height + 1;
+        if (a.x + w > a.size) {
+            a.x = 0;
+            a.y += a.shelf;
+            a.shelf = 0;
+        }
+        if (a.y + h > a.size or w > a.size) return null;
+        const p = [2]u16{ @intCast(a.x), @intCast(a.y) };
+        a.uploads.append(a.gpa, .{ .x = a.x, .y = a.y, .image = img }) catch return null;
+        a.places.put(a.gpa, img.id, p) catch return null;
+        a.x += w;
+        a.shelf = @max(a.shelf, h);
+        return p;
+    }
+};
+
 fn rgba(c: anytype) [4]f32 {
     return .{ @as(f32, @floatFromInt(c.r)) / 255, @as(f32, @floatFromInt(c.g)) / 255, @as(f32, @floatFromInt(c.b)) / 255, @as(f32, @floatFromInt(c.a)) / 255 };
 }
@@ -94,25 +153,51 @@ fn clipOf(c: anytype) [4]f32 {
 }
 
 /// build writes the instances of s into out, placing new glyphs in atlas
-/// (whose uploads the renderer then makes). When the atlas fills it grows,
-/// up to 8192 texels a side, and the scene is built again.
-pub fn build(s: *const scene.Scene, fonts: *text.Fonts, atlas: *Atlas, out: *std.ArrayListUnmanaged(Instance)) !void {
-    while (true) {
+/// and new images in images (whose uploads the renderer then makes). When
+/// an atlas fills it grows, up to 8192 texels a side for glyphs and
+/// images.max for images, and the scene is built again.
+pub fn build(s: *const scene.Scene, fonts: *text.Fonts, atlas: *Atlas, images: *ImageAtlas, out: *std.ArrayListUnmanaged(Instance)) !void {
+    var tries: u32 = 0;
+    while (true) : (tries += 1) {
         out.clearRetainingCapacity();
-        if (try buildOnce(s, fonts, atlas, out)) return;
-        if (atlas.size >= 8192) {
-            atlas.reset(atlas.size); // a frame of more glyphs than fit: start over
-            _ = try buildOnce(s, fonts, atlas, out);
-            return;
+        const full = try buildOnce(s, fonts, atlas, images, out);
+        if (full == .none or tries > 8) return;
+        if (full == .glyphs) {
+            // A frame of more glyphs than fit at the largest: start over.
+            atlas.reset(if (atlas.size >= 8192) atlas.size else atlas.size * 2);
+        } else {
+            images.reset(@min(images.max, images.size * 2));
         }
-        atlas.reset(atlas.size * 2);
     }
 }
 
-fn buildOnce(s: *const scene.Scene, fonts: *text.Fonts, atlas: *Atlas, out: *std.ArrayListUnmanaged(Instance)) !bool {
+const Full = enum { none, glyphs, images };
+
+fn buildOnce(s: *const scene.Scene, fonts: *text.Fonts, atlas: *Atlas, images: *ImageAtlas, out: *std.ArrayListUnmanaged(Instance)) !Full {
     const k = s.scale;
     try out.ensureTotalCapacity(atlas.gpa, s.ops.items.len);
     for (s.ops.items) |*op| switch (op.kind) {
+        .image => {
+            const big = op.image.?;
+            const img = big.fitted(images.max / 2);
+            const p = images.place(img) orelse return .images;
+            images.used = true;
+            const sx = @as(f32, @floatFromInt(img.width)) / @as(f32, @floatFromInt(big.width));
+            const sy = @as(f32, @floatFromInt(img.height)) / @as(f32, @floatFromInt(big.height));
+            const sz: f32 = @floatFromInt(images.size);
+            const px: f32 = @floatFromInt(p[0]);
+            const py: f32 = @floatFromInt(p[1]);
+            const src = op.seg[0];
+            const r = op.rect;
+            try out.append(atlas.gpa, .{
+                .rect = .{ r.x * k, r.y * k, r.w * k, r.h * k },
+                .clip = clipOf(op.clip),
+                .color = .{ 1, 1, 1, @as(f32, @floatFromInt(op.color.a)) / 255 },
+                .border_color = .{ 0, 0, 0, 0 },
+                .params = .{ @min(op.radius, @min(r.w, r.h) / 2) * k, 0, 4, 0 },
+                .uv = .{ (px + src[0] * sx) / sz, (py + src[1] * sy) / sz, (px + src[2] * sx) / sz, (py + src[3] * sy) / sz },
+            });
+        },
         .rect => if (op.size > 0) {
             // A shadow: the quad covers its blur; uv carries the box.
             const b = op.size;
@@ -175,10 +260,10 @@ fn buildOnce(s: *const scene.Scene, fonts: *text.Fonts, atlas: *Atlas, out: *std
             };
             var full = false;
             scene.glyphs(s, fonts, op, Ctx{ .out = out, .atlas = atlas, .op = op, .full = &full }, Ctx.glyph);
-            if (full) return false;
+            if (full) return .glyphs;
         },
     };
-    return true;
+    return .none;
 }
 
 /// The shaders, in GLSL; the Vulkan renderer's SPIR-V is compiled from the
@@ -227,6 +312,7 @@ pub const glsl_fragment =
     \\flat in vec4 v_params;
     \\flat in vec4 v_seg;
     \\uniform sampler2D u_atlas;
+    \\uniform sampler2D u_images;
     \\out vec4 o_color;
     \\float box(vec2 p, vec2 c, vec2 h, float r) {
     \\    vec2 q = abs(p - c) - (h - r);
@@ -242,6 +328,14 @@ pub const glsl_fragment =
     \\void main() {
     \\    if (v_pos.x < v_clip.x || v_pos.y < v_clip.y || v_pos.x >= v_clip.z || v_pos.y >= v_clip.w) discard;
     \\    vec4 fill = vec4(v_color.rgb * v_color.a, v_color.a);
+    \\    if (v_params.z > 3.5) {
+    \\        vec2 half_texel = 0.5 / vec2(textureSize(u_images, 0));
+    \\        vec2 uv = clamp(v_uv, min(v_seg.xy, v_seg.zw) + half_texel, max(v_seg.xy, v_seg.zw) - half_texel);
+    \\        vec2 h = v_rect.zw * 0.5;
+    \\        float cover = clamp(0.5 - box(v_pos, v_rect.xy + h, h, v_params.x), 0.0, 1.0);
+    \\        o_color = texture(u_images, uv) * (v_color.a * cover);
+    \\        return;
+    \\    }
     \\    if (v_params.z > 2.5) {
     \\        vec2 h = v_seg.zw * 0.5;
     \\        float d = box(v_pos, v_seg.xy + h, h, v_params.x);
@@ -283,9 +377,11 @@ test "atlas places glyphs apart, and instances sample their own glyph" {
     s.textRun(&fonts, 10, 60, "Symbol Price Change % Volume quick", 14, .regular, @import("../geom.zig").Color.black);
     var atlas = Atlas{ .gpa = gpa, .size = 256 };
     defer atlas.deinit();
+    var images = ImageAtlas{ .gpa = gpa };
+    defer images.deinit();
     var out: std.ArrayListUnmanaged(Instance) = .empty;
     defer out.deinit(gpa);
-    try build(&s, &fonts, &atlas, &out);
+    try build(&s, &fonts, &atlas, &images, &out);
     // The texture the uploads make.
     const tex = try gpa.alloc(u8, atlas.size * atlas.size);
     defer gpa.free(tex);
@@ -307,9 +403,11 @@ test "each glyph instance samples its own coverage" {
     s.textRun(&fonts, 16, 30, "Streaming quotes · tick 1", 18, .bold, @import("../geom.zig").Color.black);
     var atlas = Atlas{ .gpa = gpa };
     defer atlas.deinit();
+    var images = ImageAtlas{ .gpa = gpa };
+    defer images.deinit();
     var out: std.ArrayListUnmanaged(Instance) = .empty;
     defer out.deinit(gpa);
-    try build(&s, &fonts, &atlas, &out);
+    try build(&s, &fonts, &atlas, &images, &out);
     const tex = try gpa.alloc(u8, atlas.size * atlas.size);
     defer gpa.free(tex);
     @memset(tex, 0);

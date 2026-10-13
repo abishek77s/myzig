@@ -9,6 +9,7 @@ layout(location = 5) flat in vec4 v_border_color;
 layout(location = 6) flat in vec4 v_params;
 layout(location = 7) flat in vec4 v_seg;
 layout(set = 0, binding = 0) uniform sampler2D u_atlas;
+layout(set = 0, binding = 1) uniform sampler2D u_images;
 layout(location = 0) out vec4 o_color;
 float box(vec2 p, vec2 c, vec2 h, float r) {
     vec2 q = abs(p - c) - (h - r);
@@ -24,6 +25,14 @@ float segment(vec2 p, vec4 s) {
 void main() {
     if (v_pos.x < v_clip.x || v_pos.y < v_clip.y || v_pos.x >= v_clip.z || v_pos.y >= v_clip.w) discard;
     vec4 fill = vec4(v_color.rgb * v_color.a, v_color.a);
+    if (v_params.z > 3.5) {
+        vec2 half_texel = 0.5 / vec2(textureSize(u_images, 0));
+        vec2 uv = clamp(v_uv, min(v_seg.xy, v_seg.zw) + half_texel, max(v_seg.xy, v_seg.zw) - half_texel);
+        vec2 h = v_rect.zw * 0.5;
+        float cover = clamp(0.5 - box(v_pos, v_rect.xy + h, h, v_params.x), 0.0, 1.0);
+        o_color = texture(u_images, uv) * (v_color.a * cover);
+        return;
+    }
     if (v_params.z > 2.5) {
         vec2 h = v_seg.zw * 0.5;
         float d = box(v_pos, v_seg.xy + h, h, v_params.x);
