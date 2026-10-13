@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const only = b.option([]const u8, "only", "Build only this example (and no benchmark)");
-    const examples = [_][]const u8{ "counter", "quotes", "list", "gallery", "events" };
+    const examples = [_][]const u8{ "counter", "quotes", "list", "gallery", "events", "editor" };
     const test_step = b.step("test", "Run the tests");
     inline for (examples) |name| {
         const exe = b.addExecutable(.{
@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
         });
         if (only == null or std.mem.eql(u8, only.?, name)) b.installArtifact(exe);
         const run = b.addRunArtifact(exe);
+        if (b.args) |a| run.addArgs(a);
         b.step(name, "Run the " ++ name ++ " example").dependOn(&run.step);
         const t = b.addTest(.{ .root_module = exe.root_module });
         test_step.dependOn(&b.addRunArtifact(t).step);

@@ -493,6 +493,9 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             if (flags & flag_command != 0 and (key == .left or key == .right)) {
                 key = if (key == .left) .home else .end;
                 mods.ctrl = false;
+            } else if (flags & flag_command != 0 and (key == .up or key == .down)) {
+                // ⌘↑ and ⌘↓: the text's start and end.
+                key = if (key == .up) .home else .end;
             }
             // While an input method composes, its keys are its own.
             const composing = g.ctx.input.preedit_len > 0 and g.ctx.input.text_focus;
