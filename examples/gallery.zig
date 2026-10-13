@@ -1,7 +1,7 @@
 //! Gallery shows every control MyZig has: text inputs, checkboxes, radio
 //! buttons, toggles, a slider, a progress bar, buttons and a scroll view,
-//! a select, a tooltip and a dialog, with a dark theme a toggle switches
-//! to. Text wraps. Tab moves the focus.
+//! a select, a tooltip, a dialog, a context menu and an image, with a dark
+//! theme a toggle switches to. Text wraps. Tab moves the focus.
 //!
 //!     zig build gallery
 const std = @import("std");
@@ -27,8 +27,11 @@ pub const Gallery = struct {
     region: usize = 0,
     confirm_clear: bool = false,
     log_menu: ui.Menu = .{},
+    /// logo is decoded once, from the PNG built into the executable.
+    logo: ?*myzig.Image = null,
 
     pub fn deinit(s: *Gallery) void {
+        if (s.logo) |l| l.deinit();
         s.name.deinit(s.gpa);
         s.password.deinit(s.gpa);
         for (s.log.items) |l| s.gpa.free(l);
@@ -130,7 +133,13 @@ pub fn view(s: *Gallery, c: *ui.Context) void {
     {
         c.column(.{ .gap = 8, .width = 260 });
         defer c.end();
-        c.text("Activity", .{ .size = 16, .bold = true });
+        {
+            c.row(.{ .gap = 10, .@"align" = .center });
+            defer c.end();
+            if (s.logo == null) s.logo = myzig.Image.decode(s.gpa, @embedFile("assets/logo.png")) catch null;
+            if (s.logo) |logo| c.image(logo, .{ .width = 32, .radius = 8 });
+            c.text("Activity", .{ .size = 16, .bold = true });
+        }
         c.scrollView(&s.log_scroll, .{ .gap = 6, .padding = 10, .background = t.surface, .radius = t.radius, .key = "log" });
         defer c.end();
         // A right click opens the log's menu.
@@ -514,4 +523,22 @@ test "the mouse's side buttons reach the view" {
     h.navigate(.back);
     try testing.expectEqual(@as(u32, 1), st.back);
     try testing.expect(h.hasText("1"));
+}
+
+test "the logo decodes and is drawn where its box is" {
+    var fonts = try myzig.text.Fonts.init(testing.allocator);
+    defer fonts.deinit();
+    var s = Gallery{ .gpa = testing.allocator };
+    defer s.deinit();
+    var h = try harness(&s, &fonts);
+    defer h.deinit();
+    const logo = s.logo.?;
+    try testing.expectEqual(@as(u32, 128), logo.width);
+    var found = false;
+    for (h.scene.ops.items) |op| if (op.kind == .image) {
+        found = true;
+        try testing.expectEqual(@as(f32, 32), op.rect.w);
+        try testing.expectEqual(@as(f32, 32), op.rect.h);
+    };
+    try testing.expect(found);
 }

@@ -204,6 +204,60 @@ pub const Canvas = struct {
     }
 };
 
+pub const ImageDraw = struct {
+    /// x, y, w, h is where the image goes, in device pixels; src the part of
+    /// it shown, x0 y0 x1 y1 in its texels.
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    src: [4]f32,
+    radius: f32 = 0,
+    /// opacity is 0..255.
+    opacity: u32 = 255,
+};
+
+/// image draws img (an image.Image: premultiplied 0xAARRGGBB, sampled
+/// bilinear) into c, its corners rounded, clipped to clip.
+pub fn image(c: *const Canvas, img: anytype, d: ImageDraw, clip: IRect) void {
+    if (d.w <= 0 or d.h <= 0 or d.opacity == 0) return;
+    const outer = IRect{
+        .x0 = @intFromFloat(@floor(d.x)),
+        .y0 = @intFromFloat(@floor(d.y)),
+        .x1 = @intFromFloat(@ceil(d.x + d.w)),
+        .y1 = @intFromFloat(@ceil(d.y + d.h)),
+    };
+    const b = outer.intersect(clip).intersect(c.bounds());
+    if (b.isEmpty()) return;
+    const r = @min(d.radius, @min(d.w, d.h) / 2);
+    const hx = d.w / 2;
+    const hy = d.h / 2;
+    const ku = (d.src[2] - d.src[0]) / d.w;
+    const kv = (d.src[3] - d.src[1]) / d.h;
+    var py = b.y0;
+    while (py < b.y1) : (py += 1) {
+        const fy = @as(f32, @floatFromInt(py)) + 0.5;
+        const v = d.src[1] + (fy - d.y) * kv;
+        const dst = c.row(py);
+        var px = b.x0;
+        while (px < b.x1) : (px += 1) {
+            const fx = @as(f32, @floatFromInt(px)) + 0.5;
+            var a: u32 = coverage(fx, fy, d.x + hx, d.y + hy, hx, hy, r);
+            if (a == 0) continue;
+            a = (a * d.opacity + 127) / 255; // 0..256
+            const s = img.sample(d.src[0] + (fx - d.x) * ku, v);
+            const p = &dst[@intCast(px)];
+            // Premultiplied: d = s·a + d·(1 − sa·a).
+            const sa = ((s >> 24) * a) >> 8;
+            const ia = 256 - sa;
+            const o = p.*;
+            const rb = ((((o & 0xff00ff) * ia) >> 8) & 0xff00ff) + ((((s & 0xff00ff) * a) >> 8) & 0xff00ff);
+            const g = ((((o & 0x00ff00) * ia) >> 8) & 0x00ff00) + ((((s & 0x00ff00) * a) >> 8) & 0x00ff00);
+            p.* = (rb & 0xff00ff) | (g & 0x00ff00);
+        }
+    }
+}
+
 /// boxDistance is the signed distance from (fx, fy) to the rounded box
 /// centered at (cx, cy) with half sizes hx, hy and radius r.
 inline fn boxDistance(fx: f32, fy: f32, cx: f32, cy: f32, hx: f32, hy: f32, r: f32) f32 {

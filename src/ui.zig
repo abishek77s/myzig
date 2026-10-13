@@ -21,6 +21,7 @@ const std = @import("std");
 const geom = @import("geom.zig");
 const textm = @import("text.zig");
 const scene_mod = @import("scene.zig");
+pub const Image = @import("image.zig").Image;
 pub const Rect = geom.Rect;
 pub const Color = geom.Color;
 pub const Scene = scene_mod.Scene;
@@ -168,6 +169,22 @@ pub const TextOpts = struct {
     /// wrap breaks the text into lines at spaces (and at newlines) to fit
     /// the width it is given.
     wrap: bool = false,
+};
+
+/// Fit is how an image fills the box it is given: all of it inside
+/// (contain), all of the box covered and the rest cropped (cover),
+/// stretched to it (fill), or at its own size, cropped (none).
+pub const Fit = enum(u2) { contain, cover, fill, none };
+
+pub const ImageOpts = struct {
+    /// width and height are the box's; with one of them, the other keeps
+    /// the image's proportions; with neither, the image's own size.
+    width: ?f32 = null,
+    height: ?f32 = null,
+    fit: Fit = .contain,
+    radius: f32 = 0,
+    opacity: f32 = 1,
+    grow: f32 = 0,
 };
 
 pub const ButtonOpts = struct {
@@ -331,7 +348,7 @@ pub const Clipboard = struct {
 
 const none: u32 = std.math.maxInt(u32);
 
-const Kind = enum(u8) { box, text, button, list, scroll, checkbox, radio, toggle, slider, progress, input, divider, overlay, select, option, menu_item };
+const Kind = enum(u8) { box, text, button, list, scroll, checkbox, radio, toggle, slider, progress, input, divider, overlay, select, option, menu_item, image };
 
 /// Place is where an overlay goes: below its anchor (a popup, flipped
 /// above when it does not fit), at the pointer (a tooltip), or centered (a
@@ -388,6 +405,8 @@ const Node = struct {
     // sliders and progress bars (0..1); a scroll view's content height
     value: f32 = 0,
     input: ?*TextInput = null,
+    img: ?*Image = null,
+    fit: Fit = .contain,
     // overlays
     anchor: Rect = .{},
     place: Place = .below,
@@ -832,6 +851,23 @@ pub const Context = struct {
         n.value = if (range != 0) std.math.clamp((value.* - min) / range, 0, 1) else 0;
         if (value.* != before) c.acted = true;
         return value.* != before;
+    }
+
+    /// image shows img in a box sized by o, fitted to it as o.fit says.
+    pub fn image(c: *Context, img: *Image, o: ImageOpts) void {
+        const iw: f32 = @floatFromInt(img.width);
+        const ih: f32 = @floatFromInt(img.height);
+        var w = o.width;
+        var h = o.height;
+        if (w != null and h == null) h = w.? * ih / iw;
+        if (h != null and w == null) w = h.? * iw / ih;
+        _ = c.add(.{
+            .kind = .image,
+            .img = img,
+            .fit = o.fit,
+            .value = std.math.clamp(o.opacity, 0, 1),
+            .box = .{ .width = w orelse iw, .height = h orelse ih, .radius = o.radius, .grow = o.grow },
+        }, null);
     }
 
     /// progress shows a bar filled to value (0..1).
@@ -1630,6 +1666,7 @@ pub const Context = struct {
                 w = 240;
                 h = c.fonts.metrics(.regular, n.size).line_height + 2 * c.theme.space(2);
             },
+            .image => {}, // its box has its size
             .divider => {
                 const p = n.parent;
                 if (p != none and c.nodes.items[p].dir == .row) w = 1 else h = 1;
@@ -1972,6 +2009,7 @@ pub const Context = struct {
                 if (n.value > 0) s.rect(.{ .x = r.x, .y = r.y, .w = @max(r.h, r.w * n.value), .h = r.h }, t.accent, r.h / 2, 0, .transparent);
             },
             .divider => s.rect(r, n.color, 0, 0, .transparent),
+            .image => c.paintImage(n, s),
             .input => c.paintInput(n, s),
             .select => {
                 c.focusRing(s, n, r, n.box.radius);
@@ -2054,6 +2092,37 @@ pub const Context = struct {
                 if (n.box.clip) s.popClip();
             },
         }
+    }
+
+    fn paintImage(c: *Context, n: *const Node, s: *Scene) void {
+        _ = c;
+        const img = n.img.?;
+        const r = n.rect;
+        const iw: f32 = @floatFromInt(img.width);
+        const ih: f32 = @floatFromInt(img.height);
+        var dst = r;
+        var src = [4]f32{ 0, 0, iw, ih };
+        switch (n.fit) {
+            .fill => {},
+            .contain => {
+                const k = @min(r.w / iw, r.h / ih);
+                dst = .{ .x = r.x + (r.w - iw * k) / 2, .y = r.y + (r.h - ih * k) / 2, .w = iw * k, .h = ih * k };
+            },
+            .cover => {
+                // The middle of the image, as much as covers the box.
+                const k = @max(r.w / iw, r.h / ih);
+                const sw = r.w / k;
+                const sh = r.h / k;
+                src = .{ (iw - sw) / 2, (ih - sh) / 2, (iw + sw) / 2, (ih + sh) / 2 };
+            },
+            .none => {
+                const w = @min(iw, r.w);
+                const h = @min(ih, r.h);
+                dst = .{ .x = r.x + (r.w - w) / 2, .y = r.y + (r.h - h) / 2, .w = w, .h = h };
+                src = .{ (iw - w) / 2, (ih - h) / 2, (iw + w) / 2, (ih + h) / 2 };
+            },
+        }
+        s.image(dst, img, src, n.box.radius, @intFromFloat(@round(n.value * 255)));
     }
 
     fn paintInput(c: *Context, n: *const Node, s: *Scene) void {

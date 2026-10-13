@@ -76,10 +76,18 @@ pub const msl =
     \\    float t = l2 > 0.0 ? clamp(dot(p - a, d) / l2, 0.0, 1.0) : 0.0;
     \\    return length(p - a - t * d);
     \\}
-    \\fragment float4 box_fragment(VOut v [[stage_in]], texture2d<float> atlas [[texture(0)]]) {
+    \\fragment float4 box_fragment(VOut v [[stage_in]], texture2d<float> atlas [[texture(0)]], texture2d<float> images [[texture(1)]]) {
     \\    constexpr sampler smp(filter::nearest, address::clamp_to_edge);
+    \\    constexpr sampler linear(filter::linear, address::clamp_to_edge);
     \\    if (v.pos.x < v.clip.x || v.pos.y < v.clip.y || v.pos.x >= v.clip.z || v.pos.y >= v.clip.w) discard_fragment();
     \\    float4 fill = float4(v.color.rgb * v.color.a, v.color.a);
+    \\    if (v.params.z > 3.5) {
+    \\        float2 half_texel = 0.5 / float2(images.get_width(), images.get_height());
+    \\        float2 uv = clamp(v.uv, min(v.seg.xy, v.seg.zw) + half_texel, max(v.seg.xy, v.seg.zw) - half_texel);
+    \\        float2 h = v.rect.zw * 0.5;
+    \\        float cover = clamp(0.5 - box(v.pos, v.rect.xy + h, h, v.params.x), 0.0, 1.0);
+    \\        return images.sample(linear, uv) * (v.color.a * cover);
+    \\    }
     \\    if (v.params.z > 2.5) {
     \\        float2 h = v.seg.zw * 0.5;
     \\        float d = box(v.pos, v.seg.xy + h, h, v.params.x);
@@ -126,6 +134,10 @@ pub const Renderer = struct {
     atlas: inst.Atlas,
     atlas_tex: Id = null,
     atlas_size: u32 = 0,
+    images: inst.ImageAtlas,
+    images_tex: Id = null,
+    /// images_size is the image texture's side: 1 until an image is drawn.
+    images_size: u32 = 0,
     instances: std.ArrayListUnmanaged(inst.Instance) = .empty,
     frames: [frames_in_flight]Frame = .{Frame{}} ** frames_in_flight,
     frame: usize = 0,
@@ -187,6 +199,7 @@ pub const Renderer = struct {
             .pipeline = pipeline,
             .layer = layer,
             .atlas = .{ .gpa = gpa },
+            .images = .{ .gpa = gpa },
         };
         const n = objc.utf8(send(device, "name", .{}));
         r.name_len = @min(n.len, r.name_buf.len);
@@ -215,10 +228,12 @@ pub const Renderer = struct {
         objc.release(r.readback);
         objc.release(r.offscreen);
         objc.release(r.atlas_tex);
+        objc.release(r.images_tex);
         objc.release(r.pipeline);
         objc.release(r.queue);
         objc.release(r.device);
         r.atlas.deinit();
+        r.images.deinit();
         r.instances.deinit(r.gpa);
     }
 
@@ -251,11 +266,26 @@ pub const Renderer = struct {
         });
     }
 
+    /// makeImages makes the image texture images.size texels a side (one
+    /// while no image was drawn), cleared.
+    fn makeImages(r: *Renderer) void {
+        objc.release(r.images_tex);
+        const sz = if (r.images.used) r.images.size else 1;
+        r.images_tex = r.texture(pixel_bgra8, sz, sz, 1);
+        r.images_size = sz;
+        const zeros = r.gpa.alloc(u8, @as(usize, sz) * 4) catch return;
+        defer r.gpa.free(zeros);
+        @memset(zeros, 0);
+        for (0..sz) |y| msg(void, r.images_tex, "replaceRegion:mipmapLevel:withBytes:bytesPerRow:", .{
+            MTLRegion{ .origin = .{ .y = y }, .size = .{ .width = sz, .height = 1 } }, @as(UInt, 0), @as(?*const anyopaque, zeros.ptr), @as(UInt, sz * 4),
+        });
+    }
+
     /// draw draws s, width×height pixels, and presents it.
     pub fn draw(r: *Renderer, s: *const scene.Scene, fonts: *text.Fonts, width: i32, height: i32) !void {
         const pool = objc.Pool.push();
         defer pool.pop();
-        try inst.build(s, fonts, &r.atlas, &r.instances);
+        try inst.build(s, fonts, &r.atlas, &r.images, &r.instances);
         const w: u32 = @intCast(@max(1, width));
         const h: u32 = @intCast(@max(1, height));
 
@@ -280,6 +310,22 @@ pub const Renderer = struct {
             });
         }
         r.atlas.uploads.clearRetainingCapacity();
+        // Images, like glyphs, only go where no frame in flight samples:
+        // a grown atlas is a new texture.
+        const images_size = if (r.images.used) r.images.size else 1;
+        if (r.images_size != images_size or (r.images.grown and r.images.used)) {
+            r.makeImages();
+            r.images.grown = false;
+        }
+        for (r.images.uploads.items) |u| {
+            msg(void, r.images_tex, "replaceRegion:mipmapLevel:withBytes:bytesPerRow:", .{
+                MTLRegion{ .origin = .{ .x = u.x, .y = u.y }, .size = .{ .width = u.image.width, .height = u.image.height } },
+                @as(UInt, 0),
+                @as(?*const anyopaque, u.image.pixels.ptr),
+                @as(UInt, u.image.width * 4),
+            });
+        }
+        r.images.uploads.clearRetainingCapacity();
 
         const n = r.instances.items.len;
         const bytes = @max(1, n) * @sizeOf(inst.Instance);
@@ -337,6 +383,7 @@ pub const Renderer = struct {
             const viewport = [2]f32{ @floatFromInt(w), @floatFromInt(h) };
             msg(void, enc, "setVertexBytes:length:atIndex:", .{ @as(?*const anyopaque, &viewport), @as(UInt, 8), @as(UInt, 1) });
             msg(void, enc, "setFragmentTexture:atIndex:", .{ r.atlas_tex, @as(UInt, 0) });
+            msg(void, enc, "setFragmentTexture:atIndex:", .{ r.images_tex, @as(UInt, 1) });
             // MTLPrimitiveTypeTriangleStrip
             msg(void, enc, "drawPrimitives:vertexStart:vertexCount:instanceCount:", .{ @as(UInt, 4), @as(UInt, 0), @as(UInt, 4), @as(UInt, n) });
         }
@@ -399,6 +446,15 @@ test "offscreen Metal draws what the CPU renderer draws" {
     s.textRun(&fonts, 20, 80, "Metal · quick 123", 16, .regular, geom.Color.black);
     s.shadow(.{ .x = 260, .y = 60, .w = 40, .h = 30 }, 6, 10, geom.Color.rgba(0, 0, 0, 0.4));
     s.stroke(.{ .x = 230, .y = 14, .w = 24, .h = 24 }, .{ .{ 0.1, 0.55, 0.4, 0.85 }, .{ 0.4, 0.85, 0.9, 0.15 } }, 3, geom.Color.black);
+    // An image, scaled up, its corners rounded, half of it see-through.
+    var rgba: [16 * 16 * 4]u8 = undefined;
+    for (0..16) |y| for (0..16) |x| {
+        const i = (y * 16 + x) * 4;
+        rgba[i..][0..4].* = .{ @intCast(x * 16), @intCast(y * 16), 200, if (x < 8) 255 else 128 };
+    };
+    const img = try @import("../image.zig").Image.fromRgba(gpa, 16, 16, &rgba);
+    defer img.deinit();
+    s.image(.{ .x = 214, .y = 58, .w = 40, .h = 40 }, img, .{ 0, 0, 16, 16 }, 8, 230);
     r.capture = true;
     try r.draw(&s, &fonts, 320, 120);
     const gpu_px = try gpa.alloc(u32, 320 * 120);

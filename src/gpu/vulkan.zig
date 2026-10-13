@@ -91,6 +91,9 @@ pub const Renderer = struct {
     pipeline_layout: vk.PipelineLayout = 0,
     pipeline: vk.Pipeline = 0,
     sampler: vk.Sampler = 0,
+    /// image_sampler filters (images are drawn at any size); glyphs are
+    /// drawn texel for pixel.
+    image_sampler: vk.Sampler = 0,
     pool: vk.DescriptorPool = 0,
     set: vk.DescriptorSet = 0,
     cmd_pool: vk.CommandPool = 0,
@@ -110,6 +113,13 @@ pub const Renderer = struct {
     atlas_view: vk.ImageView = 0,
     atlas_size: u32 = 0,
     atlas_fresh: bool = false,
+    images: inst.ImageAtlas,
+    images_image: vk.Image = 0,
+    images_memory: vk.DeviceMemory = 0,
+    images_view: vk.ImageView = 0,
+    /// images_size is the image texture's side: 1 until an image is drawn.
+    images_size: u32 = 0,
+    images_fresh: bool = false,
     instances: std.ArrayListUnmanaged(inst.Instance) = .empty,
 
     /// capture, when set before draw, copies the frame drawn into readback
@@ -128,6 +138,7 @@ pub const Renderer = struct {
             .get_instance_proc = gip,
             .offscreen = surface == .offscreen,
             .atlas = .{ .gpa = gpa },
+            .images = .{ .gpa = gpa },
         };
         try r.createInstance(surface, opts);
         errdefer r.i.DestroyInstance(r.instance, null);
@@ -150,6 +161,7 @@ pub const Renderer = struct {
         r.destroyAll();
         r.lib.close();
         r.atlas.deinit();
+        r.images.deinit();
         r.instances.deinit(r.gpa);
         r.targets.deinit(r.gpa);
     }
@@ -160,6 +172,7 @@ pub const Renderer = struct {
         r.destroyTargets();
         if (r.swapchain != 0) d.DestroySwapchainKHR.?(dev, r.swapchain, null);
         r.destroyAtlas();
+        r.destroyImages();
         r.freeHost(&r.readback);
         for (&r.frames) |*f| {
             r.freeHost(&f.instances);
@@ -170,6 +183,7 @@ pub const Renderer = struct {
         if (r.cmd_pool != 0) d.DestroyCommandPool(dev, r.cmd_pool, null);
         if (r.pool != 0) d.DestroyDescriptorPool(dev, r.pool, null);
         if (r.sampler != 0) d.DestroySampler(dev, r.sampler, null);
+        if (r.image_sampler != 0) d.DestroySampler(dev, r.image_sampler, null);
         if (r.pipeline != 0) d.DestroyPipeline(dev, r.pipeline, null);
         if (r.pipeline_layout != 0) d.DestroyPipelineLayout(dev, r.pipeline_layout, null);
         if (r.set_layout != 0) d.DestroyDescriptorSetLayout(dev, r.set_layout, null);
@@ -410,13 +424,18 @@ pub const Renderer = struct {
             .p_dependencies = &deps,
         }, null, &r.render_pass));
 
-        const bindings = [_]vk.DescriptorSetLayoutBinding{.{
+        const bindings = [_]vk.DescriptorSetLayoutBinding{ .{
             .binding = 0,
             .descriptor_type = vk.DESCRIPTOR_COMBINED_IMAGE_SAMPLER,
             .descriptor_count = 1,
             .stage_flags = vk.SHADER_STAGE_FRAGMENT,
-        }};
-        try vk.check(d.CreateDescriptorSetLayout(dev, &.{ .binding_count = 1, .p_bindings = &bindings }, null, &r.set_layout));
+        }, .{
+            .binding = 1,
+            .descriptor_type = vk.DESCRIPTOR_COMBINED_IMAGE_SAMPLER,
+            .descriptor_count = 1,
+            .stage_flags = vk.SHADER_STAGE_FRAGMENT,
+        } };
+        try vk.check(d.CreateDescriptorSetLayout(dev, &.{ .binding_count = bindings.len, .p_bindings = &bindings }, null, &r.set_layout));
         const push = [_]vk.PushConstantRange{.{ .stage_flags = vk.SHADER_STAGE_VERTEX, .offset = 0, .size = 8 }};
         const set_layouts = [_]vk.DescriptorSetLayout{r.set_layout};
         try vk.check(d.CreatePipelineLayout(dev, &.{
@@ -471,7 +490,8 @@ pub const Renderer = struct {
         r.pipeline = pipes[0];
 
         try vk.check(d.CreateSampler(dev, &.{}, null, &r.sampler));
-        const sizes = [_]vk.DescriptorPoolSize{.{ .type = vk.DESCRIPTOR_COMBINED_IMAGE_SAMPLER, .descriptor_count = 1 }};
+        try vk.check(d.CreateSampler(dev, &.{ .mag_filter = 1, .min_filter = 1 }, null, &r.image_sampler)); // linear
+        const sizes = [_]vk.DescriptorPoolSize{.{ .type = vk.DESCRIPTOR_COMBINED_IMAGE_SAMPLER, .descriptor_count = 2 }};
         try vk.check(d.CreateDescriptorPool(dev, &.{ .max_sets = 1, .pool_size_count = 1, .p_pool_sizes = &sizes }, null, &r.pool));
         var sets = [_]vk.DescriptorSet{0};
         try vk.check(d.AllocateDescriptorSets(dev, &.{ .descriptor_pool = r.pool, .descriptor_set_count = 1, .p_set_layouts = &set_layouts }, &sets));
@@ -614,6 +634,59 @@ pub const Renderer = struct {
         r.atlas_size = 0;
     }
 
+    fn destroyImages(r: *Renderer) void {
+        const d = r.d;
+        if (r.images_view != 0) d.DestroyImageView(r.device, r.images_view, null);
+        if (r.images_image != 0) d.DestroyImage(r.device, r.images_image, null);
+        if (r.images_memory != 0) d.FreeMemory(r.device, r.images_memory, null);
+        r.images_view = 0;
+        r.images_image = 0;
+        r.images_memory = 0;
+        r.images_size = 0;
+    }
+
+    /// makeImages makes the image texture images.size texels a side (one
+    /// texel while no image was drawn); the device must be idle.
+    fn makeImages(r: *Renderer) !void {
+        r.destroyImages();
+        const sz = if (r.images.used) r.images.size else 1;
+        try r.deviceImage(.b8g8r8a8_unorm, sz, sz, vk.IMAGE_USAGE_SAMPLED | vk.IMAGE_USAGE_TRANSFER_DST, &r.images_image, &r.images_memory, &r.images_view);
+        r.images_size = sz;
+        r.images_fresh = true;
+        const img = [_]vk.DescriptorImageInfo{.{ .sampler = r.image_sampler, .image_view = r.images_view, .image_layout = .shader_read_only_optimal }};
+        const w = [_]vk.WriteDescriptorSet{.{ .dst_set = r.set, .dst_binding = 1, .descriptor_count = 1, .descriptor_type = vk.DESCRIPTOR_COMBINED_IMAGE_SAMPLER, .p_image_info = &img }};
+        r.d.UpdateDescriptorSets(r.device, 1, &w, 0, null);
+    }
+
+    /// upload clears a texture just made, and copies regions of the
+    /// staging buffer into it.
+    fn upload(r: *Renderer, cmd: vk.CommandBuffer, image: vk.Image, fresh: *bool, staging: vk.Buffer, copies: []const vk.BufferImageCopy) void {
+        if (copies.len == 0 and !fresh.*) return;
+        const d = r.d;
+        const to_dst = [_]vk.ImageMemoryBarrier{.{
+            .src_access_mask = if (fresh.*) 0 else vk.ACCESS_SHADER_READ,
+            .dst_access_mask = vk.ACCESS_TRANSFER_WRITE,
+            .old_layout = if (fresh.*) .undefined else .shader_read_only_optimal,
+            .new_layout = .transfer_dst_optimal,
+            .image = image,
+        }};
+        d.CmdPipelineBarrier(cmd, if (fresh.*) vk.STAGE_TOP_OF_PIPE else vk.STAGE_FRAGMENT_SHADER, vk.STAGE_TRANSFER, 0, 0, null, 0, null, 1, &to_dst);
+        if (fresh.*) {
+            const range = [_]vk.ImageSubresourceRange{.{}};
+            d.CmdClearColorImage(cmd, image, .transfer_dst_optimal, &.{ .float32 = .{ 0, 0, 0, 0 } }, 1, &range);
+            fresh.* = false;
+        }
+        if (copies.len > 0) d.CmdCopyBufferToImage(cmd, staging, image, .transfer_dst_optimal, @intCast(copies.len), copies.ptr);
+        const to_read = [_]vk.ImageMemoryBarrier{.{
+            .src_access_mask = vk.ACCESS_TRANSFER_WRITE,
+            .dst_access_mask = vk.ACCESS_SHADER_READ,
+            .old_layout = .transfer_dst_optimal,
+            .new_layout = .shader_read_only_optimal,
+            .image = image,
+        }};
+        d.CmdPipelineBarrier(cmd, vk.STAGE_TRANSFER, vk.STAGE_FRAGMENT_SHADER, 0, 0, null, 0, null, 1, &to_read);
+    }
+
     /// makeAtlas makes the glyph texture atlas.size texels a side; the
     /// device must be idle (it is replaced only when it grows).
     fn makeAtlas(r: *Renderer) !void {
@@ -631,7 +704,7 @@ pub const Renderer = struct {
     pub fn draw(r: *Renderer, s: *const scene.Scene, fonts: *text.Fonts, width: i32, height: i32) !void {
         const d = r.d;
         const dev = r.device;
-        try inst.build(s, fonts, &r.atlas, &r.instances);
+        try inst.build(s, fonts, &r.atlas, &r.images, &r.instances);
         const w: u32 = @intCast(@max(1, width));
         const h: u32 = @intCast(@max(1, height));
 
@@ -643,6 +716,12 @@ pub const Renderer = struct {
             _ = d.DeviceWaitIdle(dev);
             try r.makeAtlas();
             r.atlas.grown = false;
+        }
+        const images_size = if (r.images.used) r.images.size else 1;
+        if (r.images_size != images_size or (r.images.grown and r.images.used)) {
+            _ = d.DeviceWaitIdle(dev);
+            try r.makeImages();
+            r.images.grown = false;
         }
         if (r.stale or r.extent.width != w or r.extent.height != h) {
             _ = d.DeviceWaitIdle(dev);
@@ -670,11 +749,13 @@ pub const Renderer = struct {
         @memcpy(f.instances.ptr[0 .. n * @sizeOf(inst.Instance)], std.mem.sliceAsBytes(r.instances.items));
         var upload_bytes: usize = 0;
         for (r.atlas.uploads.items) |u| upload_bytes += std.mem.alignForward(usize, u.w * u.h, 4);
+        for (r.images.uploads.items) |u| upload_bytes += u.image.pixels.len * 4;
         var copies: std.ArrayListUnmanaged(vk.BufferImageCopy) = .empty;
         defer copies.deinit(r.gpa);
+        var glyph_copies: usize = 0;
         if (upload_bytes > 0) {
             try r.ensureHost(&f.staging, upload_bytes, vk.BUFFER_USAGE_TRANSFER_SRC);
-            try copies.ensureTotalCapacity(r.gpa, r.atlas.uploads.items.len);
+            try copies.ensureTotalCapacity(r.gpa, r.atlas.uploads.items.len + r.images.uploads.items.len);
             var off: usize = 0;
             for (r.atlas.uploads.items) |u| {
                 const len = u.w * u.h;
@@ -686,8 +767,20 @@ pub const Renderer = struct {
                 });
                 off += std.mem.alignForward(usize, len, 4);
             }
+            glyph_copies = copies.items.len;
+            for (r.images.uploads.items) |u| {
+                const bytes = std.mem.sliceAsBytes(u.image.pixels);
+                @memcpy(f.staging.ptr[off..][0..bytes.len], bytes);
+                copies.appendAssumeCapacity(.{
+                    .buffer_offset = off,
+                    .image_offset = .{ .x = @intCast(u.x), .y = @intCast(u.y), .z = 0 },
+                    .image_extent = .{ .width = u.image.width, .height = u.image.height, .depth = 1 },
+                });
+                off += bytes.len;
+            }
         }
         r.atlas.uploads.clearRetainingCapacity();
+        r.images.uploads.clearRetainingCapacity();
         if (r.capture) try r.ensureHost(&r.readback, r.extent.width * r.extent.height * 4, vk.BUFFER_USAGE_TRANSFER_DST);
 
         try vk.check(d.ResetFences(dev, 1, &.{f.fence}));
@@ -695,30 +788,8 @@ pub const Renderer = struct {
         try vk.check(d.ResetCommandBuffer(cmd, 0));
         try vk.check(d.BeginCommandBuffer(cmd, &.{ .flags = vk.COMMAND_BUFFER_ONE_TIME }));
 
-        if (copies.items.len > 0 or r.atlas_fresh) {
-            const to_dst = [_]vk.ImageMemoryBarrier{.{
-                .src_access_mask = if (r.atlas_fresh) 0 else vk.ACCESS_SHADER_READ,
-                .dst_access_mask = vk.ACCESS_TRANSFER_WRITE,
-                .old_layout = if (r.atlas_fresh) .undefined else .shader_read_only_optimal,
-                .new_layout = .transfer_dst_optimal,
-                .image = r.atlas_image,
-            }};
-            d.CmdPipelineBarrier(cmd, if (r.atlas_fresh) vk.STAGE_TOP_OF_PIPE else vk.STAGE_FRAGMENT_SHADER, vk.STAGE_TRANSFER, 0, 0, null, 0, null, 1, &to_dst);
-            if (r.atlas_fresh) {
-                const range = [_]vk.ImageSubresourceRange{.{}};
-                d.CmdClearColorImage(cmd, r.atlas_image, .transfer_dst_optimal, &.{ .float32 = .{ 0, 0, 0, 0 } }, 1, &range);
-                r.atlas_fresh = false;
-            }
-            if (copies.items.len > 0) d.CmdCopyBufferToImage(cmd, f.staging.buffer, r.atlas_image, .transfer_dst_optimal, @intCast(copies.items.len), copies.items.ptr);
-            const to_read = [_]vk.ImageMemoryBarrier{.{
-                .src_access_mask = vk.ACCESS_TRANSFER_WRITE,
-                .dst_access_mask = vk.ACCESS_SHADER_READ,
-                .old_layout = .transfer_dst_optimal,
-                .new_layout = .shader_read_only_optimal,
-                .image = r.atlas_image,
-            }};
-            d.CmdPipelineBarrier(cmd, vk.STAGE_TRANSFER, vk.STAGE_FRAGMENT_SHADER, 0, 0, null, 0, null, 1, &to_read);
-        }
+        r.upload(cmd, r.atlas_image, &r.atlas_fresh, f.staging.buffer, copies.items[0..glyph_copies]);
+        r.upload(cmd, r.images_image, &r.images_fresh, f.staging.buffer, copies.items[glyph_copies..]);
 
         const bg = s.background;
         const clear = [_]vk.ClearValue{.{ .color = .{ @as(f32, @floatFromInt(bg.r)) / 255, @as(f32, @floatFromInt(bg.g)) / 255, @as(f32, @floatFromInt(bg.b)) / 255, 1 } }};
@@ -817,6 +888,15 @@ test "offscreen Vulkan draws what the CPU renderer draws" {
     s.textRun(&fonts, 20, 80, "Vulkan · quick 123", 16, .regular, geom.Color.black);
     s.shadow(.{ .x = 260, .y = 60, .w = 40, .h = 30 }, 6, 10, geom.Color.rgba(0, 0, 0, 0.4));
     s.stroke(.{ .x = 230, .y = 14, .w = 24, .h = 24 }, .{ .{ 0.1, 0.55, 0.4, 0.85 }, .{ 0.4, 0.85, 0.9, 0.15 } }, 3, geom.Color.black);
+    // An image, scaled up, its corners rounded, half of it see-through.
+    var rgba: [16 * 16 * 4]u8 = undefined;
+    for (0..16) |y| for (0..16) |x| {
+        const i = (y * 16 + x) * 4;
+        rgba[i..][0..4].* = .{ @intCast(x * 16), @intCast(y * 16), 200, if (x < 8) 255 else 128 };
+    };
+    const img = try @import("../image.zig").Image.fromRgba(gpa, 16, 16, &rgba);
+    defer img.deinit();
+    s.image(.{ .x = 214, .y = 58, .w = 40, .h = 40 }, img, .{ 0, 0, 16, 16 }, 8, 230);
     r.capture = true;
     try r.draw(&s, &fonts, 320, 120);
     const gpu_px = try gpa.alloc(u32, 320 * 120);

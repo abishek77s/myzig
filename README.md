@@ -109,6 +109,12 @@ wraps; a light and a dark theme. Every control takes the keyboard focus,
 which Tab and Shift+Tab move, and Space and Enter press. A double click in
 a text input selects a word, a triple click all of it.
 
+**Images.** `myzig.Image.decode` (or `load`, for a file) takes PNG, JPEG,
+GIF and BMP; `c.image(img, .{ .width = 64, .fit = .cover, .radius = 12 })`
+shows one, fitted to its box (contain, cover, fill or none), its corners
+rounded, at any opacity. Every renderer draws them: the GPU ones from an
+atlas of their own, filtered, beside the glyphs'.
+
 **Input.** Every mouse button: `c.pressedWith(.right)` gives where a row
 or column was right-clicked (to open a `Menu` there), the middle button
 too, and `c.navigation()` the side buttons. The wheel and the trackpad
@@ -148,7 +154,7 @@ line's ends, ⌘W and ⌘Q.
   after frame costs a hash lookup.
 - **Clicks show in the frame that reports them.** When a view acts on
   input, the frame is built again before it paints.
-- **Small.** Fonts are drawn with [stb_truetype](https://github.com/nothings/stb);
+- **Small.** Fonts are drawn with [stb_truetype](https://github.com/nothings/stb) and images decoded with stb_image;
   Xlib, Win32 and Vulkan are declared by hand rather than translated from
   headers, Cocoa and Metal are messaged through the Objective-C runtime,
   and drivers are loaded only when a window draws with them.
@@ -201,11 +207,11 @@ gpui-fast has no window numbers and MyZig's windows draw on the CPU.
 
 ## Status
 
-MyZig is young. Not there yet: native Wayland, images, rich text and
+MyZig is young. Not there yet: native Wayland, SVG, rich text and
 multi-line text editing, drag and drop, and accessibility. MyGo's webview side (web pages in the system
 webview with typed IPC) is not ported.
 
 ## License
 
 MIT. MyZig began as a port of MyGo (MIT, © MyGo contributors) and borrows
-ideas from gpui-fast (Apache-2.0). stb_truetype is public domain.
+ideas from gpui-fast (Apache-2.0). stb_truetype and stb_image are public domain.
