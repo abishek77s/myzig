@@ -20,7 +20,7 @@ const CC: std.builtin.CallingConvention = .winapi;
 const Com = opaque {
     fn fnAt(c: *Com, comptime T: type, i: usize) T {
         const vtbl: *const [*]const ?*const anyopaque = @ptrCast(@alignCast(c));
-        return @ptrCast(vtbl.*[i].?);
+        return @ptrCast(@alignCast(vtbl.*[i].?));
     }
 
     fn release(c: *Com) void {

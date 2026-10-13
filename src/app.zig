@@ -72,6 +72,10 @@ fn onXError(_: *x.Display, e: *x.XErrorEvent) callconv(.c) c_int {
 pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void, opts: WindowOptions) !void {
     const gpa = std.heap.c_allocator;
     _ = x.XSetErrorHandler(onXError);
+    // libGL, once it has spoken GLX on the display, is called when the
+    // display closes: it is unloaded after that.
+    var gl_lib: ?std.DynLib = null;
+    defer if (gl_lib) |*l| l.close();
     const dpy = x.XOpenDisplay(null) orelse return error.NoDisplay;
     defer _ = x.XCloseDisplay(dpy);
     const screen = x.XDefaultScreen(dpy);
@@ -92,7 +96,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                 visual = v.visual;
                 depth = v.depth;
             } else |_| {
-                glx.?.lib.close();
+                gl_lib = glx.?.lib;
                 glx = null;
             }
         } else |_| {}
@@ -149,9 +153,9 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     defer if (gpu) |*g| g.deinit();
     defer if (glx) |*g| {
         g.release(dpy);
-        g.lib.close();
+        gl_lib = g.lib;
     };
-    if (choice.kind != .cpu) gpu = openGpu(gpa, dpy, screen, win, visual, w, h, choice, uncapped, &glx);
+    if (choice.kind != .cpu) gpu = openGpu(gpa, dpy, screen, win, visual, w, h, choice, uncapped, &glx, &gl_lib);
     if (gpu) |*g| if (print_stats) sys.print("myzig: drawing with {s} on {s}\n", .{ g.api(), g.name() });
     if (gpu != null) rend.raster = false;
     const dump = env.get("MYZIG_DUMP");
@@ -318,7 +322,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                         gpu = null;
                         if (glx) |*gx| {
                             gx.release(dpy);
-                            gx.lib.close();
+                            gl_lib = gx.lib;
                         }
                         glx = null;
                         rend.raster = true;
@@ -380,9 +384,10 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
 }
 
 /// openGpu opens the GPU renderer choice names for win: Vulkan's, else
-/// OpenGL's (GLX), each unloaded before the next is tried. glx holds GLX,
-/// opened here unless it chose the window's visual.
-fn openGpu(gpa: std.mem.Allocator, dpy: *x.Display, screen: c_int, win: x.Window, visual: *x.Visual, w: i32, h: i32, choice: choose.Choice, uncapped: bool, glx: *?Glx) ?backend.Gpu {
+/// OpenGL's (GLX), each released before the next is tried. glx holds GLX,
+/// opened here unless it chose the window's visual; gl_lib takes libGL
+/// when it fails, to unload once the display is closed.
+fn openGpu(gpa: std.mem.Allocator, dpy: *x.Display, screen: c_int, win: x.Window, visual: *x.Visual, w: i32, h: i32, choice: choose.Choice, uncapped: bool, glx: *?Glx, gl_lib: *?std.DynLib) ?backend.Gpu {
     if (choice.kind == .vulkan) vk: {
         const r = vulkan.Renderer.init(gpa, .{ .xlib = .{ .dpy = dpy, .window = win } }, w, h, .{
             .vsync = !uncapped,
@@ -398,7 +403,7 @@ fn openGpu(gpa: std.mem.Allocator, dpy: *x.Display, screen: c_int, win: x.Window
         // A configuration for the window's visual.
         var g = Glx.open() catch return null;
         _ = g.visual(dpy, screen, x.XVisualIDFromVisual(visual)) catch {
-            g.lib.close();
+            gl_lib.* = g.lib;
             return null;
         };
         glx.* = g;
@@ -414,7 +419,7 @@ fn openGpu(gpa: std.mem.Allocator, dpy: *x.Display, screen: c_int, win: x.Window
     };
     if (r) |rr| return .{ .gl = rr };
     g.release(dpy);
-    g.lib.close();
+    gl_lib.* = g.lib;
     glx.* = null;
     return null;
 }
