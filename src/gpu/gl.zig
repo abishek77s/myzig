@@ -66,7 +66,7 @@ pub const Gl = struct {
                 std.log.err("myzig: OpenGL has no gl{s}", .{f.name});
                 return error.MissingFunction;
             };
-            @field(g, f.name) = @ptrCast(p);
+            @field(g, f.name) = @ptrCast(@alignCast(p));
         }
         return g;
     }

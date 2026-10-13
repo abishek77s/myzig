@@ -183,13 +183,14 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                     window_stats = st;
                     last_print = now;
                 }
+                // The first frame may have been drawn by windowDidResize.
+                if (dump) |path| if (g.stats.frames > 0) {
+                    g.writeDump(gpa, path) catch |e| std.log.err("myzig: {s}: {s}", .{ path, @errorName(e) });
+                    break;
+                };
                 if (g.need_frame and (uncapped or now >= next_frame)) {
                     g.need_frame = false;
                     g.frame();
-                    if (dump) |path| {
-                        g.writeDump(gpa, path) catch |e| std.log.err("myzig: {s}: {s}", .{ path, @errorName(e) });
-                        break;
-                    }
                     next_frame = if (now - next_frame < period) next_frame + period else now + period;
                 }
                 if (g.ctx.wake_at != 0 and now >= g.ctx.wake_at) {
@@ -203,6 +204,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                 if (g.ctx.wake_at != 0) wait_ns = @min(wait_ns orelse std.math.maxInt(u64), g.ctx.wake_at -| g.timer.read());
                 if (print_stats) wait_ns = @min(wait_ns orelse std.math.maxInt(u64), std.time.ns_per_s);
                 if (exit_after_ns) |limit| wait_ns = @min(wait_ns orelse std.math.maxInt(u64), limit -| g.timer.read());
+                if (dump != null) wait_ns = 0;
                 const until = if (wait_ns) |ns|
                     send(NSDate, "dateWithTimeIntervalSinceNow:", .{@as(f64, @floatFromInt(ns)) / 1e9})
                 else

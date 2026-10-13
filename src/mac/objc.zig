@@ -89,10 +89,13 @@ pub fn class(name: [*:0]const u8) Class {
 
 /// sel is the selector named name, registered once.
 pub fn sel(comptime name: [:0]const u8) Sel {
+    // S names the selector, so that each name has its own S (a struct
+    // that captured nothing would be one type for every name).
     const S = struct {
+        const n = name;
         var s: Sel = null;
     };
-    if (S.s == null) S.s = fns.sel_registerName(name);
+    if (S.s == null) S.s = fns.sel_registerName(S.n);
     return S.s;
 }
 

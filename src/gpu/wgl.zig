@@ -56,13 +56,13 @@ pub const Wgl = struct {
     pub fn open(dc_ptr: *anyopaque) !Wgl {
         const dc: HDC = @ptrCast(dc_ptr);
         const lib = LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("opengl32.dll")) orelse return error.NoOpenGL;
-        const create: *const fn (HDC) callconv(WINAPI) ?HGLRC = @ptrCast(GetProcAddress(lib, "wglCreateContext") orelse return error.NoOpenGL);
+        const create: *const fn (HDC) callconv(WINAPI) ?HGLRC = @ptrCast(@alignCast(GetProcAddress(lib, "wglCreateContext") orelse return error.NoOpenGL));
         var w = Wgl{
             .lib = lib,
             .dc = dc,
-            .getProcAddress = @ptrCast(GetProcAddress(lib, "wglGetProcAddress") orelse return error.NoOpenGL),
-            .makeCurrent = @ptrCast(GetProcAddress(lib, "wglMakeCurrent") orelse return error.NoOpenGL),
-            .deleteContext = @ptrCast(GetProcAddress(lib, "wglDeleteContext") orelse return error.NoOpenGL),
+            .getProcAddress = @ptrCast(@alignCast(GetProcAddress(lib, "wglGetProcAddress") orelse return error.NoOpenGL)),
+            .makeCurrent = @ptrCast(@alignCast(GetProcAddress(lib, "wglMakeCurrent") orelse return error.NoOpenGL)),
+            .deleteContext = @ptrCast(@alignCast(GetProcAddress(lib, "wglDeleteContext") orelse return error.NoOpenGL)),
         };
         const pfd = PIXELFORMATDESCRIPTOR{};
         const fmt = ChoosePixelFormat(dc, &pfd);
@@ -73,14 +73,14 @@ pub const Wgl = struct {
         const CreateAttribs = *const fn (HDC, ?HGLRC, [*]const i32) callconv(WINAPI) ?HGLRC;
         if (w.getProcAddress("wglCreateContextAttribsARB")) |p| {
             const attrs = [_]i32{ 0x2091, 3, 0x2092, 3, 0x9126, 1, 0 };
-            if (@as(CreateAttribs, @ptrCast(p))(dc, null, &attrs)) |core| {
+            if (@as(CreateAttribs, @ptrCast(@alignCast(p)))(dc, null, &attrs)) |core| {
                 _ = w.makeCurrent(dc, core);
                 _ = w.deleteContext(legacy);
                 w.ctx = core;
             }
         }
         const Interval = *const fn (i32) callconv(WINAPI) i32;
-        if (w.getProcAddress("wglSwapIntervalEXT")) |p| _ = @as(Interval, @ptrCast(p))(1);
+        if (w.getProcAddress("wglSwapIntervalEXT")) |p| _ = @as(Interval, @ptrCast(@alignCast(p)))(1);
         return w;
     }
 
