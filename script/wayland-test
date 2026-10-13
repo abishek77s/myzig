@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Runs script/input-test against the events example's Wayland window: in
+# Weston, nested in the X server at DISPLAY (Xvfb in CI), with the kiosk
+# shell so that the window fills Weston's and input lands where it is
+# aimed. Needs weston, wl-clipboard, xdotool. RENDERER is passed to
+# MYZIG_RENDERER (cpu by default: Weston's pixman takes shared memory).
+# `script/wayland-test draw DIR` instead saves the gallery's first frame
+# from each renderer into DIR, and checks each drew with what it says.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-$(mktemp -d)}
+chmod 700 "$XDG_RUNTIME_DIR"
+socket=myzig-test-$$
+weston --backend=x11-backend.so --renderer=pixman --shell=kiosk-shell.so \
+  --width=800 --height=600 --socket="$socket" --idle-time=0 >"$XDG_RUNTIME_DIR/weston.log" 2>&1 &
+weston=$!
+trap 'kill $weston 2>/dev/null || true' EXIT
+log=$XDG_RUNTIME_DIR/weston.log
+for _ in $(seq 100); do
+  [ -S "$XDG_RUNTIME_DIR/$socket" ] && grep -q 'window id' "$log" && break
+  sleep 0.1
+done
+wid=$(sed -n 's/.*window id \([0-9]*\).*/\1/p' "$log" | head -1)
+export WAYLAND_DISPLAY=$socket MYZIG_BACKEND=wayland
+if [ "${1:-}" = draw ]; then
+  dir=${2:-.}
+  for r in cpu gl vulkan; do
+    MYZIG_RENDERER=$r MYZIG_STATS=1 MYZIG_DUMP=$dir/wayland-$r.ppm timeout 60 zig-out/bin/gallery 2>&1 | tee "$dir/wayland-$r.log"
+    test -s "$dir/wayland-$r.ppm"
+  done
+  grep -q "Wayland.*drawing on the CPU" "$dir/wayland-cpu.log"
+  grep -q "Wayland.*OpenGL" "$dir/wayland-gl.log"
+  grep -q "Wayland.*Vulkan" "$dir/wayland-vulkan.log"
+  echo "wayland draw: ok"
+  exit 0
+fi
+export MYZIG_RENDERER=${RENDERER:-cpu}
+# xdotool types what the keymap lacks by remapping a key, which Weston's
+# own keymap does not follow: the text is ASCII.
+INPUT_WINDOW_ID=$wid CLIPBOARD=wayland TYPED="hello world" script/input-test zig-out/bin/events

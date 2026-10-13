@@ -18,6 +18,7 @@
 //!         try myzig.run(&s, view, .{ .title = "Counter", .width = 360, .height = 260 });
 //!     }
 
+const std = @import("std");
 pub const ui = @import("ui.zig");
 pub const geom = @import("geom.zig");
 pub const text = @import("text.zig");
@@ -30,12 +31,27 @@ pub const app = @import("app.zig");
 pub const WindowOptions = app.WindowOptions;
 
 /// run opens a window showing view of state and runs the app until it
-/// closes: X11 on Linux and the BSDs, Win32 on Windows, Cocoa on macOS.
+/// closes: Wayland or X11 on Linux (X11 on the BSDs), Win32 on Windows,
+/// Cocoa on macOS.
 pub const run = switch (@import("builtin").os.tag) {
     .windows => @import("win32.zig").run,
     .macos => @import("macos.zig").run,
+    .linux => runLinux,
     else => app.run,
 };
+
+/// runLinux opens a Wayland window in a Wayland session (MYZIG_BACKEND=x11
+/// or wayland chooses), and an X11 one otherwise or where Wayland cannot.
+fn runLinux(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void, opts: WindowOptions) !void {
+    const wayland = @import("wayland.zig");
+    if (wayland.wanted()) {
+        if (wayland.run(state, view, opts)) |_| return else |e| {
+            if (e != error.NoWayland) return e;
+            std.log.info("myzig: no Wayland; opening an X11 window", .{});
+        }
+    }
+    return app.run(state, view, opts);
+}
 
 test {
     _ = geom;
@@ -51,5 +67,6 @@ test {
     if (@import("builtin").os.tag == .linux) {
         _ = @import("x11/xim.zig");
         _ = @import("x11/xi.zig");
+        _ = @import("wayland.zig");
     }
 }

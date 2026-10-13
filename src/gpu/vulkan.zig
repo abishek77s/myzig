@@ -1,6 +1,7 @@
 //! The Vulkan renderer: instances.zig's scene as one instanced draw, the
 //! same shader as OpenGL's compiled to SPIR-V (gpu/shaders). It draws to a
-//! window's swapchain (X11's through VK_KHR_xlib_surface, Windows' through
+//! window's swapchain (X11's through VK_KHR_xlib_surface, Wayland's through
+//! VK_KHR_wayland_surface, Windows' through
 //! VK_KHR_win32_surface, a CAMetalLayer through MoltenVK's
 //! VK_EXT_metal_surface), or to an image of its own when there is
 //! no window (tests, and frames read back).
@@ -23,6 +24,7 @@ const frag_spv align(4) = @embedFile("shaders/box.frag.spv").*;
 /// Surface is what the renderer draws to.
 pub const Surface = union(enum) {
     xlib: struct { dpy: *anyopaque, window: c_ulong },
+    wayland: struct { display: *anyopaque, surface: *anyopaque },
     win32: struct { hinstance: *anyopaque, hwnd: *anyopaque },
     /// metal draws to a CAMetalLayer, through MoltenVK on macOS.
     metal: struct { layer: *anyopaque },
@@ -244,6 +246,10 @@ pub const Renderer = struct {
                 exts[0..2].* = .{ "VK_KHR_surface", "VK_KHR_xlib_surface" };
                 n_ext = 2;
             },
+            .wayland => {
+                exts[0..2].* = .{ "VK_KHR_surface", "VK_KHR_wayland_surface" };
+                n_ext = 2;
+            },
             .win32 => {
                 exts[0..2].* = .{ "VK_KHR_surface", "VK_KHR_win32_surface" };
                 n_ext = 2;
@@ -289,6 +295,10 @@ pub const Renderer = struct {
             .xlib => |s| {
                 const f = r.i.CreateXlibSurfaceKHR orelse return error.NoSurface;
                 try vk.check(f(r.instance, &.{ .dpy = s.dpy, .window = s.window }, null, &r.surface));
+            },
+            .wayland => |s| {
+                const f = r.i.CreateWaylandSurfaceKHR orelse return error.NoSurface;
+                try vk.check(f(r.instance, &.{ .display = s.display, .surface = s.surface }, null, &r.surface));
             },
             .win32 => |s| {
                 const f = r.i.CreateWin32SurfaceKHR orelse return error.NoSurface;
