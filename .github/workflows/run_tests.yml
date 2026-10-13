@@ -3,7 +3,7 @@
 # `tests_pass` job to require in branch protection.
 name: run_tests
 env:
-  ZIG_VERSION: 0.15.2
+  ZIG_VERSION: 0.16.0
 on:
   pull_request:
     branches:

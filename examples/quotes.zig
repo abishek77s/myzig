@@ -6,6 +6,10 @@ const std = @import("std");
 const myzig = @import("myzig");
 const ui = myzig.ui;
 
+// Small release binaries: MyZig prints panics and log messages.
+pub const panic = myzig.panic;
+pub const std_options = myzig.std_options;
+
 pub const rows = 40;
 
 pub const Quotes = struct {

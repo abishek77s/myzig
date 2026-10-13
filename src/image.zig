@@ -8,6 +8,7 @@
 //!     c.image(s.logo, .{ .width = 64, .height = 64, .radius = 12 });
 
 const std = @import("std");
+const sys = @import("sys.zig");
 
 extern fn mz_image_decode(data: [*]const u8, len: c_int, w: *c_int, h: *c_int) ?[*]u8;
 extern fn mz_image_error() ?[*:0]const u8;
@@ -40,7 +41,7 @@ pub const Image = struct {
 
     /// load reads and decodes the image file at path.
     pub fn load(gpa: std.mem.Allocator, path: []const u8) !*Image {
-        const bytes = try std.fs.cwd().readFileAlloc(gpa, path, 256 << 20);
+        const bytes = try sys.readFile(gpa, path, 256 << 20);
         defer gpa.free(bytes);
         return decode(gpa, bytes);
     }

@@ -13,7 +13,7 @@ python3 bench/bench.py setup     # clones MyGo and gpui-fast at the pinned commi
 python3 bench/bench.py all       # or one of: compile size memory window frames
 ```
 
-Results go to `bench/results/latest.json`. The steps need Zig 0.15.2, Go,
+Results go to `bench/results/latest.json`. The steps need Zig 0.16.0, Go,
 Rust (stable), Xvfb, xdotool and GNU time.
 
 ## What each number is

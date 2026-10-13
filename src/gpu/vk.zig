@@ -5,6 +5,7 @@
 //! checked against the headers' sizeof.
 
 const std = @import("std");
+const sys = @import("../sys.zig");
 const builtin = @import("builtin");
 
 pub const CC: std.builtin.CallingConvention = if (builtin.os.tag == .windows) .winapi else .c;
@@ -838,7 +839,7 @@ pub fn load(comptime T: type, ctx: anytype, comptime proc: anytype) !T {
             @field(t, f.name) = if (p) |q| @ptrCast(@alignCast(q)) else null;
         } else {
             @field(t, f.name) = @ptrCast(@alignCast(p orelse {
-                std.log.err("myzig: Vulkan has no vk{s}", .{f.name});
+                sys.log(.err, "myzig: Vulkan has no vk{s}", .{f.name});
                 return error.MissingFunction;
             }));
         }
@@ -848,7 +849,7 @@ pub fn load(comptime T: type, ctx: anytype, comptime proc: anytype) !T {
 
 pub fn check(r: Result) !void {
     if (r != SUCCESS) {
-        std.log.err("myzig: Vulkan error {d}", .{r});
+        sys.log(.err, "myzig: Vulkan error {d}", .{r});
         return error.Vulkan;
     }
 }

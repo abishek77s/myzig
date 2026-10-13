@@ -10,6 +10,7 @@
 //! texels no frame in flight samples, and a grown atlas is a new texture.
 
 const std = @import("std");
+const sys = @import("../sys.zig");
 const objc = @import("../mac/objc.zig");
 const scene = @import("../scene.zig");
 const text = @import("../text.zig");
@@ -166,7 +167,7 @@ pub const Renderer = struct {
         var err: Id = null;
         const lib = send(device, "newLibraryWithSource:options:error:", .{ objc.string(msl), @as(Id, null), &err });
         if (lib == null) {
-            std.log.err("myzig: Metal shader: {s}", .{objc.utf8(send(err, "localizedDescription", .{}))});
+            sys.log(.err, "myzig: Metal shader: {s}", .{objc.utf8(send(err, "localizedDescription", .{}))});
             return error.MetalShader;
         }
         defer objc.release(lib);
@@ -188,7 +189,7 @@ pub const Renderer = struct {
         msg(void, ca, "setDestinationAlphaBlendFactor:", .{@as(UInt, 5)});
         const pipeline = send(device, "newRenderPipelineStateWithDescriptor:error:", .{ desc, &err });
         if (pipeline == null) {
-            std.log.err("myzig: Metal pipeline: {s}", .{objc.utf8(send(err, "localizedDescription", .{}))});
+            sys.log(.err, "myzig: Metal pipeline: {s}", .{objc.utf8(send(err, "localizedDescription", .{}))});
             return error.MetalPipeline;
         }
 
@@ -432,7 +433,7 @@ test "offscreen Metal draws what the CPU renderer draws" {
     const geom = @import("../geom.zig");
     const raster = @import("../raster.zig");
     var r = Renderer.init(gpa, null, .{}) catch |e| {
-        std.debug.print("no Metal device ({s}); skipped\n", .{@errorName(e)});
+        sys.print("no Metal device ({s}); skipped\n", .{@errorName(e)});
         return error.SkipZigTest;
     };
     defer r.deinit();
@@ -475,7 +476,7 @@ test "offscreen Metal draws what the CPU renderer draws" {
         worst = @max(worst, @abs(da - db));
     };
     std.testing.expect(worst <= 8) catch |e| {
-        std.debug.print("Metal and CPU pixels differ by up to {d}\n", .{worst});
+        sys.print("Metal and CPU pixels differ by up to {d}\n", .{worst});
         return e;
     };
     try std.testing.expectEqual(cpu_px[30 * 320 + 70], gpu_px[30 * 320 + 70]);

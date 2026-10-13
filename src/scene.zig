@@ -228,8 +228,6 @@ pub const Renderer = struct {
     damage: std.ArrayListUnmanaged(IRect) = .empty,
     valid: bool = false,
     last_bg: Color = Color.white,
-    threads: usize = 1,
-    pool: ?*std.Thread.Pool = null,
     stats: Stats = .{},
 
     pub const Stats = struct { frames: u64 = 0, pixels: u64 = 0, ops_drawn: u64 = 0 };

@@ -8,6 +8,7 @@
 //! rest are opened at run time: a build runs where there is no Wayland.
 
 const std = @import("std");
+const sys = @import("sys.zig");
 const env = @import("env.zig");
 const ui = @import("ui.zig");
 const text = @import("text.zig");
@@ -148,7 +149,7 @@ const Win = struct {
     owned: std.ArrayListUnmanaged(u8) = .empty,
 
     ctx: *ui.Context = undefined,
-    timer: std.time.Timer = undefined,
+    timer: sys.Timer = undefined,
     need_frame: bool = true,
 
     /// decorates reports whether MyZig draws the title bar now.
@@ -503,12 +504,12 @@ fn onKeyboard(_: *p.wl_keyboard, ev: p.wl_keyboard.Event, w: *Win) void {
     switch (ev) {
         .keymap => |e| {
             if (e.format != p.wl_keyboard.KeymapFormat.xkb_v1) {
-                std.posix.close(e.fd);
+                sys.close(e.fd);
                 return;
             }
             if (w.kb == null) w.kb = xkb.Keyboard.open() catch |err| {
-                std.log.warn("myzig: no xkbcommon ({s}); the keyboard does nothing", .{@errorName(err)});
-                std.posix.close(e.fd);
+                sys.log(.warn, "myzig: no xkbcommon ({s}); the keyboard does nothing", .{@errorName(err)});
+                sys.close(e.fd);
                 return;
             };
             w.kb.?.setKeymap(e.fd, e.size);
@@ -691,7 +692,7 @@ fn updateCursor(w: *Win) void {
     const s = w.intScale();
     if (t.theme == null or t.theme_scale != s) {
         const size: i32 = if (env.get("XCURSOR_SIZE")) |v| std.fmt.parseInt(i32, v, 10) catch 24 else 24;
-        const name: ?[*:0]const u8 = if (std.posix.getenv("XCURSOR_THEME")) |v| v.ptr else null;
+        const name: ?[*:0]const u8 = if (env.get("XCURSOR_THEME")) |v| v.ptr else null;
         t.theme = t.load(name, size * s, shm);
         t.theme_scale = s;
     }
@@ -753,11 +754,11 @@ fn onSource(src: *p.wl_data_source, ev: p.wl_data_source.Event, w: *Win) void {
             // Written whole, then closed: the reader takes it at its pace.
             var off: usize = 0;
             while (off < w.owned.items.len) {
-                const n = std.posix.write(e.fd, w.owned.items[off..]) catch break;
+                const n = sys.write(e.fd, w.owned.items[off..]) catch break;
                 if (n == 0) break;
                 off += n;
             }
-            std.posix.close(e.fd);
+            sys.close(e.fd);
         },
         .cancelled => {
             src.destroy();
@@ -790,11 +791,11 @@ fn clipGet(ctx: *anyopaque, gpa: std.mem.Allocator) ?[]u8 {
     if (w.source != null) return gpa.dupe(u8, w.owned.items) catch null;
     const offer = w.offer orelse return null;
     const mime = w.offer_mime orelse return null;
-    const fds = std.posix.pipe2(.{ .CLOEXEC = true }) catch return null;
+    const fds = sys.pipe() catch return null;
     offer.receive(mime, fds[1]);
-    std.posix.close(fds[1]);
+    sys.close(fds[1]);
     _ = wl.lib.display_flush(w.display);
-    defer std.posix.close(fds[0]);
+    defer sys.close(fds[0]);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var buf: [64 << 10]u8 = undefined;
     while (true) {
@@ -831,9 +832,9 @@ const Shm = struct {
         s.deinit(gpa);
         const size: usize = @intCast(width * height * 4);
         const fd = try std.posix.memfd_create("myzig", std.os.linux.MFD.CLOEXEC);
-        defer std.posix.close(fd);
-        try std.posix.ftruncate(fd, size * s.bufs.len);
-        s.map = try std.posix.mmap(null, size * s.bufs.len, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, fd, 0);
+        defer sys.close(fd);
+        try sys.ftruncate(fd, size * s.bufs.len);
+        s.map = try std.posix.mmap(null, size * s.bufs.len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
         s.pool = shm.create_pool(fd, @intCast(size * s.bufs.len));
         const all: [*]u32 = @ptrCast(s.map.ptr);
         for (&s.bufs, 0..) |*b, i| {
@@ -919,7 +920,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     const display = wl.connect() catch return error.NoWayland;
     defer wl.lib.display_disconnect(display);
     var w = Win{ .gpa = gpa, .display = display };
-    w.timer = try std.time.Timer.start();
+    w.timer = try sys.Timer.start();
     var fonts = try text.Fonts.init(gpa);
     defer fonts.deinit();
     var ctx = ui.Context.init(gpa, &fonts);
@@ -951,8 +952,9 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     w.toplevel = w.xdg_surface.get_toplevel() orelse return error.NoToplevel;
     w.toplevel.setListener(*Win, onToplevel, &w);
     w.toplevel.set_title(opts.title.ptr);
+    var exe_buf: [4096]u8 = undefined;
+    const exe = sys.exeName(&exe_buf);
     var app_id_buf: [64]u8 = undefined;
-    const exe = if (std.os.argv.len > 0) std.fs.path.basename(std.mem.span(std.os.argv[0])) else "myzig";
     const app_id = std.fmt.bufPrintZ(&app_id_buf, "{s}", .{exe[0..@min(exe.len, 60)]}) catch "myzig";
     w.toplevel.set_app_id(app_id.ptr);
     w.toplevel.set_min_size(160, 120);
@@ -1017,7 +1019,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
             .vsync = !uncapped,
             .validation = env.has("MYZIG_VK_VALIDATION"),
         }) catch |e| {
-            if (choice.forced) std.log.warn("myzig: no Vulkan ({s}); trying OpenGL", .{@errorName(e)});
+            if (choice.forced) sys.log(.warn, "myzig: no Vulkan ({s}); trying OpenGL", .{@errorName(e)});
             break :vk;
         };
         if (!choice.forced and r.software()) {
@@ -1029,7 +1031,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     if (gpu == null and (choice.kind == .gl or (choice.kind == .vulkan and !choice.forced) or (choice.kind == .vulkan and choice.forced))) gl: {
         egl = Egl.open() catch break :gl;
         egl.?.context(@ptrCast(display), @ptrCast(w.surface), size[0], size[1]) catch |e| {
-            std.log.warn("myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(e)});
+            sys.log(.warn, "myzig: no OpenGL context ({s}); drawing on the CPU", .{@errorName(e)});
             egl.?.release();
             egl = null;
             break :gl;
@@ -1052,7 +1054,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
         }
         gpu = .{ .gl = r };
     }
-    if (print_stats) std.debug.print("myzig: Wayland{s}, {s}\n", .{ if (w.csd) " (MyZig's decorations)" else "", if (gpu) |*g| g.api() else "drawing on the CPU" });
+    if (print_stats) sys.print("myzig: Wayland{s}, {s}\n", .{ if (w.csd) " (MyZig's decorations)" else "", if (gpu) |*g| g.api() else "drawing on the CPU" });
     if (gpu != null) rend.raster = false;
     if (dump != null) if (gpu) |*g| g.capture();
 
@@ -1132,7 +1134,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                 if (rend.damage.items.len > 0 or resized) {
                     if (egl) |*e| if (resized) e.resize(size[0], size[1]);
                     g.draw(&sc, &fonts, size[0], size[1]) catch |e| {
-                        std.log.err("myzig: {s} frame: {s}; drawing on the CPU", .{ g.api(), @errorName(e) });
+                        sys.log(.err, "myzig: {s} frame: {s}; drawing on the CPU", .{ g.api(), @errorName(e) });
                         g.deinit();
                         gpu = null;
                         if (egl) |*eg| eg.release();

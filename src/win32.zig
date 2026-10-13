@@ -4,6 +4,7 @@
 //! other are paced by the compositor (DwmFlush).
 
 const std = @import("std");
+const sys = @import("sys.zig");
 const app = @import("app.zig");
 const env = @import("env.zig");
 const ui = @import("ui.zig");
@@ -186,7 +187,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
         need_frame: bool = true,
         tracking: bool = false,
         stats: app.Stats = .{},
-        timer: std.time.Timer,
+        timer: sys.Timer,
         wgl: ?Wgl = null,
         gpu: ?backend.Gpu = null,
         high_surrogate: u16 = 0,
@@ -210,7 +211,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             const title = try std.unicode.utf8ToUtf16LeAllocZ(gpa, opts.title);
             defer gpa.free(title);
 
-            g = .{ .state = state, .hwnd = undefined, .fonts = try text.Fonts.init(gpa), .ctx = undefined, .sc = .{ .gpa = gpa }, .rend = .{ .gpa = gpa }, .timer = try std.time.Timer.start() };
+            g = .{ .state = state, .hwnd = undefined, .fonts = try text.Fonts.init(gpa), .ctx = undefined, .sc = .{ .gpa = gpa }, .rend = .{ .gpa = gpa }, .timer = try sys.Timer.start() };
             g.ctx = ui.Context.init(gpa, &g.fonts);
             g.cursors = .{ LoadCursorW(null, IDC_ARROW), LoadCursorW(null, IDC_IBEAM), LoadCursorW(null, IDC_HAND) };
             g.scale = if (env.get("MYZIG_SCALE")) |v| std.fmt.parseFloat(f32, v) catch s0 else s0;
@@ -269,7 +270,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                         // and for the period where it does not wait (no DWM).
                         _ = DwmFlush();
                         const t = g.timer.read();
-                        if (t < next_frame) std.Thread.sleep(next_frame - t);
+                        if (t < next_frame) sys.sleep(next_frame - t);
                         next_frame = @max(next_frame + period, g.timer.read() -| period);
                         if (next_frame < g.timer.read()) next_frame = g.timer.read() + period;
                     }
@@ -301,7 +302,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                     .vsync = !env.has("MYZIG_UNCAPPED"),
                     .validation = env.has("MYZIG_VK_VALIDATION"),
                 }) catch |e| {
-                    if (choice.forced) std.log.warn("myzig: no Vulkan ({s}); drawing on the CPU", .{@errorName(e)});
+                    if (choice.forced) sys.log(.warn, "myzig: no Vulkan ({s}); drawing on the CPU", .{@errorName(e)});
                     break :vk;
                 };
                 if (!choice.forced and r.software()) {
@@ -313,7 +314,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
             if (w.gpu == null and !(choice.kind == .vulkan and choice.forced)) gl: {
                 const dc = GetDC(w.hwnd) orelse return;
                 w.wgl = Wgl.open(dc) catch |e| {
-                    std.log.warn("myzig: no OpenGL ({s}); drawing on the CPU", .{@errorName(e)});
+                    sys.log(.warn, "myzig: no OpenGL ({s}); drawing on the CPU", .{@errorName(e)});
                     break :gl;
                 };
                 const gl = glr.Gl.load(&w.wgl.?, Wgl.proc) catch return w.closeGpu();
@@ -325,7 +326,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                 w.gpu = .{ .gl = r };
             }
             const gpu = if (w.gpu) |*x| x else return;
-            if (verbose) std.debug.print("myzig: drawing with {s} on {s}\n", .{ gpu.api(), gpu.name() });
+            if (verbose) sys.print("myzig: drawing with {s} on {s}\n", .{ gpu.api(), gpu.name() });
             w.rend.raster = false;
             w.rend.retain_pixels = false;
         }
@@ -370,7 +371,7 @@ fn Window(comptime S: type, comptime view: fn (S, *ui.Context) void) type {
                     r.draw(&w.sc, &w.fonts, w.width, w.height) catch |e| {
                         // The device was lost (a driver update or reset, a GPU
                         // removed): the window draws on the CPU from now on.
-                        std.log.err("myzig: {s} frame: {s}; drawing on the CPU", .{ r.api(), @errorName(e) });
+                        sys.log(.err, "myzig: {s} frame: {s}; drawing on the CPU", .{ r.api(), @errorName(e) });
                         w.closeGpu();
                         w.rend.raster = true;
                         w.rend.retain_pixels = true;

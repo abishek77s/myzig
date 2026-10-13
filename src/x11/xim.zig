@@ -5,6 +5,7 @@
 //! until it commits. Either way its candidate window goes by the caret.
 
 const std = @import("std");
+const env = @import("../env.zig");
 const x = @import("../x11.zig");
 const ui = @import("../ui.zig");
 
@@ -61,7 +62,7 @@ pub const Ime = struct {
                 if (s == XIMPreeditPosition | XIMStatusNothing) position = true;
             }
         }
-        if (callbacks and std.posix.getenv("MYZIG_XIM_OVER_THE_SPOT") == null) {
+        if (callbacks and env.get("MYZIG_XIM_OVER_THE_SPOT") == null) {
             ime.callbacks = .{
                 .{ .client_data = ime, .callback = @ptrCast(&onStart) },
                 .{ .client_data = ime, .callback = @ptrCast(&onDone) },

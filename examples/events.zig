@@ -8,6 +8,10 @@ const std = @import("std");
 const myzig = @import("myzig");
 const ui = myzig.ui;
 
+// Small release binaries: MyZig prints panics and log messages.
+pub const panic = myzig.panic;
+pub const std_options = myzig.std_options;
+
 pub const Events = struct {
     gpa: std.mem.Allocator,
     log: std.ArrayListUnmanaged([]u8) = .empty,
@@ -28,9 +32,8 @@ pub const Events = struct {
     fn note(s: *Events, comptime fmt: []const u8, args: anytype) void {
         const line = std.fmt.allocPrint(s.gpa, fmt, args) catch return;
         if (!s.quiet) {
-            var out = std.fs.File.stdout();
-            out.writeAll(line) catch {};
-            out.writeAll("\n") catch {};
+            myzig.sys.out(line);
+            myzig.sys.out("\n");
         }
         if (s.log.items.len == 200) s.gpa.free(s.log.orderedRemove(0));
         s.log.append(s.gpa, line) catch s.gpa.free(line);
