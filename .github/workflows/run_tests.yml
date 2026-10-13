@@ -84,6 +84,8 @@ jobs:
         DISPLAY=:99 script/wayland-test draw shots
         for r in cpu gl vulkan; do python3 script/ppm2png.py shots/wayland-$r.ppm; done
         DISPLAY=:99 script/wayland-test
+    - name: run_tests::memory
+      run: DISPLAY=:99 MYZIG_BACKEND=x11 script/memory "" cpu gl vulkan
     - name: steps::upload_screenshots
       if: always()
       uses: actions/upload-artifact@v4
@@ -118,6 +120,11 @@ jobs:
         MYZIG_STATS=1 MYZIG_DUMP=shots/windows-default.ppm timeout 60 zig-out/bin/gallery.exe
         test -s shots/windows-default.ppm
         python script/ppm2png.py shots/windows-default.ppm
+    - name: run_tests::memory
+      # What each example's window holds, per renderer, as Task Manager
+      # counts it.
+      shell: pwsh
+      run: script/memory.ps1 -Renderers "",cpu,gl,vulkan
     - name: steps::upload_screenshots
       if: always()
       uses: actions/upload-artifact@v4

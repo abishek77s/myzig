@@ -1,0 +1,20 @@
+#!/bin/sh
+# Memory of each example's window on Linux (PSS and private), with the GPU
+# libraries it loaded: script/memory [renderer...], each renderer (cpu, gl,
+# vulkan) forced with MYZIG_RENDERER, "" for the default choice. Needs a
+# display (DISPLAY=:99 with Xvfb in CI).
+[ $# -gt 0 ] || set -- ""
+printf '%-8s %-8s %10s %10s  %s\n' app renderer pss private gpu_libs
+for r in "$@"; do
+  for app in counter quotes list gallery editor; do
+    MYZIG_RENDERER=$r zig-out/bin/$app >/dev/null 2>&1 &
+    pid=$!
+    sleep 3
+    pss=$(awk '/^Pss:/ {s += $2} END {print s}' /proc/$pid/smaps_rollup)
+    priv=$(awk '/^Private_(Clean|Dirty):/ {s += $2} END {print s}' /proc/$pid/smaps_rollup)
+    libs=$(awk '{print $6}' /proc/$pid/maps | grep -oE '(libvulkan[^/]*|libGL[^/]*|libEGL[^/]*|libLLVM[^/]*|[a-z0-9_]*_dri\.so)$' | sort -u | tr '\n' ' ')
+    kill $pid
+    wait $pid 2>/dev/null
+    printf '%-8s %-8s %8sKB %8sKB  %s\n' $app "${r:-default}" "$pss" "$priv" "$libs"
+  done
+done
