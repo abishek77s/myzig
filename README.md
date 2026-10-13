@@ -1,7 +1,9 @@
 # MyZig
 
-**Native desktop UI in Zig, drawn by MyZig itself on the GPU (Vulkan or
-OpenGL) or the CPU, on Linux and Windows.** Views are Zig functions of the
+[![run_tests](https://github.com/abishek77s/myzig/actions/workflows/run_tests.yml/badge.svg)](https://github.com/abishek77s/myzig/actions/workflows/run_tests.yml)
+
+**Native desktop UI in Zig, drawn by MyZig itself on the GPU (Metal, Vulkan
+or OpenGL) or the CPU, on Linux, Windows and macOS.** Views are Zig functions of the
 app's state, laid out with flexbox; no webview, no toolkit, no runtime.
 MyZig began as a port of the native UI of [MyGo](https://github.com/egoist/mygo)
 and measures itself against [gpui-fast](https://github.com/longbridge/gpui-fast).
@@ -36,9 +38,10 @@ pub fn main() !void {
 ## Getting started
 
 You need [Zig](https://ziglang.org/download/) 0.15.2. Nothing else on
-Windows; on Linux, the X11 development libraries (`libx11-dev libxext-dev`
-on Debian and Ubuntu). The GPU drivers are opened at run time, so building
-needs no Vulkan SDK or OpenGL headers.
+Windows or macOS (no Xcode, no SDK); on Linux, the X11 development
+libraries (`libx11-dev libxext-dev` on Debian and Ubuntu). GPU drivers and
+macOS's frameworks are opened at run time, so building needs no Vulkan SDK,
+OpenGL headers or Metal toolchain.
 
 ```sh
 zig build gallery                        # every control, with a dark theme
@@ -56,28 +59,39 @@ zig build gallery -Doptimize=ReleaseFast
 $env:MYZIG_RENDERER = "vulkan"; zig build quotes -Doptimize=ReleaseFast
 ```
 
-Executables land in `zig-out/bin`. Cross-compiling works from either
-system: `zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast` on
-Linux makes the `.exe` files.
+On macOS, in Terminal:
+
+```sh
+zig build gallery -Doptimize=ReleaseFast
+script/bundle-mac gallery                # zig-out/bundle/Gallery.app, for Finder and the Dock
+```
+
+Executables land in `zig-out/bin`. Every target cross-compiles from every
+system: `zig build -Dtarget=aarch64-macos` or `-Dtarget=x86_64-windows`
+on Linux makes the Mac and Windows executables.
 
 ### Settings
 
 | Variable | Effect |
 | --- | --- |
-| `MYZIG_RENDERER=vulkan\|gl\|cpu` | The renderer. By default: Vulkan, else OpenGL, else the CPU. A GPU API that draws on the CPU (llvmpipe, lavapipe, SwiftShader, Microsoft's GDI) is used only when named here, because MyZig's own CPU renderer, which draws only what changed, is cheaper. |
+| `MYZIG_RENDERER=metal\|vulkan\|gl\|cpu` | The renderer. By default: Metal on macOS; elsewhere Vulkan, else OpenGL, else the CPU. On macOS, `vulkan` draws through MoltenVK (`brew install molten-vk`). A GPU API that draws on the CPU (llvmpipe, lavapipe, SwiftShader, Microsoft's GDI) is used only when named here, because MyZig's own CPU renderer, which draws only what changed, is cheaper. |
 | `MYZIG_STATS=1` | Prints, each second, the frames drawn and what each cost. |
 | `MYZIG_SCALE=2` | Draws at twice the density (Windows follows the monitor's DPI by itself). |
 | `MYZIG_UNCAPPED=1` | Draws as fast as it can instead of at the display's rate. |
 | `MYZIG_VK_VALIDATION=1` | Enables the Vulkan validation layer, where it is installed. |
-| `MYZIG_FONT`, `MYZIG_FONT_BOLD` | The fonts' paths (TrueType or OpenType). |
+| `MYZIG_FONT`, `MYZIG_FONT_BOLD` | The fonts' paths (TrueType or OpenType; `file.ttc#1` names a face of a collection). |
+| `MYZIG_DUMP=frame.ppm` | Saves the window's first frame and exits (`script/ppm2png.py` makes it a PNG). |
 
 ## What it has
 
-**Renderers.** All three draw the same pixels; the tests check Vulkan's
-against the CPU's.
+**Renderers.** All four draw the same pixels; the tests check Vulkan's and
+Metal's against the CPU's.
 
+- **Metal** (macOS, on a `CAMetalLayer`): the same instanced draw, its
+  shader in Metal's language, compiled when the window opens.
 - **Vulkan** (X11 through `VK_KHR_xlib_surface`, Windows through
-  `VK_KHR_win32_surface`): the whole frame is one instanced draw. Boxes are
+  `VK_KHR_win32_surface`, macOS through MoltenVK's `VK_EXT_metal_surface`):
+  the whole frame is one instanced draw. Boxes are
   shaded from their signed distance (rounded corners, borders, soft
   shadows), glyphs sample a coverage atlas, icons are strokes, and two
   frames are in flight. SPIR-V is checked in (`zig build shaders` remakes
@@ -93,9 +107,12 @@ virtualized lists, scroll views, dividers and spacers; text that wraps; a
 light and a dark theme. Every control takes the keyboard focus, which Tab
 and Shift+Tab move, and Space and Enter press.
 
-**Platforms.** Linux on X11 (Wayland through XWayland) and Windows 10 and
-later, with per-monitor DPI, typed text through the platform's input
-method, the clipboard, cursor shapes, and frames paced by the display.
+**Platforms.** Linux on X11 (Wayland through XWayland), Windows 10 and
+later, and macOS 13 and later (Apple silicon and Intel), with per-monitor
+DPI and Retina scale, typed text through the platform's input method, the
+clipboard, cursor shapes, and frames paced by the display. On the Mac,
+shortcuts are the Mac's: ⌘C, ⌘V, ⌘A, ⌥ to move by words, ⌘← and ⌘→ to the
+line's ends, ⌘W and ⌘Q.
 
 ## How it works
 
@@ -123,11 +140,25 @@ method, the clipboard, cursor shapes, and frames paced by the display.
   input, the frame is built again before it paints.
 - **Small.** Fonts are drawn with [stb_truetype](https://github.com/nothings/stb);
   Xlib, Win32 and Vulkan are declared by hand rather than translated from
-  headers, and drivers are loaded only when a window draws with them.
+  headers, Cocoa and Metal are messaged through the Objective-C runtime,
+  and drivers are loaded only when a window draws with them.
 
 `myzig.Headless` runs a view without a window: it clicks, types, drags,
 scrolls and advances time, and its frames are the pixels a window would
 show.
+
+## Continuous integration
+
+`.github/workflows/run_tests.yml` checks every push and pull request, laid
+out like Zed's: `zig fmt`, then on Linux, Windows and macOS the tests (with
+the Vulkan test on lavapipe and the Metal test on the Mac runner's GPU),
+the headless frame benchmark, and the gallery's first frame from each
+renderer in a real window, uploaded as screenshots; cross-compiles to
+every target from Linux; and one `tests_pass` job for branch protection.
+`.github/workflows/release.yml` builds a tarball for Linux, zips for
+Windows (x86_64, ARM64) and signed `.app` bundles for macOS (Apple
+silicon, Intel) when a `v*` tag is pushed, and attaches them to the
+release.
 
 ## Benchmarks
 
@@ -158,7 +189,7 @@ gpui-fast has no window numbers and MyZig's windows draw on the CPU.
 
 ## Status
 
-MyZig is young. Not there yet: macOS, native Wayland, images, rich text and
+MyZig is young. Not there yet: native Wayland, images, rich text and
 multi-line text editing, input method composition (pre-edit), drag and
 drop, and accessibility. MyGo's webview side (web pages in the system
 webview with typed IPC) is not ported.

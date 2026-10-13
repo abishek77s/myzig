@@ -51,8 +51,21 @@ const Buffer = struct {
     }
 };
 
+/// x_errors counts the protocol errors the server sent. Xlib's own handler
+/// exits the process on the first; MyZig's logs it and goes on, and the
+/// code that can fail (a shared memory segment the server cannot attach,
+/// over SSH say) checks the count and takes another way.
+var x_errors: u32 = 0;
+
+fn onXError(_: *x.Display, e: *x.XErrorEvent) callconv(.c) c_int {
+    x_errors += 1;
+    if (x_errors <= 8) std.log.warn("myzig: X error {d} (request {d}.{d})", .{ e.error_code, e.request_code, e.minor_code });
+    return 0;
+}
+
 pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void, opts: WindowOptions) !void {
     const gpa = std.heap.c_allocator;
+    _ = x.XSetErrorHandler(onXError);
     const dpy = x.XOpenDisplay(null) orelse return error.NoDisplay;
     defer _ = x.XCloseDisplay(dpy);
     const screen = x.XDefaultScreen(dpy);
@@ -109,7 +122,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     _ = x.XMapWindow(dpy, win);
     const gc = x.XCreateGC(dpy, win, 0, null);
 
-    const use_shm = x.XShmQueryExtension(dpy) != 0 and env.get("MYZIG_NO_SHM") == null;
+    var use_shm = x.XShmQueryExtension(dpy) != 0 and env.get("MYZIG_NO_SHM") == null;
     const shm_completion = if (use_shm) x.XShmGetEventBase(dpy) else -1;
 
     var fonts = try text.Fonts.init(gpa);
@@ -163,7 +176,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
     if (dump != null) if (gpu) |*g| g.capture();
 
     var buf = Buffer{};
-    if (gpu == null) try resize(dpy, visual, depth, use_shm, &buf, w, h);
+    if (gpu == null) try resize(dpy, visual, depth, &use_shm, &buf, w, h);
     buf.width = w;
     buf.height = h;
     defer freeBuffer(dpy, &buf);
@@ -187,6 +200,9 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
             if (x.XFilterEvent(&ev, 0) != 0) continue; // the input method's
             const k = scale;
             switch (ev.type) {
+                // Hidden windows draw nothing: a GPU's present could wait
+                // on a window that never shows.
+                x.UnmapNotify => mapped = false,
                 x.Expose, x.GraphicsExpose => {
                     mapped = true;
                     rend.invalidate();
@@ -197,7 +213,7 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                     if (c.width != w or c.height != h) {
                         w = c.width;
                         h = c.height;
-                        if (gpu == null) try resize(dpy, visual, depth, use_shm, &buf, w, h);
+                        if (gpu == null) try resize(dpy, visual, depth, &use_shm, &buf, w, h);
                         buf.width = w;
                         buf.height = h;
                         rend.invalidate();
@@ -278,7 +294,20 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                 // The whole frame, when anything in it changed.
                 if (rend.damage.items.len > 0) {
                     const t0 = timer.read();
-                    g.draw(&sc, &fonts, w, h) catch |e| std.log.err("myzig: {s} frame: {s}", .{ g.api(), @errorName(e) });
+                    g.draw(&sc, &fonts, w, h) catch |e| {
+                        // The device was lost (a driver reset, a GPU
+                        // unplugged): the window draws on the CPU from now on.
+                        std.log.err("myzig: {s} frame: {s}; drawing on the CPU", .{ g.api(), @errorName(e) });
+                        g.deinit();
+                        gpu = null;
+                        if (glx) |*gx| gx.release(dpy);
+                        glx = null;
+                        rend.raster = true;
+                        try resize(dpy, visual, depth, &use_shm, &buf, w, h);
+                        rend.invalidate();
+                        need_frame = true;
+                        continue;
+                    };
                     if (dump) |path| {
                         backend.writePPM(gpa, g, w, h, path) catch {};
                         return;
@@ -288,6 +317,10 @@ pub fn run(state: anytype, comptime view: fn (@TypeOf(state), *ui.Context) void,
                 }
             } else {
                 presentDamage(dpy, win, gc, &buf, rend.scrolls.items, rend.damage.items, use_shm, &stats, &timer);
+                if (dump) |path| {
+                    writePixels(path, buf.pixels(), w, h, buf.stride) catch {};
+                    return;
+                }
                 presenting = use_shm and rend.damage.items.len > 0;
             }
             if (ctx.animating or ctx.requested) need_frame = true;
@@ -375,11 +408,11 @@ fn presentDamage(dpy: *x.Display, win: x.Window, gc: x.GC, buf: *Buffer, scrolls
     stats.present_ns += timer.read() - t0;
 }
 
-fn resize(dpy: *x.Display, visual: *x.Visual, depth: c_int, use_shm: bool, buf: *Buffer, w: i32, h: i32) !void {
+fn resize(dpy: *x.Display, visual: *x.Visual, depth: c_int, use_shm: *bool, buf: *Buffer, w: i32, h: i32) !void {
     freeBuffer(dpy, buf);
     const uw: c_uint = @intCast(@max(1, w));
     const uh: c_uint = @intCast(@max(1, h));
-    if (use_shm) {
+    if (use_shm.*) shm: {
         const img = x.XShmCreateImage(dpy, visual, @intCast(depth), x.ZPixmap, null, &buf.shm, uw, uh) orelse return error.ShmImage;
         const size: usize = @as(usize, @intCast(img.bytes_per_line)) * uh;
         buf.shm.shmid = x.shmget(x.IPC_PRIVATE, size, x.IPC_CREAT | 0o600);
@@ -387,13 +420,28 @@ fn resize(dpy: *x.Display, visual: *x.Visual, depth: c_int, use_shm: bool, buf: 
         const addr = x.shmat(buf.shm.shmid, null, 0) orelse return error.Shm;
         buf.shm.shmaddr = @ptrCast(addr);
         img.data = @ptrCast(addr);
+        const errors = x_errors;
         _ = x.XShmAttach(dpy, &buf.shm);
         _ = x.XSync(dpy, 0);
         // The segment goes once both sides detach.
         _ = x.shmctl(buf.shm.shmid, x.IPC_RMID, null);
+        if (x_errors != errors) {
+            // The server could not attach it (it is on another machine):
+            // pixels go over the connection from now on.
+            _ = x.shmdt(addr);
+            buf.shm = .{};
+            img.data = null;
+            _ = x.XFree(img);
+            use_shm.* = false;
+            break :shm;
+        }
         buf.img = img;
         buf.stride = @intCast(@divExact(img.bytes_per_line, 4));
-    } else {
+        buf.width = @intCast(uw);
+        buf.height = @intCast(uh);
+        return;
+    }
+    {
         const owned = try std.heap.c_allocator.alloc(u32, uw * uh);
         buf.owned = owned;
         buf.img = x.XCreateImage(dpy, visual, @intCast(depth), x.ZPixmap, 0, @ptrCast(owned.ptr), uw, uh, 32, 0) orelse return error.Image;
@@ -458,6 +506,20 @@ fn mapKey(sym: c_ulong) ui.Key {
         0xff08 => .backspace,
         else => .none,
     };
+}
+
+/// writePixels writes a canvas of 0x00RRGGBB pixels to path, as a PPM
+/// image: what MYZIG_DUMP=path saves of a window's first frame.
+pub fn writePixels(path: []const u8, pixels: []const u32, w: i32, h: i32, stride: usize) !void {
+    var f = try std.fs.cwd().createFile(path, .{});
+    defer f.close();
+    var wbuf: [64 << 10]u8 = undefined;
+    var fw = f.writer(&wbuf);
+    try fw.interface.print("P6\n{d} {d}\n255\n", .{ w, h });
+    for (0..@intCast(h)) |y| for (pixels[y * stride ..][0..@intCast(w)]) |p| {
+        try fw.interface.writeAll(&.{ @truncate(p >> 16), @truncate(p >> 8), @truncate(p) });
+    };
+    try fw.interface.flush();
 }
 
 pub fn printStats(label: []const u8, s: Stats, elapsed_ns: u64) void {

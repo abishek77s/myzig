@@ -53,13 +53,13 @@ pub const Glx = struct {
     /// context makes an OpenGL 3.3 core context current on win.
     pub fn context(g: *Glx, dpy: *x.Display, win: x.Window) !void {
         const Create = *const fn (*x.Display, FBConfig, ?Context, c_int, [*]const c_int) callconv(.c) ?Context;
-        const create: Create = @ptrCast(g.getProcAddress("glXCreateContextAttribsARB") orelse return error.NoCreateContext);
+        const create: Create = @ptrCast(@alignCast(g.getProcAddress("glXCreateContextAttribsARB") orelse return error.NoCreateContext));
         const attrs = [_]c_int{ 0x2091, 3, 0x2092, 3, 0x9126, 1, 0 };
         g.ctx = create(dpy, g.fbc.?, null, 1, &attrs) orelse return error.CreateContext;
         if (g.makeCurrent(dpy, win, g.ctx) == 0) return error.MakeCurrent;
         // Vsync where the driver has it; the loop paces frames anyway.
         const Interval = *const fn (*x.Display, x.Window, c_int) callconv(.c) void;
-        if (g.getProcAddress("glXSwapIntervalEXT")) |p| @as(Interval, @ptrCast(p))(dpy, win, 1);
+        if (g.getProcAddress("glXSwapIntervalEXT")) |p| @as(Interval, @ptrCast(@alignCast(p)))(dpy, win, 1);
     }
 
     pub fn release(g: *Glx, dpy: *x.Display) void {

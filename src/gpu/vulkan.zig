@@ -1,7 +1,8 @@
 //! The Vulkan renderer: instances.zig's scene as one instanced draw, the
 //! same shader as OpenGL's compiled to SPIR-V (gpu/shaders). It draws to a
-//! window's swapchain, X11's through VK_KHR_xlib_surface and Windows'
-//! through VK_KHR_win32_surface, or to an image of its own when there is
+//! window's swapchain (X11's through VK_KHR_xlib_surface, Windows' through
+//! VK_KHR_win32_surface, a CAMetalLayer through MoltenVK's
+//! VK_EXT_metal_surface), or to an image of its own when there is
 //! no window (tests, and frames read back).
 //!
 //! Two frames are in flight: each has its command buffer, fence, the
@@ -23,6 +24,8 @@ const frag_spv align(4) = @embedFile("shaders/box.frag.spv").*;
 pub const Surface = union(enum) {
     xlib: struct { dpy: *anyopaque, window: c_ulong },
     win32: struct { hinstance: *anyopaque, hwnd: *anyopaque },
+    /// metal draws to a CAMetalLayer, through MoltenVK on macOS.
+    metal: struct { layer: *anyopaque },
     /// offscreen draws to an image of the renderer's, read with read().
     offscreen,
 };
@@ -190,7 +193,16 @@ pub const Renderer = struct {
     fn openLoader() !std.DynLib {
         const names: []const []const u8 = switch (builtin.os.tag) {
             .windows => &.{"vulkan-1.dll"},
-            .macos => &.{ "libvulkan.1.dylib", "libMoltenVK.dylib" },
+            // The loader, else MoltenVK itself; Homebrew's prefixes are
+            // not on dlopen's default path.
+            .macos => &.{
+                "libvulkan.1.dylib",
+                "/opt/homebrew/lib/libvulkan.1.dylib",
+                "/usr/local/lib/libvulkan.1.dylib",
+                "libMoltenVK.dylib",
+                "/opt/homebrew/lib/libMoltenVK.dylib",
+                "/usr/local/lib/libMoltenVK.dylib",
+            },
             else => &.{ "libvulkan.so.1", "libvulkan.so" },
         };
         for (names) |n| return std.DynLib.open(n) catch continue;
@@ -211,16 +223,20 @@ pub const Renderer = struct {
                 return g(null, n);
             }
         }.p);
-        var exts: [2][*:0]const u8 = undefined;
+        var exts: [3][*:0]const u8 = undefined;
         var n_ext: u32 = 0;
         switch (surface) {
             .xlib => {
-                exts = .{ "VK_KHR_surface", "VK_KHR_xlib_surface" };
+                exts[0..2].* = .{ "VK_KHR_surface", "VK_KHR_xlib_surface" };
                 n_ext = 2;
             },
             .win32 => {
-                exts = .{ "VK_KHR_surface", "VK_KHR_win32_surface" };
+                exts[0..2].* = .{ "VK_KHR_surface", "VK_KHR_win32_surface" };
                 n_ext = 2;
+            },
+            .metal => {
+                exts = .{ "VK_KHR_surface", "VK_EXT_metal_surface", "VK_KHR_portability_enumeration" };
+                n_ext = 3;
             },
             .offscreen => {},
         }
@@ -231,6 +247,7 @@ pub const Renderer = struct {
             .enabled_extension_count = n_ext,
             .pp_enabled_extension_names = &exts,
         };
+        if (surface == .metal) info.flags = vk.INSTANCE_CREATE_ENUMERATE_PORTABILITY;
         if (opts.validation) {
             info.enabled_layer_count = 1;
             info.pp_enabled_layer_names = &layers;
@@ -241,7 +258,15 @@ pub const Renderer = struct {
             std.log.warn("myzig: no Vulkan validation layer", .{});
             info.enabled_layer_count = 0;
         }
-        try vk.check(base.CreateInstance(&info, null, &r.instance));
+        var res = base.CreateInstance(&info, null, &r.instance);
+        if (res != vk.SUCCESS and surface == .metal) {
+            // MoltenVK without the loader lists itself without the
+            // portability extension.
+            info.flags = 0;
+            info.enabled_extension_count = 2;
+            res = base.CreateInstance(&info, null, &r.instance);
+        }
+        try vk.check(res);
         r.i = try vk.load(vk.InstanceFns, r, instanceProc);
     }
 
@@ -254,6 +279,10 @@ pub const Renderer = struct {
             .win32 => |s| {
                 const f = r.i.CreateWin32SurfaceKHR orelse return error.NoSurface;
                 try vk.check(f(r.instance, &.{ .hinstance = s.hinstance, .hwnd = s.hwnd }, null, &r.surface));
+            },
+            .metal => |s| {
+                const f = r.i.CreateMetalSurfaceEXT orelse return error.NoSurface;
+                try vk.check(f(r.instance, &.{ .layer = s.layer }, null, &r.surface));
             },
             .offscreen => {},
         }

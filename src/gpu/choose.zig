@@ -1,12 +1,12 @@
-//! Which renderer a window draws with: MYZIG_RENDERER=cpu, gl or vulkan,
-//! or by default a GPU's where there is one (Vulkan, else OpenGL) and the
-//! CPU's elsewhere.
+//! Which renderer a window draws with: MYZIG_RENDERER=cpu, gl, vulkan or
+//! metal, or by default a GPU's where there is one (Metal on macOS; Vulkan,
+//! else OpenGL, elsewhere) and the CPU's where there is none.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const env = @import("../env.zig");
 
-pub const Kind = enum { cpu, gl, vulkan };
+pub const Kind = enum { cpu, gl, vulkan, metal };
 
 pub const Choice = struct {
     kind: Kind,
@@ -20,7 +20,10 @@ pub fn choose() Choice {
         if (std.mem.eql(u8, v, "cpu")) return .{ .kind = .cpu, .forced = true };
         if (std.mem.eql(u8, v, "gl") or std.mem.eql(u8, v, "opengl")) return .{ .kind = .gl, .forced = true };
         if (std.mem.eql(u8, v, "vulkan") or std.mem.eql(u8, v, "vk")) return .{ .kind = .vulkan, .forced = true };
+        if (std.mem.eql(u8, v, "metal")) return .{ .kind = .metal, .forced = true };
     }
+    // Every Mac MyZig runs on has Metal; OpenGL there is deprecated.
+    if (builtin.os.tag == .macos) return .{ .kind = .metal, .forced = false };
     // Vulkan first; the window falls back to OpenGL, then to the CPU.
     return .{ .kind = if (hasGpu()) .vulkan else .cpu, .forced = false };
 }

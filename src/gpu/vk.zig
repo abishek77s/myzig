@@ -83,6 +83,7 @@ pub const StructureType = enum(i32) {
     present_info_khr = 1000001001,
     xlib_surface_create_info_khr = 1000004000,
     win32_surface_create_info_khr = 1000009000,
+    metal_surface_create_info_ext = 1000217000,
 };
 
 pub const Extent2D = extern struct { width: u32, height: u32 };
@@ -128,6 +129,17 @@ pub const Win32SurfaceCreateInfoKHR = extern struct {
     hinstance: *anyopaque,
     hwnd: *anyopaque,
 };
+
+pub const MetalSurfaceCreateInfoEXT = extern struct {
+    s_type: StructureType = .metal_surface_create_info_ext,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    layer: *anyopaque,
+};
+
+/// INSTANCE_CREATE_ENUMERATE_PORTABILITY lists drivers that implement
+/// Vulkan over another API (MoltenVK over Metal).
+pub const INSTANCE_CREATE_ENUMERATE_PORTABILITY: Flags = 1;
 
 pub const PhysicalDeviceType = enum(i32) { other = 0, integrated_gpu = 1, discrete_gpu = 2, virtual_gpu = 3, cpu = 4, _ };
 
@@ -733,6 +745,7 @@ pub const InstanceFns = struct {
     DestroySurfaceKHR: ?*const fn (Instance, SurfaceKHR, ?*const anyopaque) callconv(CC) void,
     CreateXlibSurfaceKHR: ?*const fn (Instance, *const XlibSurfaceCreateInfoKHR, ?*const anyopaque, *SurfaceKHR) callconv(CC) Result,
     CreateWin32SurfaceKHR: ?*const fn (Instance, *const Win32SurfaceCreateInfoKHR, ?*const anyopaque, *SurfaceKHR) callconv(CC) Result,
+    CreateMetalSurfaceEXT: ?*const fn (Instance, *const MetalSurfaceCreateInfoEXT, ?*const anyopaque, *SurfaceKHR) callconv(CC) Result,
 };
 
 /// DeviceFns holds the functions of a device; the swapchain ones are there
@@ -812,12 +825,12 @@ pub fn load(comptime T: type, ctx: anytype, comptime proc: anytype) !T {
     inline for (std.meta.fields(T)) |f| {
         const p = proc(ctx, "vk" ++ f.name);
         if (@typeInfo(f.type) == .optional) {
-            @field(t, f.name) = if (p) |q| @ptrCast(q) else null;
+            @field(t, f.name) = if (p) |q| @ptrCast(@alignCast(q)) else null;
         } else {
-            @field(t, f.name) = @ptrCast(p orelse {
+            @field(t, f.name) = @ptrCast(@alignCast(p orelse {
                 std.log.err("myzig: Vulkan has no vk{s}", .{f.name});
                 return error.MissingFunction;
-            });
+            }));
         }
     }
     return t;

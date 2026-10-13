@@ -29,9 +29,10 @@ pub const app = @import("app.zig");
 pub const WindowOptions = app.WindowOptions;
 
 /// run opens a window showing view of state and runs the app until it
-/// closes: X11 on Linux and the BSDs, Win32 on Windows.
+/// closes: X11 on Linux and the BSDs, Win32 on Windows, Cocoa on macOS.
 pub const run = switch (@import("builtin").os.tag) {
     .windows => @import("win32.zig").run,
+    .macos => @import("macos.zig").run,
     else => app.run,
 };
 
@@ -40,6 +41,7 @@ test {
     _ = raster;
     _ = @import("gpu/instances.zig");
     _ = @import("gpu/vulkan.zig");
+    if (@import("builtin").os.tag == .macos) _ = @import("gpu/metal.zig");
     _ = ui;
     _ = scene;
     _ = text;

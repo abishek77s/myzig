@@ -1,16 +1,29 @@
-//! Gpu is the renderer a window draws with on the GPU: OpenGL's or
-//! Vulkan's, the same scene and shader either way. The window keeps the
+//! Gpu is the renderer a window draws with on the GPU: OpenGL's, Vulkan's
+//! or Metal's, the same scene and shader either way. The window keeps the
 //! platform's side (the GLX or WGL context OpenGL presents with).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const scene = @import("../scene.zig");
 const text = @import("../text.zig");
 pub const glr = @import("gl.zig");
 pub const vulkan = @import("vulkan.zig");
+/// metal is Metal's renderer on macOS, and nothing elsewhere.
+pub const metal = if (builtin.os.tag == .macos) @import("metal.zig") else struct {
+    pub const Renderer = struct {
+        pub fn deinit(_: *Renderer) void {}
+        pub fn name(_: *const Renderer) []const u8 {
+            return "";
+        }
+        pub fn draw(_: *Renderer, _: *const scene.Scene, _: *text.Fonts, _: i32, _: i32) !void {}
+        pub fn read(_: *Renderer, _: i32, _: i32, _: []u32) void {}
+    };
+};
 
 pub const Gpu = union(enum) {
     gl: glr.Renderer,
     vulkan: vulkan.Renderer,
+    metal: metal.Renderer,
 
     pub fn deinit(g: *Gpu) void {
         switch (g.*) {
@@ -18,11 +31,12 @@ pub const Gpu = union(enum) {
         }
     }
 
-    /// api names the API: "OpenGL" or "Vulkan".
+    /// api names the API: "OpenGL", "Vulkan" or "Metal".
     pub fn api(g: *const Gpu) []const u8 {
         return switch (g.*) {
             .gl => "OpenGL",
             .vulkan => "Vulkan",
+            .metal => "Metal",
         };
     }
 
@@ -37,10 +51,11 @@ pub const Gpu = union(enum) {
         return switch (g.*) {
             .gl => |*r| glr.software(r.name()),
             .vulkan => |*r| r.software(),
+            .metal => false,
         };
     }
 
-    /// draw draws s, width×height pixels. Vulkan also presents; OpenGL's
+    /// draw draws s, width×height pixels. Vulkan and Metal also present; OpenGL's
     /// frame is presented by the window's context (swapBuffers).
     pub fn draw(g: *Gpu, s: *const scene.Scene, fonts: *text.Fonts, width: i32, height: i32) !void {
         switch (g.*) {
@@ -53,6 +68,9 @@ pub const Gpu = union(enum) {
         switch (g.*) {
             .gl => {},
             .vulkan => |*r| r.capture = true,
+            .metal => |*r| if (builtin.os.tag == .macos) {
+                r.capture = true;
+            },
         }
     }
 
