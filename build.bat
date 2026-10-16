@@ -13,7 +13,7 @@ where cl >nul 2>nul || (echo [error: MSVC cl.exe not found] & exit /b 1)
 :have_cl
 
 set rad=..\..\raddebugger\src
-set common=/I%rad% /nologo /FC /Z7 /Zc:preprocessor /W3 /wd4244 /wd4305 /wd4267 /wd4018 /wd4146
+set common=/I%rad% /I.. /nologo /FC /Z7 /Zc:preprocessor /W3 /wd4244 /wd4305 /wd4267 /wd4018 /wd4146
 if "%1"=="release" (set opts=/O2 /DBUILD_DEBUG=0) else (set opts=/Od /Ob1 /DBUILD_DEBUG=1)
 
 if not exist build mkdir build
