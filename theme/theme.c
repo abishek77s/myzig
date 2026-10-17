@@ -75,6 +75,10 @@ th_theme_from_kind(TH_Kind kind)
       c->element_background                = th_rgba(0x2e343eff);
       c->element_selection_background      = th_rgba(0x74ade83d); // players[0].selection
       c->search_match_background           = th_rgba(0x74ade866);
+      c->search_active_match_background    = th_rgba(0xe8af7466);
+      c->ghost_element_hover               = th_rgba(0x363c46ff);
+      c->text_placeholder                  = th_rgba(0x878a98ff);
+      c->border_focused                    = th_rgba(0x47679eff);
       c->scrollbar_thumb_background        = th_rgba(0xc8ccd44c);
       c->scrollbar_thumb_hover_background  = th_rgba(0x363c46ff);
       c->scrollbar_thumb_active_background = th_rgba(0xc8ccd480);
@@ -126,6 +130,10 @@ th_theme_from_kind(TH_Kind kind)
       c->element_background                = th_rgba(0xebebecff);
       c->element_selection_background      = th_rgba(0x5c78e23d);
       c->search_match_background           = th_rgba(0x5c79e266);
+      c->search_active_match_background    = th_rgba(0xd0a92366);
+      c->ghost_element_hover               = th_rgba(0xdfdfe0ff);
+      c->text_placeholder                  = th_rgba(0x7e8086ff);
+      c->border_focused                    = th_rgba(0x7d82e8ff);
       c->scrollbar_thumb_background        = th_rgba(0x383a414c);
       c->scrollbar_thumb_hover_background  = th_rgba(0xdfdfe0ff);
       c->scrollbar_thumb_active_background = th_rgba(0x383a4180);

@@ -56,6 +56,7 @@ md_style_preview(TH_Theme *theme, MD_Fonts *fonts, F32 rem, F32 scale)
 internal FNT_Tag
 md_font_tag(MD_Fonts *fonts, MD_FontFamily family, B32 bold, B32 italic)
 {
+  if(family == MD_FontFamily_Symbol) { return fonts->symbols; }
   if(family == MD_FontFamily_Mono)
   {
     if(bold && italic) { return fonts->mono_bold_italic; }
@@ -130,23 +131,576 @@ md_base64_decode(Arena *arena, String8 s)
   return str8(out, n);
 }
 
+internal String8
+md_percent_decode(Arena *arena, String8 s)
+{
+  U8 *out = push_array_no_zero(arena, U8, s.size + 1);
+  U64 n = 0;
+  for(U64 i = 0; i < s.size; i += 1)
+  {
+    if(s.str[i] == '%' && i+2 < s.size && char_is_digit(s.str[i+1], 16) && char_is_digit(s.str[i+2], 16))
+    {
+      out[n++] = (U8)u64_from_str8(str8_substr(s, r1u64(i+1, i+3)), 16);
+      i += 2;
+      continue;
+    }
+    out[n++] = s.str[i];
+  }
+  return str8(out, n);
+}
+
+//- Remote images. gpui's image cache fetches URIs on a background executor;
+// here each URL gets one download thread, and the bytes are kept for the
+// session so reloading the file doesn't fetch them again. A finished download
+// wakes the frame loop, and the view rebuilds its element.
+
+typedef struct MD_Download MD_Download;
+struct MD_Download
+{
+  MD_Download *next;
+  String8 url;
+  Arena *arena;
+  String8 bytes;
+  B32 done;
+  Thread thread;
+  B32 detached;
+};
+
+global Mutex md_download_mutex = {0};
+global MD_Download *md_first_download = 0;
+global Arena *md_download_arena = 0;
+global U64 md_download_finish_count = 0;
+global U64 md_download_seen_count = 0;
+
+#if OS_WINDOWS
+#include <winhttp.h>
+#pragma comment(lib, "winhttp")
+
+internal String8
+md_http_get(Arena *arena, String8 url)
+{
+  String8 result = {0};
+  Temp scratch = scratch_begin(&arena, 1);
+  U64 hash = str8_find_needle(url, 0, str8_lit("#"), 0);
+  String16 url16 = str16_from_8(scratch.arena, str8_prefix(url, hash));
+  URL_COMPONENTS parts = {0};
+  parts.dwStructSize = sizeof(parts);
+  parts.dwHostNameLength = (DWORD)-1;
+  parts.dwUrlPathLength = (DWORD)-1;
+  parts.dwExtraInfoLength = (DWORD)-1;
+  HINTERNET session = 0, connect = 0, request = 0;
+  if(url16.size && WinHttpCrackUrl((WCHAR *)url16.str, (DWORD)url16.size, 0, &parts) && parts.lpszHostName && parts.dwHostNameLength)
+  {
+    WCHAR *host = push_array(scratch.arena, WCHAR, parts.dwHostNameLength + 1);
+    MemoryCopy(host, parts.lpszHostName, parts.dwHostNameLength*sizeof(WCHAR));
+    // the path runs on through the query to the end of the (fragment-less) URL
+    WCHAR *path = (parts.lpszUrlPath && parts.dwUrlPathLength) ? parts.lpszUrlPath : L"/";
+    session = WinHttpOpen(L"mdview/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if(session == 0) { session = WinHttpOpen(L"mdview/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0); }
+    if(session)
+    {
+      WinHttpSetTimeouts(session, 10000, 10000, 15000, 30000);
+      connect = WinHttpConnect(session, host, parts.nPort, 0);
+    }
+    if(connect)
+    {
+      DWORD flags = (parts.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+      request = WinHttpOpenRequest(connect, L"GET", path, 0, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    }
+    if(request)
+    {
+      DWORD decompression = WINHTTP_DECOMPRESSION_FLAG_ALL;
+      WinHttpSetOption(request, WINHTTP_OPTION_DECOMPRESSION, &decompression, sizeof(decompression));
+      DWORD status = 0;
+      DWORD status_size = sizeof(status);
+      if(WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+         WinHttpReceiveResponse(request, 0) &&
+         WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX) &&
+         status >= 200 && status < 300)
+      {
+        String8List pieces = {0};
+        U64 total = 0;
+        for(;total < MB(32);)
+        {
+          DWORD available = 0;
+          if(!WinHttpQueryDataAvailable(request, &available) || available == 0) { break; }
+          U8 *buffer = push_array_no_zero(scratch.arena, U8, available);
+          DWORD read = 0;
+          if(!WinHttpReadData(request, buffer, available, &read) || read == 0) { break; }
+          str8_list_push(scratch.arena, &pieces, str8(buffer, read));
+          total += read;
+        }
+        result = str8_list_join(arena, &pieces, 0);
+      }
+    }
+  }
+  if(request) { WinHttpCloseHandle(request); }
+  if(connect) { WinHttpCloseHandle(connect); }
+  if(session) { WinHttpCloseHandle(session); }
+  scratch_end(scratch);
+  return result;
+}
+#else
+internal String8
+md_http_get(Arena *arena, String8 url)
+{
+  return str8_zero();
+}
+#endif
+
+internal void
+md_download_thread(void *p)
+{
+  MD_Download *d = (MD_Download *)p;
+  set_thread_name(str8_lit("[mdview] image download"));
+  Arena *arena = arena_alloc();
+  String8 bytes = md_http_get(arena, d->url);
+  MutexScope(md_download_mutex)
+  {
+    d->arena = arena;
+    d->bytes = bytes;
+    d->done = 1;
+    md_download_finish_count += 1;
+  }
+  wm_send_wakeup_event();
+}
+
+// Returns the download of a URL, starting it on first request.
+internal MD_Download *
+md_download_from_url(String8 url)
+{
+  if(md_download_arena == 0)
+  {
+    md_download_arena = arena_alloc();
+    md_download_mutex = mutex_alloc();
+  }
+  MD_Download *d = 0;
+  for(MD_Download *n = md_first_download; n != 0; n = n->next)
+  {
+    if(str8_match(n->url, url, 0)) { d = n; break; }
+  }
+  if(d == 0)
+  {
+    d = push_array(md_download_arena, MD_Download, 1);
+    d->url = push_str8_copy(md_download_arena, url);
+    MutexScope(md_download_mutex) { SLLStackPush(md_first_download, d); }
+    // detached only once done: the thread entity carries `d` to the new
+    // thread, and a detached entity can be reused before the thread reads it
+    d->thread = thread_launch(md_download_thread, d);
+  }
+  return d;
+}
+
+// True once per batch of finished downloads: the element must be rebuilt.
+internal B32
+md_images_poll(void)
+{
+  if(md_download_arena == 0) { return 0; }
+  B32 changed = 0;
+  MutexScope(md_download_mutex)
+  {
+    changed = (md_download_finish_count != md_download_seen_count);
+    md_download_seen_count = md_download_finish_count;
+    for(MD_Download *d = md_first_download; d != 0; d = d->next)
+    {
+      if(d->done && !d->detached) { thread_detach(d->thread); d->detached = 1; }
+    }
+  }
+  return changed;
+}
+
+//- SVG. Zed rasterizes SVGs with resvg; nanosvg covers the shapes, and since
+// it draws no text, <text> elements are collected here and drawn over the
+// image with the UI font (that is what badges are made of).
+
+internal String8 md_html_attr(String8 tag, String8 name);
+
+internal B32
+md_bytes_are_svg(String8 bytes)
+{
+  String8 head = str8_prefix(bytes, 4096);
+  return (str8_find_needle(head, 0, str8_lit("<svg"), StringMatchFlag_CaseInsensitive) < head.size);
+}
+
+// An attribute, or the same property in the style attribute.
+internal String8
+md_svg_attr(String8 tag, String8 name)
+{
+  String8 style = md_html_attr(tag, str8_lit("style"));
+  for(U64 i = 0; i < style.size;)
+  {
+    U64 semi = str8_find_needle(style, i, str8_lit(";"), 0);
+    String8 decl = str8_substr(style, r1u64(i, semi));
+    i = semi + 1;
+    U64 colon = str8_find_needle(decl, 0, str8_lit(":"), 0);
+    if(colon >= decl.size) { continue; }
+    if(str8_match(str8_skip_chop_whitespace(str8_prefix(decl, colon)), name, StringMatchFlag_CaseInsensitive))
+    {
+      return str8_skip_chop_whitespace(str8_skip(decl, colon+1));
+    }
+  }
+  return md_html_attr(tag, name);
+}
+
+// Reads up to `max` numbers separated by spaces or commas.
+internal U64
+md_svg_numbers(String8 s, F32 *out, U64 max)
+{
+  U64 count = 0;
+  for(U64 i = 0; i < s.size && count < max;)
+  {
+    U8 c = s.str[i];
+    if(char_is_space(c) || c == ',') { i += 1; continue; }
+    U64 e = i;
+    if(e < s.size && (s.str[e] == '-' || s.str[e] == '+')) { e += 1; }
+    for(;e < s.size && (char_is_digit(s.str[e], 10) || s.str[e] == '.'); e += 1);
+    if(e < s.size && (s.str[e] == 'e' || s.str[e] == 'E'))
+    {
+      e += 1;
+      if(e < s.size && (s.str[e] == '-' || s.str[e] == '+')) { e += 1; }
+      for(;e < s.size && char_is_digit(s.str[e], 10); e += 1);
+    }
+    if(e == i) { break; }
+    out[count++] = (F32)f64_from_str8(str8_substr(s, r1u64(i, e)));
+    i = e;
+  }
+  return count;
+}
+
+internal F32
+md_svg_number(String8 s, F32 fallback)
+{
+  F32 v = 0;
+  return md_svg_numbers(s, &v, 1) ? v : fallback;
+}
+
+// #rgb, #rrggbb, rgb(..), a few names; 0 when the value is not a color.
+internal B32
+md_svg_color(String8 s, Vec4F32 *out)
+{
+  s = str8_skip_chop_whitespace(s);
+  if(s.size == 0) { return 0; }
+  if(s.str[0] == '#')
+  {
+    String8 hex = str8_skip(s, 1);
+    if(hex.size == 3)
+    {
+      U8 buf[6] = {hex.str[0], hex.str[0], hex.str[1], hex.str[1], hex.str[2], hex.str[2]};
+      hex = str8(buf, 6);
+      U32 v = (U32)u64_from_str8(hex, 16);
+      *out = v4f32(((v >> 16) & 0xff)/255.f, ((v >> 8) & 0xff)/255.f, (v & 0xff)/255.f, 1);
+      return 1;
+    }
+    if(hex.size >= 6)
+    {
+      U32 v = (U32)u64_from_str8(str8_prefix(hex, 6), 16);
+      *out = v4f32(((v >> 16) & 0xff)/255.f, ((v >> 8) & 0xff)/255.f, (v & 0xff)/255.f, 1);
+      return 1;
+    }
+    return 0;
+  }
+  if(str8_match(str8_prefix(s, 4), str8_lit("rgb("), StringMatchFlag_CaseInsensitive))
+  {
+    F32 v[3] = {0};
+    md_svg_numbers(str8_skip(s, 4), v, 3);
+    *out = v4f32(v[0]/255.f, v[1]/255.f, v[2]/255.f, 1);
+    return 1;
+  }
+  local_persist struct { char *name; U32 rgb; } names[] =
+  {
+    {"black", 0x000000}, {"white", 0xffffff}, {"red", 0xff0000}, {"green", 0x008000},
+    {"blue", 0x0000ff}, {"gray", 0x808080}, {"grey", 0x808080}, {"silver", 0xc0c0c0},
+    {"yellow", 0xffff00}, {"orange", 0xffa500}, {"purple", 0x800080}, {"navy", 0x000080},
+  };
+  for EachElement(i, names)
+  {
+    if(str8_match(s, str8_cstring(names[i].name), StringMatchFlag_CaseInsensitive))
+    {
+      U32 v = names[i].rgb;
+      *out = v4f32(((v >> 16) & 0xff)/255.f, ((v >> 8) & 0xff)/255.f, (v & 0xff)/255.f, 1);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+typedef struct MD_SvgState MD_SvgState;
+struct MD_SvgState
+{
+  F32 m[6];                      // affine: x' = a*x + c*y + e, y' = b*x + d*y + f
+  Vec4F32 fill;
+  B32 no_fill;
+  F32 opacity;
+  F32 font_size;
+  MD_Align anchor;
+  B32 bold;
+};
+
+internal void
+md_svg_mul(F32 *m, F32 *t)
+{
+  F32 r[6];
+  r[0] = m[0]*t[0] + m[2]*t[1];
+  r[1] = m[1]*t[0] + m[3]*t[1];
+  r[2] = m[0]*t[2] + m[2]*t[3];
+  r[3] = m[1]*t[2] + m[3]*t[3];
+  r[4] = m[0]*t[4] + m[2]*t[5] + m[4];
+  r[5] = m[1]*t[4] + m[3]*t[5] + m[5];
+  MemoryCopy(m, r, sizeof(r));
+}
+
+internal void
+md_svg_apply_transform(F32 *m, String8 s)
+{
+  for(U64 i = 0; i < s.size;)
+  {
+    U64 open = str8_find_needle(s, i, str8_lit("("), 0);
+    U64 close = str8_find_needle(s, open, str8_lit(")"), 0);
+    if(open >= s.size || close >= s.size) { break; }
+    String8 name = str8_skip_chop_whitespace(str8_substr(s, r1u64(i, open)));
+    for(;name.size && (name.str[0] == ',' || char_is_space(name.str[0]));) { name = str8_skip(name, 1); }
+    F32 v[6] = {0};
+    U64 n = md_svg_numbers(str8_substr(s, r1u64(open+1, close)), v, 6);
+    F32 t[6] = {1, 0, 0, 1, 0, 0};
+    if(str8_match(name, str8_lit("translate"), 0)) { t[4] = v[0]; t[5] = (n > 1) ? v[1] : 0; }
+    else if(str8_match(name, str8_lit("scale"), 0)) { t[0] = v[0]; t[3] = (n > 1) ? v[1] : v[0]; }
+    else if(str8_match(name, str8_lit("matrix"), 0) && n == 6) { MemoryCopy(t, v, sizeof(t)); }
+    md_svg_mul(m, t);
+    i = close + 1;
+  }
+}
+
+internal void
+md_svg_state_apply(MD_SvgState *s, String8 tag)
+{
+  String8 v;
+  v = md_svg_attr(tag, str8_lit("transform"));
+  if(v.size) { md_svg_apply_transform(s->m, v); }
+  v = md_svg_attr(tag, str8_lit("fill"));
+  if(v.size)
+  {
+    if(str8_match(v, str8_lit("none"), StringMatchFlag_CaseInsensitive)) { s->no_fill = 1; }
+    else if(md_svg_color(v, &s->fill)) { s->no_fill = 0; }
+  }
+  v = md_svg_attr(tag, str8_lit("fill-opacity"));
+  if(v.size) { s->fill.w = Clamp(0, md_svg_number(v, 1), 1); }
+  v = md_svg_attr(tag, str8_lit("opacity"));
+  if(v.size) { s->opacity *= Clamp(0, md_svg_number(v, 1), 1); }
+  v = md_svg_attr(tag, str8_lit("font-size"));
+  if(v.size) { s->font_size = md_svg_number(v, s->font_size); }
+  v = md_svg_attr(tag, str8_lit("text-anchor"));
+  if(str8_match(v, str8_lit("middle"), 0)) { s->anchor = MD_Align_Center; }
+  else if(str8_match(v, str8_lit("end"), 0)) { s->anchor = MD_Align_Right; }
+  else if(str8_match(v, str8_lit("start"), 0)) { s->anchor = MD_Align_Left; }
+  v = md_svg_attr(tag, str8_lit("font-weight"));
+  if(v.size) { s->bold = str8_match(v, str8_lit("bold"), 0) || str8_match(v, str8_lit("bolder"), 0) || md_svg_number(v, 400) >= 600; }
+}
+
+internal void
+md_svg_collect_texts(Arena *arena, MD_Image *img, String8 src, F32 width, F32 height)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+  MD_SvgState stack[64];
+  U64 depth = 0;
+  MD_SvgState base = {{1, 0, 0, 1, 0, 0}};
+  base.fill = v4f32(0, 0, 0, 1);
+  base.opacity = 1;
+  base.font_size = 16;
+  base.anchor = MD_Align_Left;
+  stack[depth++] = base;
+  U64 skip_depth = 0;            // inside <title>, <defs>, ...: no text is drawn
+  MD_SvgText *last = 0;
+  for(U64 i = 0; i < src.size;)
+  {
+    U64 lt = str8_find_needle(src, i, str8_lit("<"), 0);
+    if(lt >= src.size) { break; }
+    if(str8_match(str8_prefix(str8_skip(src, lt), 4), str8_lit("<!--"), 0))
+    {
+      U64 e = str8_find_needle(src, lt+4, str8_lit("-->"), 0);
+      i = e + 3;
+      continue;
+    }
+    U64 gt = str8_find_needle(src, lt, str8_lit(">"), 0);
+    if(gt >= src.size) { break; }
+    String8 tag = str8_substr(src, r1u64(lt, gt+1));
+    i = gt + 1;
+    if(tag.size < 3 || tag.str[1] == '!' || tag.str[1] == '?') { continue; }
+    B32 closing = (tag.str[1] == '/');
+    B32 self_closing = (tag.str[tag.size-2] == '/');
+    U64 ns = closing ? 2 : 1, ne = ns;
+    for(;ne < tag.size && !char_is_space(tag.str[ne]) && tag.str[ne] != '>' && tag.str[ne] != '/'; ne += 1);
+    String8 name = str8_substr(tag, r1u64(ns, ne));
+    B32 hidden = (str8_match(name, str8_lit("title"), 0) || str8_match(name, str8_lit("desc"), 0) ||
+                  str8_match(name, str8_lit("defs"), 0) || str8_match(name, str8_lit("style"), 0) ||
+                  str8_match(name, str8_lit("script"), 0) || str8_match(name, str8_lit("clipPath"), 0) ||
+                  str8_match(name, str8_lit("mask"), 0) || str8_match(name, str8_lit("symbol"), 0) ||
+                  str8_match(name, str8_lit("metadata"), 0));
+    if(closing)
+    {
+      if(depth > 1) { depth -= 1; }
+      if(skip_depth && depth < skip_depth) { skip_depth = 0; }
+      continue;
+    }
+    if(self_closing) { continue; }
+    MD_SvgState s = stack[Min(depth, ArrayCount(stack))-1];
+    md_svg_state_apply(&s, tag);
+    if(depth < ArrayCount(stack)) { stack[depth] = s; }
+    depth += 1;
+    if(hidden && skip_depth == 0) { skip_depth = depth; }
+    if(!str8_match(name, str8_lit("text"), 0) || skip_depth) { continue; }
+
+    //- <text>: its content, with <tspan>s flattened; the first tspan's x/y
+    // stand in when the text has none
+    U64 end = str8_find_needle(src, i, str8_lit("</text"), 0);
+    String8 body = str8_substr(src, r1u64(i, end));
+    String8 x_attr = md_html_attr(tag, str8_lit("x"));
+    String8 y_attr = md_html_attr(tag, str8_lit("y"));
+    String8List parts = {0};
+    for(U64 k = 0; k < body.size;)
+    {
+      if(body.str[k] == '<')
+      {
+        U64 e = str8_find_needle(body, k, str8_lit(">"), 0);
+        String8 inner = str8_substr(body, r1u64(k, e+1));
+        if(!x_attr.size) { x_attr = md_html_attr(inner, str8_lit("x")); }
+        if(!y_attr.size) { y_attr = md_html_attr(inner, str8_lit("y")); }
+        if(inner.size > 1 && inner.str[1] != '/') { md_svg_state_apply(&s, inner); }
+        k = e + 1;
+        continue;
+      }
+      U64 e = str8_find_needle(body, k, str8_lit("<"), 0);
+      String8 raw = str8_substr(body, r1u64(k, e));
+      k = e;
+      U8 *out = push_array_no_zero(scratch.arena, U8, raw.size*4 + 1);
+      U64 n = 0;
+      for(U64 j = 0; j < raw.size; j += 1)
+      {
+        U8 c = raw.str[j];
+        if(char_is_space(c)) { if(n == 0 || out[n-1] != ' ') { out[n++] = ' '; } continue; }
+        if(c == '&')
+        {
+          U8 buf[8]; U64 sz = 0;
+          U64 used = md_parse_entity(raw, j, buf, &sz);
+          if(used) { MemoryCopy(out+n, buf, sz); n += sz; j += used-1; continue; }
+        }
+        out[n++] = c;
+      }
+      str8_list_push(scratch.arena, &parts, str8(out, n));
+    }
+    i = (end < src.size) ? end : src.size; // its </text> pops the state
+    String8 string = str8_skip_chop_whitespace(str8_list_join(scratch.arena, &parts, 0));
+    if(string.size == 0 || s.no_fill) { continue; }
+    F32 x = md_svg_number(x_attr, 0);
+    F32 y = md_svg_number(y_attr, 0);
+    MD_SvgText *t = push_array(arena, MD_SvgText, 1);
+    t->string = push_str8_copy(arena, string);
+    t->pos = v2f32(s.m[0]*x + s.m[2]*y + s.m[4], s.m[1]*x + s.m[3]*y + s.m[5]);
+    t->font_size = s.font_size*sqrt_f32(abs_f32(s.m[0]*s.m[3] - s.m[1]*s.m[2]));
+    t->color = s.fill;
+    t->color.w *= s.opacity;
+    t->anchor = s.anchor;
+    t->bold = s.bold;
+    if(last) { last->next = t; } else { img->first_text = t; }
+    last = t;
+  }
+
+  //- the root viewBox maps user units onto the image (xMidYMid meet)
+  {
+    U64 svg_at = str8_find_needle(src, 0, str8_lit("<svg"), StringMatchFlag_CaseInsensitive);
+    U64 svg_end = str8_find_needle(src, svg_at, str8_lit(">"), 0);
+    String8 svg_tag = str8_substr(src, r1u64(svg_at, svg_end+1));
+    F32 vb[4] = {0};
+    if(md_svg_numbers(md_html_attr(svg_tag, str8_lit("viewBox")), vb, 4) == 4 && vb[2] > 0 && vb[3] > 0)
+    {
+      F32 k = Min(width/vb[2], height/vb[3]);
+      F32 tx = (width - vb[2]*k)/2 - vb[0]*k;
+      F32 ty = (height - vb[3]*k)/2 - vb[1]*k;
+      for(MD_SvgText *t = img->first_text; t != 0; t = t->next)
+      {
+        t->pos = v2f32(t->pos.x*k + tx, t->pos.y*k + ty);
+        t->font_size *= k;
+      }
+    }
+  }
+  scratch_end(scratch);
+}
+
+internal void
+md_image_decode(MD_Image *img, String8 bytes, F32 scale)
+{
+  Temp scratch = scratch_begin(0, 0);
+  img->failed = 1;
+  img->pending = 0;
+  if(bytes.size && md_bytes_are_svg(bytes))
+  {
+    // nanosvg parses in place, so it gets a terminated copy
+    char *src = (char *)push_array_no_zero(scratch.arena, U8, bytes.size + 1);
+    MemoryCopy(src, bytes.str, bytes.size);
+    src[bytes.size] = 0;
+    NSVGimage *svg = nsvgParse(src, "px", 96.f);
+    if(svg && svg->width >= 1 && svg->height >= 1)
+    {
+      // rasterize at the display scale (2x at least) so it stays crisp
+      F32 k = Max(2.f, ceil_f32(scale));
+      F32 big = Max(svg->width, svg->height)*k;
+      if(big > 4096.f) { k *= 4096.f/big; }
+      int w = (int)ceil_f32(svg->width*k);
+      int h = (int)ceil_f32(svg->height*k);
+      U8 *pixels = push_array(scratch.arena, U8, (U64)w*h*4);
+      NSVGrasterizer *rast = nsvgCreateRasterizer();
+      if(rast)
+      {
+        nsvgRasterize(rast, svg, 0, 0, k, pixels, w, h, w*4);
+        nsvgDeleteRasterizer(rast);
+        img->texture = r_tex2d_alloc(R_ResourceKind_Static, v2s32(w, h), R_Tex2DFormat_RGBA8, pixels);
+        img->size = v2s32((S32)ceil_f32(svg->width), (S32)ceil_f32(svg->height));
+        img->tex_size = v2s32(w, h);
+        img->failed = 0;
+        md_svg_collect_texts(md_image_arena, img, bytes, svg->width, svg->height);
+      }
+    }
+    if(svg) { nsvgDelete(svg); }
+  }
+  else if(bytes.size)
+  {
+    int w = 0, h = 0, comp = 0;
+    stbi_uc *pixels = stbi_load_from_memory(bytes.str, (int)bytes.size, &w, &h, &comp, 4);
+    if(pixels && w > 0 && h > 0)
+    {
+      img->texture = r_tex2d_alloc(R_ResourceKind_Static, v2s32(w, h), R_Tex2DFormat_RGBA8, pixels);
+      img->size = v2s32(w, h);
+      img->tex_size = img->size;
+      img->failed = 0;
+    }
+    if(pixels) { stbi_image_free(pixels); }
+  }
+  scratch_end(scratch);
+}
+
 // Zed's `resolve_preview_image`: http(s) URLs load as URIs, data: URLs are
 // decoded, `/`-rooted paths resolve against the workspace root (here the
 // file's folder) and other paths against the file's folder; a missing file
-// yields no image, so the alt text renders as text.
+// yields no image, so the alt text renders as text. A remote image that is
+// still downloading renders as nothing, as gpui's `img` does while loading.
 typedef enum MD_ImageResolve
 {
   MD_ImageResolve_None,
   MD_ImageResolve_Loaded,
   MD_ImageResolve_Failed,
+  MD_ImageResolve_Pending,
 }
 MD_ImageResolve;
 
 internal MD_ImageResolve
-md_image_resolve(String8 url, String8 base_dir, MD_Image **out)
+md_image_result(MD_Image *img)
+{
+  return img->pending ? MD_ImageResolve_Pending : img->failed ? MD_ImageResolve_Failed : MD_ImageResolve_Loaded;
+}
+
+internal MD_ImageResolve
+md_image_resolve(String8 url, String8 base_dir, F32 scale, MD_Image **out)
 {
   Temp scratch = scratch_begin(0, 0);
-  MD_ImageResolve result = MD_ImageResolve_None;
   if(md_image_arena == 0) { md_image_arena = arena_alloc(); }
   String8 key = url;
   B32 remote = (str8_match(str8_prefix(url, 7), str8_lit("http://"), StringMatchFlag_CaseInsensitive) ||
@@ -160,20 +714,7 @@ md_image_resolve(String8 url, String8 base_dir, MD_Image **out)
     rel = str8_prefix(rel, q);
     U64 h = str8_find_needle(rel, 0, str8_lit("#"), 0);
     rel = str8_prefix(rel, h);
-    // percent-decoding of spaces
-    String8List parts = {0};
-    U64 start = 0;
-    for(U64 i = 0; i+2 < rel.size; i += 1)
-    {
-      if(rel.str[i] == '%' && rel.str[i+1] == '2' && rel.str[i+2] == '0')
-      {
-        str8_list_push(scratch.arena, &parts, str8_substr(rel, r1u64(start, i)));
-        str8_list_push(scratch.arena, &parts, str8_lit(" "));
-        start = i+3;
-      }
-    }
-    str8_list_push(scratch.arena, &parts, str8_skip(rel, start));
-    rel = str8_list_join(scratch.arena, &parts, 0);
+    rel = md_percent_decode(scratch.arena, rel);
     for(;rel.size && (rel.str[0] == '/' || rel.str[0] == '\\');) { rel = str8_skip(rel, 1); }
     B32 absolute = (rel.size > 2 && rel.str[1] == ':');
     path = absolute ? rel : push_str8f(scratch.arena, "%S/%S", base_dir, rel);
@@ -181,44 +722,59 @@ md_image_resolve(String8 url, String8 base_dir, MD_Image **out)
     if(!file_path_exists(path)) { scratch_end(scratch); return MD_ImageResolve_None; }
     key = path;
   }
-  for(MD_Image *img = md_first_image; img != 0; img = img->next)
+
+  //- cached
+  MD_Image *img = 0;
+  for(MD_Image *n = md_first_image; n != 0; n = n->next)
   {
-    if(str8_match(img->key, key, 0)) { *out = img; scratch_end(scratch); return img->failed ? MD_ImageResolve_Failed : MD_ImageResolve_Loaded; }
+    if(str8_match(n->key, key, 0)) { img = n; break; }
   }
-  MD_Image *img = push_array(md_image_arena, MD_Image, 1);
-  img->key = push_str8_copy(md_image_arena, key);
-  SLLStackPush(md_first_image, img);
+  if(img == 0)
+  {
+    img = push_array(md_image_arena, MD_Image, 1);
+    img->key = push_str8_copy(md_image_arena, key);
+    SLLStackPush(md_first_image, img);
+    if(remote)
+    {
+      img->pending = 1;
+    }
+    else
+    {
+      String8 bytes = {0};
+      if(data_url)
+      {
+        U64 comma = str8_find_needle(url, 0, str8_lit(","), 0);
+        String8 header = str8_prefix(url, comma);
+        String8 payload = str8_skip(url, comma+1);
+        if(comma < url.size && str8_find_needle(header, 0, str8_lit(";base64"), StringMatchFlag_CaseInsensitive) < header.size)
+        {
+          bytes = md_base64_decode(scratch.arena, payload);
+        }
+        else if(comma < url.size)
+        {
+          bytes = md_percent_decode(scratch.arena, payload);
+        }
+      }
+      else
+      {
+        bytes = data_from_file_path(scratch.arena, path);
+      }
+      md_image_decode(img, bytes, scale);
+    }
+  }
+
+  //- a pending download finished
+  if(img->pending)
+  {
+    MD_Download *d = md_download_from_url(url);
+    B32 done = 0;
+    String8 bytes = {0};
+    MutexScope(md_download_mutex) { done = d->done; bytes = d->bytes; }
+    if(done) { md_image_decode(img, bytes, scale); }
+  }
   *out = img;
-  img->failed = 1;
-  String8 bytes = {0};
-  if(data_url)
-  {
-    U64 comma = str8_find_needle(url, 0, str8_lit(","), 0);
-    String8 header = str8_prefix(url, comma);
-    if(comma < url.size && str8_find_needle(header, 0, str8_lit(";base64"), StringMatchFlag_CaseInsensitive) < header.size)
-    {
-      bytes = md_base64_decode(scratch.arena, str8_skip(url, comma+1));
-    }
-  }
-  else if(!remote)
-  {
-    bytes = data_from_file_path(scratch.arena, path);
-  }
-  if(bytes.size)
-  {
-    int w = 0, h = 0, comp = 0;
-    stbi_uc *pixels = stbi_load_from_memory(bytes.str, (int)bytes.size, &w, &h, &comp, 4);
-    if(pixels && w > 0 && h > 0)
-    {
-      img->texture = r_tex2d_alloc(R_ResourceKind_Static, v2s32(w, h), R_Tex2DFormat_RGBA8, pixels);
-      img->size = v2s32(w, h);
-      img->failed = 0;
-    }
-    if(pixels) { stbi_image_free(pixels); }
-  }
-  result = img->failed ? MD_ImageResolve_Failed : MD_ImageResolve_Loaded;
   scratch_end(scratch);
-  return result;
+  return md_image_result(img);
 }
 
 ////////////////////////////////
@@ -706,7 +1262,7 @@ md_build_inlines(MD_Builder *b, MD_InlineArray inlines)
       case MD_InlineKind_ImageStart:
       {
         MD_Image *image = 0;
-        MD_ImageResolve r = md_image_resolve(in->url, b->base_dir, &image);
+        MD_ImageResolve r = md_image_resolve(in->url, b->base_dir, b->style->scale, &image);
         if(r == MD_ImageResolve_None)
         {
           // no image source: the alt text flows as plain text
@@ -714,6 +1270,12 @@ md_build_inlines(MD_Builder *b, MD_InlineArray inlines)
         }
         U64 end = i;
         String8 alt = md_alt_text(b, inlines, i, &end);
+        if(r == MD_ImageResolve_Pending)
+        {
+          // still downloading: nothing yet
+          i = end;
+          break;
+        }
         U64 link = (b->link_depth > 0) ? md_run_style(b)->link : 0;
         if(r == MD_ImageResolve_Loaded)
         {
@@ -734,10 +1296,15 @@ md_build_inlines(MD_Builder *b, MD_InlineArray inlines)
 ////////////////////////////////
 //~ Builder: HTML Blocks
 //
-// Zed renders HTML blocks through html5ever into the same builder
-// (html/html_rendering.rs): p, h1-h6, lists, blockquote, tables, img, b/strong,
-// i/em, del, a and the `align` attribute. This covers the same tags with a
-// small tag scanner.
+// Zed parses HTML blocks with html5ever and renders the result into the same
+// builder (html/html_parser.rs, html/html_rendering.rs): p, h1-h6, ul/ol
+// (nested, with per-depth bullets), blockquote, table (caption, thead,
+// tbody, th/td, align), img (width/height), b/strong, i/em, del, ins, a, and
+// the style attribute's font-weight, font-style, text-decoration and
+// text-align. Here a small tree builder with HTML's implied end tags stands
+// in for html5ever. Beyond Zed: alignment inherited from containers
+// (`<div align="center">`), `pre` as a code block, code/kbd in the code font,
+// u/s/strike, br and hr, and id/name anchors for `#fragment` links.
 
 internal String8
 md_html_attr(String8 tag, String8 name)
@@ -766,10 +1333,13 @@ md_html_attr(String8 tag, String8 name)
   return str8_zero();
 }
 
+// text_align_from_attributes: style's text-align, then the align attribute
 internal MD_Align
 md_html_align(String8 tag)
 {
-  String8 a = md_html_attr(tag, str8_lit("align"));
+  String8 a = md_svg_attr(tag, str8_lit("text-align"));
+  if(a.size == 0) { a = md_html_attr(tag, str8_lit("align")); }
+  a = str8_skip_chop_whitespace(a);
   if(str8_match(a, str8_lit("center"), StringMatchFlag_CaseInsensitive)) { return MD_Align_Center; }
   if(str8_match(a, str8_lit("right"), StringMatchFlag_CaseInsensitive)) { return MD_Align_Right; }
   if(str8_match(a, str8_lit("left"), StringMatchFlag_CaseInsensitive)) { return MD_Align_Left; }
@@ -779,21 +1349,113 @@ md_html_align(String8 tag)
 internal void md_push_paragraph_box(MD_Builder *b, Rng1U64 range, MD_Align align);
 internal void md_push_heading_box(MD_Builder *b, U64 level, Rng1U64 range, MD_Align align);
 internal void md_pop_text_block(MD_Builder *b);
+internal void md_build_code_block(MD_Builder *b, MD_Node *node, Rng1U64 range, String8 code, MD_Language lang);
 
-internal void
-md_build_html_block(MD_Builder *b, MD_Node *node)
+//- tree
+
+typedef struct MD_HtmlNode MD_HtmlNode;
+struct MD_HtmlNode
 {
-  Temp scratch = scratch_begin(&b->arena, 1);
-  String8 s = node->text;
-  MD_Box *html_div = b->current;
-  B32 in_block = 0;
-  MD_Align align_stack[32] = {0};
-  U64 align_depth = 0;
-  U64 inline_pushes = 0;
-  Rng1U64 range = r1u64(node->range.min + 1, node->range.max + 1);
-  MD_Align align = MD_Align_None;
-#define MD_EnsureBlock() do { if(!in_block) { md_push_paragraph_box(b, range, align); in_block = 1; } } while(0)
-#define MD_EndBlock() do { if(in_block) { for(;inline_pushes > 0; inline_pushes -= 1) { md_pop_run_style(b); } md_pop_text_block(b); in_block = 0; } } while(0)
+  MD_HtmlNode *first;
+  MD_HtmlNode *last;
+  MD_HtmlNode *next;
+  MD_HtmlNode *parent;
+  String8 name;                  // lowercase; empty for text
+  String8 tag;                   // the start tag, for attributes
+  String8 text;                  // raw text, entities not yet decoded
+  U64 offset;                    // position in the block's source
+};
+
+read_only global char *md_html_void_tags[] =
+{
+  "img", "br", "hr", "input", "meta", "link", "source", "wbr", "col", "area", "embed", "param", "track", "base",
+};
+
+read_only global char *md_html_render_block_tags[] =
+{
+  "p", "div", "center", "section", "article", "header", "footer", "main", "nav", "aside", "figure",
+  "figcaption", "details", "summary", "dl", "dt", "dd", "picture", "ul", "ol", "li", "blockquote",
+  "table", "caption", "thead", "tbody", "tfoot", "tr", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6",
+  "pre", "hr", "form", "fieldset", "address", "html", "body",
+};
+
+read_only global char *md_html_hidden_tags[] =
+{
+  "head", "title", "script", "style", "template", "noscript", "textarea", "select", "button", "iframe", "svg", "math",
+};
+
+internal B32
+md_html_name_in(String8 name, char **names, U64 count)
+{
+  for EachIndex(i, count) { if(str8_match(name, str8_cstring(names[i]), 0)) { return 1; } }
+  return 0;
+}
+
+#define md_html_is(node, lit) str8_match((node)->name, str8_lit(lit), 0)
+#define md_html_is_block(name) md_html_name_in((name), md_html_render_block_tags, ArrayCount(md_html_render_block_tags))
+
+internal MD_HtmlNode *
+md_html_node_push(Arena *arena, MD_HtmlNode *parent, String8 name, U64 offset)
+{
+  MD_HtmlNode *n = push_array(arena, MD_HtmlNode, 1);
+  n->name = name;
+  n->offset = offset;
+  n->parent = parent;
+  SLLQueuePush(parent->first, parent->last, n);
+  return n;
+}
+
+// The open element a start tag implicitly closes, if any (the tree
+// builder's "generate implied end tags" for the elements READMEs use).
+internal MD_HtmlNode *
+md_html_implied_close(MD_HtmlNode *cur, MD_HtmlNode *root, String8 name)
+{
+  for(MD_HtmlNode *n = cur; n != root; n = n->parent)
+  {
+    if(str8_match(name, str8_lit("li"), 0))
+    {
+      if(md_html_is(n, "li")) { return n; }
+      if(md_html_is(n, "ul") || md_html_is(n, "ol")) { break; }
+    }
+    else if(str8_match(name, str8_lit("td"), 0) || str8_match(name, str8_lit("th"), 0))
+    {
+      if(md_html_is(n, "td") || md_html_is(n, "th")) { return n; }
+      if(md_html_is(n, "tr") || md_html_is(n, "table")) { break; }
+    }
+    else if(str8_match(name, str8_lit("tr"), 0))
+    {
+      if(md_html_is(n, "tr")) { return n; }
+      if(md_html_is(n, "table") || md_html_is(n, "thead") || md_html_is(n, "tbody") || md_html_is(n, "tfoot")) { break; }
+    }
+    else if(str8_match(name, str8_lit("thead"), 0) || str8_match(name, str8_lit("tbody"), 0) || str8_match(name, str8_lit("tfoot"), 0))
+    {
+      if(md_html_is(n, "thead") || md_html_is(n, "tbody") || md_html_is(n, "tfoot")) { return n; }
+      if(md_html_is(n, "table")) { break; }
+    }
+    else if(str8_match(name, str8_lit("dt"), 0) || str8_match(name, str8_lit("dd"), 0))
+    {
+      if(md_html_is(n, "dt") || md_html_is(n, "dd")) { return n; }
+      if(md_html_is(n, "dl")) { break; }
+    }
+    if(md_html_is_block(name))
+    {
+      // a block start tag closes an open p
+      if(md_html_is(n, "p")) { return n; }
+      if(md_html_is_block(n->name)) { break; }
+    }
+    else
+    {
+      break;
+    }
+  }
+  return 0;
+}
+
+internal MD_HtmlNode *
+md_html_parse(Arena *arena, String8 s)
+{
+  MD_HtmlNode *root = push_array(arena, MD_HtmlNode, 1);
+  MD_HtmlNode *cur = root;
   for(U64 i = 0; i < s.size;)
   {
     if(str8_match(str8_prefix(str8_skip(s, i), 4), str8_lit("<!--"), 0))
@@ -808,156 +1470,560 @@ md_build_html_block(MD_Builder *b, MD_Node *node)
       if(len == 0 && i+1 < s.size && (s.str[i+1] == '!' || s.str[i+1] == '?'))
       {
         U64 e = str8_find_needle(s, i, str8_lit(">"), 0);
-        len = (e < s.size) ? e+1-i : s.size-i;
+        i = (e < s.size) ? e+1 : s.size;
+        continue;
       }
       if(len)
       {
         String8 tag = str8_substr(s, r1u64(i, i+len));
-        B32 closing = (tag.size > 1 && tag.str[1] == '/');
-        U64 ns = closing ? 2 : 1;
-        U64 ne = ns;
-        for(;ne < tag.size && md_char_is_alnum(tag.str[ne]); ne += 1);
-        String8 name = str8_substr(tag, r1u64(ns, ne));
+        U64 at = i;
         i += len;
-        B32 is_heading = (name.size == 2 && (name.str[0] == 'h' || name.str[0] == 'H') && name.str[1] >= '1' && name.str[1] <= '6');
-        local_persist char *block_tags[] = {"p", "div", "center", "li", "ul", "ol", "blockquote", "table", "tr", "td", "th", "thead", "tbody", "details", "summary", "section", "article", "header", "footer", "picture", "figure", "figcaption", "dl", "dt", "dd"};
-        B32 is_block = is_heading;
-        for EachElement(k, block_tags) { if(str8_match(name, str8_cstring(block_tags[k]), StringMatchFlag_CaseInsensitive)) { is_block = 1; break; } }
-        if(is_block)
+        B32 closing = (tag.size > 1 && tag.str[1] == '/');
+        U64 ns = closing ? 2 : 1, ne = ns;
+        for(;ne < tag.size && (md_char_is_alnum(tag.str[ne]) || tag.str[ne] == '-'); ne += 1);
+        String8 name = push_str8_copy(arena, str8_substr(tag, r1u64(ns, ne)));
+        for EachIndex(k, name.size) { name.str[k] = lower_from_char(name.str[k]); }
+        if(closing)
         {
-          MD_EndBlock();
-          if(!closing)
+          for(MD_HtmlNode *n = cur; n != root; n = n->parent)
           {
-            MD_Align a = md_html_align(tag);
-            if(str8_match(name, str8_lit("center"), StringMatchFlag_CaseInsensitive)) { a = MD_Align_Center; }
-            if(align_depth < ArrayCount(align_stack)) { align_stack[align_depth] = align; }
-            align_depth += 1;
-            if(a != MD_Align_None) { align = a; }
-            if(is_heading)
-            {
-              md_push_heading_box(b, name.str[1] - '0', range, align);
-              in_block = 1;
-            }
-          }
-          else if(align_depth > 0)
-          {
-            align_depth -= 1;
-            if(align_depth < ArrayCount(align_stack)) { align = align_stack[align_depth]; }
+            if(str8_match(n->name, name, 0)) { cur = n->parent; break; }
           }
           continue;
         }
-        if(str8_match(name, str8_lit("br"), StringMatchFlag_CaseInsensitive))
+        for(MD_HtmlNode *closed = 0; (closed = md_html_implied_close(cur, root, name)) != 0;) { cur = closed->parent; }
+        MD_HtmlNode *node = md_html_node_push(arena, cur, name, at);
+        node->tag = tag;
+        B32 self_closing = (tag.size >= 2 && tag.str[tag.size-2] == '/');
+        if(md_html_name_in(name, md_html_void_tags, ArrayCount(md_html_void_tags)) || self_closing) { continue; }
+        if(md_html_name_in(name, md_html_hidden_tags, ArrayCount(md_html_hidden_tags)))
         {
-          if(in_block) { md_push_line_break(b); }
+          // raw content up to the end tag; never rendered
+          String8 end_tag = push_str8f(arena, "</%S", name);
+          U64 e = str8_find_needle(s, i, end_tag, StringMatchFlag_CaseInsensitive);
+          U64 gt = str8_find_needle(s, e, str8_lit(">"), 0);
+          i = (gt < s.size) ? gt+1 : s.size;
           continue;
         }
-        if(str8_match(name, str8_lit("hr"), StringMatchFlag_CaseInsensitive))
-        {
-          MD_EndBlock();
-          MD_Box *rule = md_box_alloc(b, MD_BoxKind_Block);
-          rule->border[MD_Side_Bottom] = md_px(b->style, 1);
-          rule->border_color = b->colors->border;
-          rule->margin[MD_Side_Top] = rule->margin[MD_Side_Bottom] = b->style->paragraph_spacing;
-          md_push_div(b, rule, range);
-          md_pop_div(b);
-          continue;
-        }
-        if(str8_match(name, str8_lit("img"), StringMatchFlag_CaseInsensitive))
-        {
-          String8 src = md_unescape(b->arena, md_html_attr(tag, str8_lit("src")));
-          String8 alt = md_html_attr(tag, str8_lit("alt"));
-          MD_Image *image = 0;
-          MD_ImageResolve r = md_image_resolve(src, b->base_dir, &image);
-          if(r == MD_ImageResolve_None) { continue; }
-          MD_EnsureBlock();
-          U64 link = (b->link_depth > 0) ? md_run_style(b)->link : 0;
-          if(r == MD_ImageResolve_Loaded)
-          {
-            F32 w = 0, h = 0;
-            String8 ws = md_html_attr(tag, str8_lit("width"));
-            String8 hs = md_html_attr(tag, str8_lit("height"));
-            if(ws.size && char_is_digit(ws.str[0], 10) && ws.str[ws.size-1] != '%') { w = (F32)u64_from_str8(ws, 10)*b->style->scale; }
-            if(hs.size && char_is_digit(hs.str[0], 10) && hs.str[hs.size-1] != '%') { h = (F32)u64_from_str8(hs, 10)*b->style->scale; }
-            md_push_image(b, image, link, w, h);
-          }
-          else
-          {
-            md_push_image_fallback(b, src, alt);
-          }
-          continue;
-        }
-        // inline formatting
-        MD_RunStyle st = *md_run_style(b);
-        B32 known = 1;
-        if(str8_match(name, str8_lit("b"), StringMatchFlag_CaseInsensitive) || str8_match(name, str8_lit("strong"), StringMatchFlag_CaseInsensitive)) { st.bold = 1; }
-        else if(str8_match(name, str8_lit("i"), StringMatchFlag_CaseInsensitive) || str8_match(name, str8_lit("em"), StringMatchFlag_CaseInsensitive)) { st.italic = 1; }
-        else if(str8_match(name, str8_lit("del"), StringMatchFlag_CaseInsensitive) || str8_match(name, str8_lit("s"), StringMatchFlag_CaseInsensitive)) { st.strike = 1; }
-        else if(str8_match(name, str8_lit("ins"), StringMatchFlag_CaseInsensitive) || str8_match(name, str8_lit("u"), StringMatchFlag_CaseInsensitive)) { st.underline = 1; st.underline_color = st.color; }
-        else if(str8_match(name, str8_lit("code"), StringMatchFlag_CaseInsensitive) || str8_match(name, str8_lit("kbd"), StringMatchFlag_CaseInsensitive)) { st.family = MD_FontFamily_Mono; }
-        else if(str8_match(name, str8_lit("a"), StringMatchFlag_CaseInsensitive))
-        {
-          String8 href = md_html_attr(tag, str8_lit("href"));
-          if(!closing && href.size)
-          {
-            st.color = b->colors->text_accent;
-            st.underline = 1;
-            st.underline_color = th_opacity(b->colors->text_accent, 0.5f);
-            st.link = md_push_link(b, md_unescape(b->arena, href));
-            b->link_depth += 1;
-          }
-          else if(closing && b->link_depth > 0) { b->link_depth -= 1; }
-          else if(!closing) { known = 0; }
-        }
-        else { known = 0; }
-        if(known && in_block)
-        {
-          if(closing) { if(inline_pushes > 0) { md_pop_run_style(b); inline_pushes -= 1; } }
-          else { md_push_run_style(b, st); inline_pushes += 1; }
-        }
-        else if(known && !closing)
-        {
-          MD_EnsureBlock();
-          md_push_run_style(b, st);
-          inline_pushes += 1;
-        }
+        cur = node;
         continue;
       }
     }
-    // text: collapse whitespace, decode entities
-    U64 e = i;
+    U64 e = i+1;
     for(;e < s.size && s.str[e] != '<'; e += 1);
-    if(e == i) { e = i+1; }
-    String8 raw = str8_substr(s, r1u64(i, e));
-    i = e;
-    U8 *out = push_array_no_zero(scratch.arena, U8, raw.size*4 + 1);
-    U64 n = 0;
-    B32 space = in_block ? (b->pending_size > 0) : 0;
-    B32 pending_space = 0;
-    for(U64 k = 0; k < raw.size; k += 1)
+    String8 text = str8_substr(s, r1u64(i, e));
+    if(cur->last && cur->last->name.size == 0 && cur->last->text.str + cur->last->text.size == text.str)
     {
-      U8 c = raw.str[k];
-      if(char_is_space(c)) { pending_space = 1; continue; }
-      if(pending_space && (n > 0 || space)) { out[n++] = ' '; }
-      pending_space = 0;
-      if(c == '&')
-      {
-        U8 buf[8]; U64 sz = 0;
-        U64 used = md_parse_entity(raw, k, buf, &sz);
-        if(used) { MemoryCopy(out+n, buf, sz); n += sz; k += used-1; continue; }
-      }
-      out[n++] = c;
+      cur->last->text.size += text.size;
     }
-    if(pending_space && n > 0) { out[n++] = ' '; }
-    if(n == 0) { continue; }
-    MD_EnsureBlock();
-    md_push_text(b, push_str8_copy(b->arena, str8(out, n)));
+    else
+    {
+      MD_HtmlNode *t = md_html_node_push(arena, cur, str8_zero(), i);
+      t->text = text;
+    }
+    i = e;
   }
-  MD_EndBlock();
-  for(;inline_pushes > 0; inline_pushes -= 1) { md_pop_run_style(b); }
+  return root;
+}
+
+//- rendering
+
+typedef struct MD_HtmlCtx MD_HtmlCtx;
+struct MD_HtmlCtx
+{
+  Rng1U64 range;                 // the HTML block's source range
+  MD_Align align;
+  U64 list_depth;
+  B32 in_text;                   // an anonymous paragraph is open
+  B32 space_pending;             // collapsed whitespace not yet emitted
+  B32 pre;
+};
+
+internal B32
+md_html_has_content(MD_HtmlNode *node)
+{
+  for(MD_HtmlNode *c = node->first; c != 0; c = c->next)
+  {
+    if(c->name.size == 0)
+    {
+      for EachIndex(i, c->text.size) { if(!char_is_space(c->text.str[i])) { return 1; } }
+    }
+    else if(md_html_is(c, "img") || md_html_is(c, "br") || md_html_is(c, "hr") || md_html_has_content(c)) { return 1; }
+  }
+  return 0;
+}
+
+internal void
+md_html_text(MD_Builder *b, MD_HtmlCtx *ctx, String8 raw)
+{
+  Temp scratch = scratch_begin(&b->arena, 1);
+  U8 *out = push_array_no_zero(scratch.arena, U8, raw.size*4 + 2);
+  U64 n = 0;
+  for(U64 k = 0; k < raw.size; k += 1)
+  {
+    U8 c = raw.str[k];
+    if(!ctx->pre && char_is_space(c))
+    {
+      if(n > 0 || b->pending_size > 0) { ctx->space_pending = 1; }
+      continue;
+    }
+    if(ctx->space_pending) { out[n++] = ' '; ctx->space_pending = 0; }
+    if(c == '&')
+    {
+      U8 buf[8]; U64 sz = 0;
+      U64 used = md_parse_entity(raw, k, buf, &sz);
+      if(used) { MemoryCopy(out+n, buf, sz); n += sz; k += used-1; continue; }
+    }
+    if(c == '\r') { continue; }
+    out[n++] = c;
+  }
+  if(n) { md_push_text(b, push_str8_copy(b->arena, str8(out, n))); }
+  scratch_end(scratch);
+}
+
+// html_style_from_html_styles + the formatting elements
+internal void
+md_html_apply_inline_style(MD_Builder *b, MD_HtmlNode *node, MD_RunStyle *st)
+{
+  if(md_html_is(node, "b") || md_html_is(node, "strong")) { st->bold = 1; }
+  else if(md_html_is(node, "i") || md_html_is(node, "em") || md_html_is(node, "cite") || md_html_is(node, "var")) { st->italic = 1; }
+  else if(md_html_is(node, "del") || md_html_is(node, "s") || md_html_is(node, "strike")) { st->strike = 1; }
+  else if(md_html_is(node, "ins") || md_html_is(node, "u")) { st->underline = 1; st->underline_color = st->color; }
+  else if(md_html_is(node, "code") || md_html_is(node, "kbd") || md_html_is(node, "samp") || md_html_is(node, "tt")) { st->family = MD_FontFamily_Mono; st->bold = 0; }
+  String8 v;
+  v = md_svg_attr(node->tag, str8_lit("font-weight"));
+  if(v.size) { st->bold = str8_match(v, str8_lit("bold"), StringMatchFlag_CaseInsensitive) || str8_match(v, str8_lit("bolder"), StringMatchFlag_CaseInsensitive) || md_svg_number(v, 400) >= 600; }
+  v = md_svg_attr(node->tag, str8_lit("font-style"));
+  if(str8_match(v, str8_lit("italic"), StringMatchFlag_CaseInsensitive) || str8_match(v, str8_lit("oblique"), StringMatchFlag_CaseInsensitive)) { st->italic = 1; }
+  v = md_svg_attr(node->tag, str8_lit("text-decoration"));
+  if(str8_find_needle(v, 0, str8_lit("underline"), StringMatchFlag_CaseInsensitive) < v.size) { st->underline = 1; st->underline_color = st->color; }
+  if(str8_find_needle(v, 0, str8_lit("line-through"), StringMatchFlag_CaseInsensitive) < v.size) { st->strike = 1; }
+}
+
+internal void
+md_html_anchor(MD_Builder *b, MD_HtmlNode *node, MD_Box *box)
+{
+  String8 id = md_html_attr(node->tag, str8_lit("id"));
+  if(id.size == 0 && md_html_is(node, "a")) { id = md_html_attr(node->tag, str8_lit("name")); }
+  if(id.size) { md_push_anchor(b, push_str8_copy(b->arena, id), box); }
+}
+
+internal void
+md_html_image(MD_Builder *b, MD_HtmlNode *node)
+{
+  String8 src = md_unescape(b->arena, md_html_attr(node->tag, str8_lit("src")));
+  String8 alt = md_unescape(b->arena, md_html_attr(node->tag, str8_lit("alt")));
+  MD_Image *image = 0;
+  MD_ImageResolve r = md_image_resolve(src, b->base_dir, b->style->scale, &image);
+  if(r == MD_ImageResolve_None || r == MD_ImageResolve_Pending) { return; }
+  U64 link = (b->link_depth > 0) ? md_run_style(b)->link : 0;
+  if(r == MD_ImageResolve_Loaded)
+  {
+    // parse_html_element_dimension: px or bare numbers; the attribute, then style
+    F32 dims[2] = {0};
+    char *names[2] = {"width", "height"};
+    for EachIndex(k, 2)
+    {
+      String8 v = md_html_attr(node->tag, str8_cstring(names[k]));
+      if(v.size == 0) { v = md_svg_attr(node->tag, str8_cstring(names[k])); }
+      v = str8_skip_chop_whitespace(v);
+      if(v.size && char_is_digit(v.str[0], 10) && v.str[v.size-1] != '%') { dims[k] = md_svg_number(v, 0)*b->style->scale; }
+    }
+    // one dimension keeps the aspect ratio
+    if(dims[0] > 0 && dims[1] == 0 && image->size.x > 0) { dims[1] = dims[0]*image->size.y/image->size.x; }
+    if(dims[1] > 0 && dims[0] == 0 && image->size.y > 0) { dims[0] = dims[1]*image->size.x/image->size.y; }
+    md_push_image(b, image, link, dims[0], dims[1]);
+  }
+  else
+  {
+    md_push_image_fallback(b, src, alt);
+  }
+}
+
+internal void md_html_render_blocks(MD_Builder *b, MD_HtmlCtx *ctx, MD_HtmlNode *parent);
+
+// Inline content: text and formatting into the open text block. Block
+// elements nested in inline ones flow as their content.
+internal void
+md_html_render_inline(MD_Builder *b, MD_HtmlCtx *ctx, MD_HtmlNode *node)
+{
+  if(node->name.size == 0) { md_html_text(b, ctx, node->text); return; }
+  if(md_html_is(node, "br"))
+  {
+    md_push_line_break(b);
+    ctx->space_pending = 0;
+    return;
+  }
+  if(md_html_is(node, "img")) { ctx->space_pending = 0; md_html_image(b, node); return; }
+  if(md_html_name_in(node->name, md_html_hidden_tags, ArrayCount(md_html_hidden_tags))) { return; }
+  // whitespace before an element takes the outer style, not the element's
+  if(ctx->space_pending && b->pending_size > 0) { md_push_text(b, str8_lit(" ")); ctx->space_pending = 0; }
+  MD_RunStyle st = *md_run_style(b);
+  B32 is_link = 0;
+  if(md_html_is(node, "a"))
+  {
+    md_html_anchor(b, node, b->current);
+    String8 href = md_html_attr(node->tag, str8_lit("href"));
+    if(href.size)
+    {
+      st.color = b->colors->text_accent;
+      st.underline = 1;
+      st.underline_color = th_opacity(b->colors->text_accent, 0.5f);
+      st.link = md_push_link(b, md_unescape(b->arena, href));
+      is_link = 1;
+    }
+  }
+  md_html_apply_inline_style(b, node, &st);
+  B32 chip = (md_html_is(node, "code") || md_html_is(node, "kbd")) && !ctx->pre;
+  if(chip && !is_link) { st.color = (b->link_depth > 0) ? b->colors->text_accent : b->colors->text; }
+  md_push_run_style(b, st);
+  if(is_link) { b->link_depth += 1; }
+  for(MD_HtmlNode *c = node->first; c != 0; c = c->next)
+  {
+    if(chip && c->name.size == 0)
+    {
+      // inline code: the same chip as `code` spans
+      Temp scratch = scratch_begin(&b->arena, 1);
+      String8 decoded = md_unescape(scratch.arena, c->text);
+      if(ctx->space_pending) { md_push_text(b, str8_lit(" ")); ctx->space_pending = 0; }
+      md_push_code_chip_text(b, push_str8_copy(b->arena, decoded), th_opacity(b->colors->editor_foreground, 0.08f));
+      scratch_end(scratch);
+      continue;
+    }
+    md_html_render_inline(b, ctx, c);
+  }
+  if(is_link) { b->link_depth -= 1; }
+  md_pop_run_style(b);
+}
+
+internal void
+md_html_end_text(MD_Builder *b, MD_HtmlCtx *ctx)
+{
+  if(ctx->in_text) { md_pop_text_block(b); ctx->in_text = 0; }
+  ctx->space_pending = 0;
+}
+
+internal String8
+md_html_raw_text(Arena *arena, MD_HtmlNode *node)
+{
+  String8List parts = {0};
+  for(MD_HtmlNode *c = node->first; c != 0; c = c->next)
+  {
+    if(c->name.size == 0) { str8_list_push(arena, &parts, md_unescape(arena, c->text)); }
+    else if(md_html_is(c, "br")) { str8_list_push(arena, &parts, str8_lit("\n")); }
+    else { str8_list_push(arena, &parts, md_html_raw_text(arena, c)); }
+  }
+  return str8_list_join(arena, &parts, 0);
+}
+
+internal void
+md_html_render_table(MD_Builder *b, MD_HtmlCtx *ctx, MD_HtmlNode *table)
+{
+  MD_Style *style = b->style;
+  TH_Colors *colors = b->colors;
+  Temp scratch = scratch_begin(&b->arena, 1);
+
+  //- rows from thead, tbody, tfoot and direct children
+  MD_HtmlNode *rows[1024];
+  U64 row_count = 0;
+  MD_HtmlNode *caption = 0;
+  for(MD_HtmlNode *c = table->first; c != 0; c = c->next)
+  {
+    if(md_html_is(c, "caption")) { caption = c; }
+    else if(md_html_is(c, "tr")) { if(row_count < ArrayCount(rows)) { rows[row_count++] = c; } }
+    else if(md_html_is(c, "thead") || md_html_is(c, "tbody") || md_html_is(c, "tfoot"))
+    {
+      for(MD_HtmlNode *r = c->first; r != 0; r = r->next)
+      {
+        if(md_html_is(r, "tr") && row_count < ArrayCount(rows)) { rows[row_count++] = r; }
+      }
+    }
+  }
+  U64 cols = 0;
+  for EachIndex(r, row_count)
+  {
+    U64 n = 0;
+    for(MD_HtmlNode *cell = rows[r]->first; cell != 0; cell = cell->next)
+    {
+      if(!md_html_is(cell, "td") && !md_html_is(cell, "th")) { continue; }
+      String8 span = md_html_attr(cell->tag, str8_lit("colspan"));
+      n += Clamp(1, (U64)md_svg_number(span, 1), 64);
+    }
+    cols = Max(cols, n);
+  }
+
+  //- caption: div().mb_2().line_height(rems(1.3))
+  if(caption)
+  {
+    MD_Box *cap = md_box_alloc(b, MD_BoxKind_Block);
+    cap->margin[MD_Side_Bottom] = md_rems(style, 0.5f);
+    cap->text_line_height_abs = md_rems(style, 1.3f);
+    md_push_div(b, cap, ctx->range);
+    for(MD_HtmlNode *c = caption->first; c != 0; c = c->next) { md_html_render_inline(b, ctx, c); }
+    ctx->space_pending = 0;
+    md_pop_div(b);
+  }
+  if(cols == 0) { scratch_end(scratch); return; }
+
+  //- div().flex() > div().grid().grid_cols_max_content(n).mb_2().border(1.5).rounded_sm()
+  MD_Box *wrapper = md_box_alloc(b, MD_BoxKind_Row);
+  md_push_div(b, wrapper, ctx->range);
+  MD_Box *grid = md_box_alloc(b, MD_BoxKind_Grid);
+  grid->grid_columns = cols;
+  grid->margin[MD_Side_Bottom] = md_rems(style, 0.5f);
+  for EachIndex(k, 4) { grid->border[k] = md_px(style, 1.5f); }
+  grid->border_color = colors->border;
+  grid->radius = md_rems(style, 0.25f);
+  grid->scroll_x = 1;
+  grid->shrink_to_fit = 1;
+  grid->key = ctx->range.min + table->offset + 1;
+  md_push_div(b, grid, ctx->range);
+  B32 was_in_table = b->in_table;
+  b->in_table = 1;
+  for EachIndex(r, row_count)
+  {
+    U64 col = 0;
+    for(MD_HtmlNode *cell = rows[r]->first; cell != 0 && col < cols; cell = cell->next)
+    {
+      if(!md_html_is(cell, "td") && !md_html_is(cell, "th")) { continue; }
+      B32 header = md_html_is(cell, "th");
+      U64 span = Clamp(1, (U64)md_svg_number(md_html_attr(cell->tag, str8_lit("colspan")), 1), cols - col);
+      MD_Align align = md_html_align(cell->tag);
+      if(align == MD_Align_None) { align = md_html_align(rows[r]->tag); }
+      for EachIndex(k, span)
+      {
+        MD_Box *c = md_box_alloc(b, MD_BoxKind_Block);
+        c->bfc = 1;
+        if(col > 0 && k == 0) { c->border[MD_Side_Left] = md_px(style, 1); }
+        if(r > 0) { c->border[MD_Side_Top] = md_px(style, 1); }
+        c->border_color = colors->border;
+        c->padding[MD_Side_Left] = c->padding[MD_Side_Right] = md_rems(style, 0.5f);   // px_2
+        c->padding[MD_Side_Top] = c->padding[MD_Side_Bottom] = md_rems(style, 0.25f);  // py_1
+        if(header) { c->background = colors->title_bar_background; }
+        else if(r % 2 == 1) { c->background = colors->panel_background; }
+        c->align = align;
+        MD_RunStyle s = *md_run_style(b);
+        s.align = align;
+        md_push_run_style(b, s);
+        md_push_div(b, c, ctx->range);
+        if(k == 0)
+        {
+          // colspan: the cell's content in its first column, the rest empty
+          ctx->space_pending = 0;
+          for(MD_HtmlNode *ch = cell->first; ch != 0; ch = ch->next) { md_html_render_inline(b, ctx, ch); }
+          ctx->space_pending = 0;
+        }
+        md_pop_div(b);
+        md_pop_run_style(b);
+        col += 1;
+      }
+    }
+    // missing cells: empty bordered divs
+    for(;col < cols; col += 1)
+    {
+      MD_Box *c = md_box_alloc(b, MD_BoxKind_Block);
+      if(col > 0) { c->border[MD_Side_Left] = md_px(style, 1); }
+      if(r > 0) { c->border[MD_Side_Top] = md_px(style, 1); }
+      c->border_color = colors->border;
+      if(r % 2 == 1) { c->background = colors->panel_background; }
+      md_push_div(b, c, ctx->range);
+      md_pop_div(b);
+    }
+  }
+  b->in_table = was_in_table;
+  md_pop_div(b);
+  md_pop_div(b);
+  scratch_end(scratch);
+}
+
+internal void
+md_html_render_block(MD_Builder *b, MD_HtmlCtx *ctx, MD_HtmlNode *node)
+{
+  MD_Style *style = b->style;
+  TH_Colors *colors = b->colors;
+  if(md_html_name_in(node->name, md_html_hidden_tags, ArrayCount(md_html_hidden_tags))) { return; }
+  MD_HtmlCtx sub = *ctx;
+  sub.in_text = 0;
+  sub.space_pending = 0;
+  MD_Align a = md_html_align(node->tag);
+  if(md_html_is(node, "center")) { a = MD_Align_Center; }
+  if(a != MD_Align_None) { sub.align = a; }
+  B32 is_heading = (node->name.size == 2 && node->name.str[0] == 'h' && node->name.str[1] >= '1' && node->name.str[1] <= '6');
+
+  if(md_html_is(node, "p") || md_html_is(node, "summary") || md_html_is(node, "dt") || is_heading)
+  {
+    if(!md_html_has_content(node)) { return; }
+    if(is_heading) { md_push_heading_box(b, node->name.str[1] - '0', ctx->range, sub.align); }
+    else { md_push_paragraph_box(b, ctx->range, sub.align); }
+    md_html_anchor(b, node, b->current);
+    MD_RunStyle st = *md_run_style(b);
+    if(md_html_is(node, "dt")) { st.bold = 1; }
+    md_html_apply_inline_style(b, node, &st);
+    md_push_run_style(b, st);
+    for(MD_HtmlNode *c = node->first; c != 0; c = c->next) { md_html_render_inline(b, &sub, c); }
+    md_pop_run_style(b);
+    md_pop_text_block(b);
+  }
+  else if(md_html_is(node, "ul") || md_html_is(node, "ol"))
+  {
+    // render_html_list: div().pl_2p5(), then push_markdown_list_item per item
+    B32 ordered = md_html_is(node, "ol");
+    MD_Box *l = md_box_alloc(b, MD_BoxKind_Block);
+    l->padding[MD_Side_Left] = md_rems(style, 0.625f);
+    md_push_div(b, l, ctx->range);
+    md_html_anchor(b, node, l);
+    U64 order = 1;
+    String8 start = md_html_attr(node->tag, str8_lit("start"));
+    if(start.size && str8_is_integer(start, 10)) { order = u64_from_str8(start, 10); }
+    sub.list_depth = ctx->list_depth + 1;
+    for(MD_HtmlNode *item = node->first; item != 0; item = item->next)
+    {
+      if(!md_html_is(item, "li")) { continue; }
+      U64 this_order = order++;
+      if(!md_html_has_content(item)) { continue; }
+      // html_list_item_prefix
+      String8 bullet;
+      U64 depth = ctx->list_depth;
+      if(ordered)
+      {
+        U64 index = this_order ? this_order-1 : 0;
+        if(depth == 0) { bullet = push_str8f(b->arena, "%I64u. ", this_order); }
+        else { bullet = push_str8f(b->arena, "%c. ", (char)((depth == 1 ? 'A' : 'a') + index % 26)); }
+      }
+      else
+      {
+        local_persist char *bullets[] = {"\xe2\x80\xa2 ", "\xe2\x97\xa6 ", "\xe2\x96\xaa ", "\xe2\x80\xa3 ", "\xe2\x81\x83 "};
+        bullet = str8_cstring(bullets[Min(depth, ArrayCount(bullets)-1)]);
+      }
+      MD_Box *row = md_box_alloc(b, MD_BoxKind_Row);
+      row->margin[MD_Side_Bottom] = md_rems(style, 0.25f);
+      row->gap = md_rems(style, 0.25f);
+      row->text_line_height_rel = style->paragraph_line_height;
+      md_push_div(b, row, ctx->range);
+      MD_Box *bullet_box = md_box_alloc(b, MD_BoxKind_Block);
+      md_box_append(row, bullet_box);
+      md_make_label(b, bullet_box, bullet, (depth == 0 || ordered) ? MD_FontFamily_Sans : MD_FontFamily_Symbol, 0, colors->text, 0);
+      MD_Box *content = md_box_alloc(b, MD_BoxKind_Block);
+      content->flex_1 = 1;
+      content->bfc = 1;
+      md_push_div(b, content, ctx->range);
+      md_html_render_blocks(b, &sub, item);
+      md_pop_div(b);
+      md_pop_div(b);
+    }
+    md_pop_div(b);
+  }
+  else if(md_html_is(node, "blockquote"))
+  {
+    if(!md_html_has_content(node)) { return; }
+    MD_Box *q = md_box_alloc(b, MD_BoxKind_Block);
+    q->padding[MD_Side_Left] = md_rems(style, 1.f);
+    q->margin[MD_Side_Bottom] = style->paragraph_spacing;
+    q->border[MD_Side_Left] = md_px(style, 4);
+    q->border_color = colors->border;
+    MD_RunStyle s = *md_run_style(b);
+    s.color = colors->text_muted;
+    md_push_run_style(b, s);
+    md_push_div(b, q, ctx->range);
+    md_html_render_blocks(b, &sub, node);
+    md_pop_div(b);
+    md_pop_run_style(b);
+  }
+  else if(md_html_is(node, "table"))
+  {
+    md_html_render_table(b, &sub, node);
+  }
+  else if(md_html_is(node, "pre"))
+  {
+    Temp scratch = scratch_begin(&b->arena, 1);
+    String8 code = md_html_raw_text(scratch.arena, node);
+    if(code.size && code.str[0] == '\n') { code = str8_skip(code, 1); }
+    for(;code.size && (code.str[code.size-1] == '\n' || code.str[code.size-1] == '\r');) { code.size -= 1; }
+    String8 cls = md_html_attr(node->tag, str8_lit("class"));
+    if(node->first && md_html_is(node->first, "code")) { String8 inner = md_html_attr(node->first->tag, str8_lit("class")); if(inner.size) { cls = inner; } }
+    U64 dash = str8_find_needle(cls, 0, str8_lit("-"), 0);
+    String8 lang = (dash < cls.size) ? str8_skip(cls, dash+1) : cls;
+    U64 space = str8_find_needle(lang, 0, str8_lit(" "), 0);
+    Rng1U64 range = r1u64(ctx->range.min + node->offset, ctx->range.max);
+    md_build_code_block(b, 0, range, push_str8_copy(b->arena, code), md_language_from_info(str8_prefix(lang, space)));
+    scratch_end(scratch);
+  }
+  else if(md_html_is(node, "hr"))
+  {
+    MD_Box *rule = md_box_alloc(b, MD_BoxKind_Block);
+    rule->border[MD_Side_Bottom] = md_px(style, 1);
+    rule->border_color = colors->border;
+    rule->margin[MD_Side_Top] = rule->margin[MD_Side_Bottom] = style->paragraph_spacing;
+    md_push_div(b, rule, ctx->range);
+    md_pop_div(b);
+  }
+  else if(md_html_is(node, "dd"))
+  {
+    MD_Box *dd = md_box_alloc(b, MD_BoxKind_Block);
+    dd->padding[MD_Side_Left] = md_rems(style, 1.f);
+    md_push_div(b, dd, ctx->range);
+    md_html_render_blocks(b, &sub, node);
+    md_pop_div(b);
+  }
+  else
+  {
+    // div, center, section, details, ...: their children, with the alignment
+    if(md_html_attr(node->tag, str8_lit("id")).size)
+    {
+      MD_Box *anchor = md_box_alloc(b, MD_BoxKind_Block);
+      md_push_div(b, anchor, ctx->range);
+      md_html_anchor(b, node, anchor);
+      md_html_render_blocks(b, &sub, node);
+      md_pop_div(b);
+    }
+    else
+    {
+      md_html_render_blocks(b, &sub, node);
+    }
+  }
+}
+
+// Block content: block elements in order; runs of text and inline elements
+// between them become paragraphs.
+internal void
+md_html_render_blocks(MD_Builder *b, MD_HtmlCtx *ctx, MD_HtmlNode *parent)
+{
+  for(MD_HtmlNode *c = parent->first; c != 0; c = c->next)
+  {
+    B32 block = (c->name.size && md_html_is_block(c->name));
+    if(block)
+    {
+      md_html_end_text(b, ctx);
+      md_html_render_block(b, ctx, c);
+      continue;
+    }
+    if(!ctx->in_text)
+    {
+      B32 content = 0;
+      if(c->name.size == 0) { for EachIndex(i, c->text.size) { if(!char_is_space(c->text.str[i])) { content = 1; break; } } }
+      else if(md_html_is(c, "img") || md_html_is(c, "br") || md_html_has_content(c)) { content = 1; }
+      else if(md_html_is(c, "a")) { md_html_anchor(b, c, b->current); }
+      if(!content) { continue; }
+      md_push_paragraph_box(b, ctx->range, ctx->align);
+      ctx->in_text = 1;
+      ctx->space_pending = 0;
+    }
+    md_html_render_inline(b, ctx, c);
+  }
+  md_html_end_text(b, ctx);
+}
+
+internal void
+md_build_html_block(MD_Builder *b, MD_Node *node)
+{
+  Temp scratch = scratch_begin(&b->arena, 1);
+  MD_Box *html_div = b->current;
+  MD_HtmlNode *root = md_html_parse(scratch.arena, node->text);
+  MD_HtmlCtx ctx = {0};
+  ctx.range = r1u64(node->range.min + 1, node->range.max + 1);
+  md_html_render_blocks(b, &ctx, root);
   // the last box of the block gets the end-of-document margin rule
   if(html_div->last && node->range.max == b->doc->end) { html_div->last->margin[MD_Side_Bottom] = 0; }
-#undef MD_EnsureBlock
-#undef MD_EndBlock
   scratch_end(scratch);
 }
 
@@ -2185,6 +3251,26 @@ md_paint_text(MD_PaintCtx *p, MD_Box *box, Vec2F32 origin, Vec4F32 bg)
       md_fill(chip, th_over(bg, run->chip_color), md_px(style, 4));
     }
 
+    //- search highlights (MarkdownHighlights::highlights_for_line)
+    if(p->ix->search_match_count)
+    {
+      Rng1U64 *m = p->ix->search_matches;
+      U64 count = p->ix->search_match_count;
+      U64 ls = t->global_start + line->start;
+      U64 le = t->global_start + line->end;
+      U64 lo = 0, hi = count;
+      for(;lo < hi;) { U64 mid = (lo + hi)/2; if(m[mid].max <= ls) { lo = mid+1; } else { hi = mid; } }
+      for(U64 mi = lo; mi < count && m[mi].min < le; mi += 1)
+      {
+        U64 a = Max(m[mi].min, ls), z = Min(m[mi].max, le);
+        if(a >= z) { continue; }
+        F32 sx0 = md_text_x_for_offset(style, t, line, a - t->global_start);
+        F32 sx1 = md_text_x_for_offset(style, t, line, z - t->global_start);
+        Vec4F32 color = (mi == p->ix->search_active) ? p->colors->search_active_match_background : p->colors->search_match_background;
+        md_fill(r2f32p(x0 + sx0, top, x0 + sx1, top + lh), th_over(bg, color), 0);
+      }
+    }
+
     //- selection
     if(has_sel)
     {
@@ -2277,9 +3363,26 @@ md_paint_box(MD_PaintCtx *p, MD_Box *box, Vec2F32 origin, Vec4F32 bg)
     {
       if(box->image && !box->image->failed)
       {
-        Vec2S32 sz = box->image->size;
-        R_Rect2DInst *inst = dr_img(r, r2f32p(0, 0, (F32)sz.x, (F32)sz.y), box->image->texture, v4f32(1, 1, 1, 1), box->radius, 0, 0.5f);
-        (void)inst;
+        MD_Image *img = box->image;
+        Vec2S32 sz = img->tex_size;
+        dr_img(r, r2f32p(0, 0, (F32)sz.x, (F32)sz.y), img->texture, v4f32(1, 1, 1, 1), box->radius, 0, 0.5f);
+        // SVG <text>, which the rasterizer leaves out
+        if(img->first_text && img->size.x > 0)
+        {
+          F32 k = (r.x1 - r.x0)/(F32)img->size.x;
+          DR_ClipScope(intersect_2f32(r, p->clip))
+            for(MD_SvgText *t = img->first_text; t != 0; t = t->next)
+          {
+            F32 px = t->font_size*k;
+            if(px < 1.f) { continue; }
+            FNT_Tag font = t->bold ? style->fonts->sans_semibold : style->fonts->sans;
+            FNT_Run run = fnt_run_from_string(font, md_pt_from_px(px), 0, px*4.f, FNT_RasterFlag_Smooth, t->string);
+            F32 x = r.x0 + t->pos.x*k;
+            if(t->anchor == MD_Align_Center) { x -= run.dim.x/2; }
+            else if(t->anchor == MD_Align_Right) { x -= run.dim.x; }
+            dr_text_run(v2f32(round_f32(x), round_f32(r.y0 + t->pos.y*k)), th_linear(t->color), run);
+          }
+        }
       }
     }break;
     case MD_BoxKind_Checkbox:
@@ -2560,6 +3663,56 @@ md_element_text_in_range(Arena *arena, MD_Element *el, U64 start, U64 end)
     str8_list_push(arena, &parts, str8_substr(t->string, r1u64(a, z)));
   }
   return str8_list_join(arena, &parts, 0);
+}
+
+internal MD_Text *
+md_element_text_at(MD_Element *el, U64 offset)
+{
+  for EachIndex(i, el->text_count)
+  {
+    MD_Text *t = el->texts[i];
+    if(offset >= t->global_start && offset <= t->global_start + t->string.size) { return t; }
+  }
+  return 0;
+}
+
+internal Rng1U64 md_box_source_range(MD_Box *box);
+
+internal B32
+md_char_is_marker(U8 c)
+{
+  return (c == '*' || c == '_' || c == '`' || c == '~');
+}
+
+// The Markdown source behind a selection (Copy as Markdown). Selections live
+// in rendered text, so this maps through the blocks' source ranges: a
+// selection inside one block that occurs verbatim in its source copies that
+// source with the emphasis and code markers around it; anything else copies
+// the blocks it touches.
+internal String8
+md_element_source_in_range(MD_Element *el, String8 source, U64 start, U64 end)
+{
+  MD_Text *a = md_element_text_at(el, start);
+  MD_Text *z = md_element_text_at(el, end);
+  if(a == 0 || z == 0 || end <= start) { return str8_zero(); }
+  Rng1U64 ra = md_box_source_range(a->box);
+  Rng1U64 rz = md_box_source_range(z->box);
+  ra.min = Min(ra.min, source.size); ra.max = Min(ra.max, source.size);
+  rz.min = Min(rz.min, source.size); rz.max = Min(rz.max, source.size);
+  if(a == z)
+  {
+    String8 rendered = str8_substr(a->string, r1u64(start - a->global_start, end - a->global_start));
+    String8 block = str8_substr(source, ra);
+    U64 at = str8_find_needle(block, 0, rendered, 0);
+    if(rendered.size && at < block.size && str8_find_needle(block, at+1, rendered, 0) >= block.size)
+    {
+      U64 s0 = ra.min + at, s1 = s0 + rendered.size;
+      for(;s0 > ra.min && md_char_is_marker(source.str[s0-1]);) { s0 -= 1; }
+      for(;s1 < ra.max && md_char_is_marker(source.str[s1]);) { s1 += 1; }
+      return str8_substr(source, r1u64(s0, s1));
+    }
+  }
+  return str8_skip_chop_whitespace(str8_substr(source, r1u64(Min(ra.min, rz.min), Max(ra.max, rz.max))));
 }
 
 ////////////////////////////////

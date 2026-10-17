@@ -35,6 +35,7 @@ struct MD_Fonts
   FNT_Tag mono_italic;
   FNT_Tag mono_bold;
   FNT_Tag mono_bold_italic;
+  FNT_Tag symbols;               // fallback for bullets the text fonts lack (Segoe UI Symbol)
   FNT_Tag icons;
 };
 
@@ -42,6 +43,7 @@ typedef enum MD_FontFamily
 {
   MD_FontFamily_Sans,
   MD_FontFamily_Mono,
+  MD_FontFamily_Symbol,
 }
 MD_FontFamily;
 
@@ -166,14 +168,31 @@ typedef enum MD_BoxKind
 }
 MD_BoxKind;
 
+// <text> in an SVG. nanosvg draws no text, so these are drawn over the
+// rasterized image with the UI font, in the image's own px coordinates.
+typedef struct MD_SvgText MD_SvgText;
+struct MD_SvgText
+{
+  MD_SvgText *next;
+  String8 string;
+  Vec2F32 pos;                   // baseline anchor point
+  F32 font_size;
+  Vec4F32 color;                 // sRGB
+  MD_Align anchor;               // Left = start, Center = middle, Right = end
+  B32 bold;
+};
+
 typedef struct MD_Image MD_Image;
 struct MD_Image
 {
   MD_Image *next;
   String8 key;
   R_Handle texture;
-  Vec2S32 size;
+  Vec2S32 size;                  // logical px (layout size)
+  Vec2S32 tex_size;              // texture px (SVGs rasterize above 1x)
   B32 failed;
+  B32 pending;                   // remote image still downloading
+  MD_SvgText *first_text;
 };
 
 typedef struct MD_Box MD_Box;
@@ -293,7 +312,10 @@ struct MD_Interaction
   MD_ScrollState *first_scroll;
   U64 copied_code_key;           // code block whose copy button shows "copied"
   U64 copied_code_until_us;
-  U64 active_root_index;         // root block holding the "cursor" (link targets)
+  U64 active_root_index;         // root block holding the "cursor" (clicks, link targets)
+  Rng1U64 *search_matches;       // selection-space ranges, sorted
+  U64 search_match_count;
+  U64 search_active;             // index into search_matches, max_U64 = none
 };
 
 typedef struct MD_Hit MD_Hit;
@@ -309,6 +331,7 @@ struct MD_Hit
 };
 
 internal void md_images_reset(void);
+internal B32 md_images_poll(void);
 internal MD_Element *md_element_build(Arena *arena, MD_Document *doc, MD_Style *style, String8 base_dir);
 internal void md_element_layout(MD_Element *el, MD_Style *style, F32 width);
 internal void md_element_paint(MD_Element *el, MD_Style *style, MD_Interaction *ix, Vec2F32 origin, Rng2F32 clip);
@@ -316,6 +339,8 @@ internal MD_Hit md_element_hit_test(MD_Element *el, MD_Interaction *ix, Vec2F32 
 internal U64 md_element_offset_from_point(MD_Element *el, MD_Style *style, MD_Interaction *ix, Vec2F32 p);
 internal Rng1U64 md_element_word_at(MD_Element *el, U64 offset);
 internal String8 md_element_text_in_range(Arena *arena, MD_Element *el, U64 start, U64 end);
+internal String8 md_element_source_in_range(MD_Element *el, String8 source, U64 start, U64 end);
+internal MD_Text *md_element_text_at(MD_Element *el, U64 offset);
 internal F32 *md_scroll_offset_ptr(MD_Interaction *ix, Arena *arena, U64 key);
 internal MD_Text *md_element_first_text_in(MD_Element *el, MD_Box *box);
 internal MD_Text *md_element_text_for_source_index(MD_Element *el, U64 source_index);
