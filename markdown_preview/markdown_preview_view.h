@@ -43,6 +43,9 @@ struct MDP_View
   F32 element_rem;
   TH_Kind element_theme;
 
+  // the window's title bar, drawn by the app above the preview, physical px
+  F32 top_inset;
+
   // settings
   F32 font_size;                 // markdown_preview_font_size, logical px
   TH_Kind theme_kind;
@@ -79,6 +82,29 @@ struct MDP_View
   // file watching
   U64 file_modified;
   U64 reload_at_us;
+  U64 element_generation;        // bumps whenever the element is rebuilt
+
+  // search (BufferSearchBar over the SearchableItem impl)
+  B32 search_open;
+  B32 search_focused;
+  B32 search_case;               // SearchOptions::CASE_SENSITIVE
+  B32 search_word;               // SearchOptions::WHOLE_WORD
+  U8 search_query[512];
+  U64 search_query_size;
+  B32 search_dirty;
+  B32 search_scroll_pending;
+  U64 search_generation;
+  U64 search_anchor;             // selection-space offset the active match follows
+  Arena *search_arena;
+
+  // right-click menu (ContextMenu)
+  B32 menu_open;
+  Vec2F32 menu_pos;
+  U32 menu_items[3];
+  U64 menu_item_count;
+  U64 menu_selected;             // keyboard-highlighted item, max_U64 = none
+  U8 menu_link[2048];
+  U64 menu_link_size;
 };
 
 internal void mdp_view_init(MDP_View *view);
