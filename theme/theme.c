@@ -77,6 +77,10 @@ th_theme_from_kind(TH_Kind kind)
       c->search_match_background           = th_rgba(0x74ade866);
       c->search_active_match_background    = th_rgba(0xe8af7466);
       c->ghost_element_hover               = th_rgba(0x363c46ff);
+      c->ghost_element_selected            = th_rgba(0x454a56ff);
+      c->panel_focused_border              = th_rgba(0x2870bdff); // not in one.json: ThemeColors::dark()
+      c->panel_indent_guide                = th_rgba(0xfefef31b);
+      c->panel_indent_guide_active         = th_rgba(0xfffaed2d);
       c->text_placeholder                  = th_rgba(0x878a98ff);
       c->border_focused                    = th_rgba(0x47679eff);
       c->scrollbar_thumb_background        = th_rgba(0xc8ccd44c);
@@ -132,6 +136,10 @@ th_theme_from_kind(TH_Kind kind)
       c->search_match_background           = th_rgba(0x5c79e266);
       c->search_active_match_background    = th_rgba(0xd0a92366);
       c->ghost_element_hover               = th_rgba(0xdfdfe0ff);
+      c->ghost_element_selected            = th_rgba(0xcacacaff);
+      c->panel_focused_border              = th_rgba(0x0588f0ff); // not in one.json: ThemeColors::light()
+      c->panel_indent_guide                = th_rgba(0x1f180021);
+      c->panel_indent_guide_active         = th_rgba(0x19130029);
       c->text_placeholder                  = th_rgba(0x7e8086ff);
       c->border_focused                    = th_rgba(0x7d82e8ff);
       c->scrollbar_thumb_background        = th_rgba(0x383a414c);

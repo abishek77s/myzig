@@ -43,8 +43,10 @@ struct MDP_View
   F32 element_rem;
   TH_Kind element_theme;
 
-  // the window's title bar, drawn by the app above the preview, physical px
+  // the window's title bar above the preview and the outline panel to its
+  // left, drawn by the app, physical px
   F32 top_inset;
+  F32 left_inset;
 
   // settings
   F32 font_size;                 // markdown_preview_font_size, logical px
@@ -114,5 +116,7 @@ internal void mdp_view_poll_file(MDP_View *view);
 internal B32  mdp_view_handle_event(MDP_View *view, WM_Window window, WM_Event *ev);
 internal void mdp_view_draw(MDP_View *view, WM_Window window);
 internal B32  mdp_view_is_animating(MDP_View *view);
+internal void mdp_view_scroll_to_heading_index(MDP_View *view, WM_Window window, U64 index);
+internal U64  mdp_view_heading_index_at_top(MDP_View *view, WM_Window window);
 
 #endif // MARKDOWN_PREVIEW_VIEW_H

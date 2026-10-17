@@ -8,6 +8,9 @@
 //   markdown/              parser, code highlighting,
 //                          MarkdownStyle + MarkdownElement  (crates/markdown)
 //   markdown_preview/      settings and the preview view    (crates/markdown_preview)
+//   outline_panel/         the headings sidebar             (crates/outline_panel)
+//   recent_panel/          the recent files sidebar         (crates/sidebar)
+//   icons/                 Zed's SVG icons                  (assets/icons, crates/ui Icon)
 //   mdview_main.c          window, events, frame loop       (crates/zed/src/main.rs)
 //
 // reference/ZED_MARKDOWN_PREVIEW.md describes the Zed side.
@@ -30,8 +33,11 @@
 #include "font_cache/font_cache.h"
 #include "draw/draw.h"
 #include "theme/theme.h"
+#include "icons/icons.h"
 #include "markdown/markdown_inc.h"
 #include "markdown_preview/markdown_preview_inc.h"
+#include "outline_panel/outline_panel_inc.h"
+#include "recent_panel/recent_panel_inc.h"
 
 //- [c]
 #include "base/base_inc.c"
@@ -60,8 +66,11 @@
 # pragma warning(pop)
 #endif
 #include "theme/theme.c"
+#include "icons/icons.c"
 #include "markdown/markdown_inc.c"
 #include "markdown_preview/markdown_preview_inc.c"
+#include "outline_panel/outline_panel_inc.c"
+#include "recent_panel/recent_panel_inc.c"
 
 ////////////////////////////////
 //~ App State
@@ -76,6 +85,8 @@ struct MV_State
   WM_Window os;
   R_Handle r;
   MDP_View view;
+  OP_Panel outline;
+  RP_Panel recent;
   B32 pick_file_requested;
   FNT_Tag caption_font;          // Segoe Fluent Icons / Segoe MDL2 Assets, or zero
   S32 caption_pressed;           // MV_Caption under a left press, -1 = none
@@ -97,6 +108,7 @@ read_only global String8 mv_welcome_text = str8_lit_comp(
 "- Press `Ctrl+O` to pick a file, or drop a `.md` file on this window\n"
 "- The preview reloads when the file changes on disk\n"
 "- Started without a path, mdview reopens the last file\n"
+"- Recent files are listed in the sidebar; click one to open it\n"
 "\n"
 "## Keys\n"
 "\n"
@@ -112,6 +124,8 @@ read_only global String8 mv_welcome_text = str8_lit_comp(
 "| `Alt` + `C` / `W` | Match case / whole word |\n"
 "| Right click | Copy, Copy as Markdown, Copy Link |\n"
 "| `Ctrl` + `O`, `F5` | Open, reload |\n"
+"| `Ctrl` + `Alt` + `J` | Recent files sidebar |\n"
+"| `Ctrl` + `B` | Outline panel; type to filter, arrows to move |\n"
 "| `Ctrl` + `T` | One Dark / One Light |\n"
 "\n"
 "## What renders\n"
@@ -236,8 +250,10 @@ f->field = mv_font_from_candidates(c_, ArrayCount(c_), (fallback)); \
 //
 // Kitten's titlebar (reference/kitten/src/ui/titlebar.rs, after Zed's
 // PlatformTitleBar) with the brand menu replaced by one button per shortcut:
-// a 32px bar in title_bar_background with a 1px bottom border, the buttons,
-// a hairline and the document's flat tab, and the Windows caption buttons.
+// a 32px bar in title_bar_background with a 1px bottom border, the buttons
+// (Zed's icons as IconButtons, with a tooltip naming the shortcut, or a
+// label), and the Windows caption buttons. The open document is shown by the
+// recent files sidebar rather than a tab.
 // The bar is client area (WM_WindowFlag_CustomBorder): everything but the
 // buttons is pushed as caption, so the OS drags, snaps and double-click
 // maximizes, and the buttons handle their own clicks.
@@ -249,14 +265,20 @@ struct MV_TitleButton
   String8 shortcut;
   WM_Modifiers modifiers;
   WM_Key key;
+  IC_Icon icon;                  // IC_Icon_Null for a labelled button
+  IC_Icon icon_light;            // in One Light, if not the same
+  IC_Icon icon_open;             // while the recent files sidebar is open, if not the same
 };
 
 read_only global MV_TitleButton mv_title_buttons[] =
 {
-  {str8_lit_comp("Open"),   str8_lit_comp("Ctrl+O"), WM_Modifier_Ctrl, WM_Key_O},
-  {str8_lit_comp("Reload"), str8_lit_comp("F5"),     0,                WM_Key_F5},
-  {str8_lit_comp("Find"),   str8_lit_comp("Ctrl+F"), WM_Modifier_Ctrl, WM_Key_F},
-  {str8_lit_comp("Theme"),  str8_lit_comp("Ctrl+T"), WM_Modifier_Ctrl, WM_Key_T},
+  // the threads sidebar toggle from Zed's status bar, for the sidebar on the left
+  {str8_lit_comp("Recent Files"), str8_lit_comp("Ctrl+Alt+J"), WM_Modifier_Ctrl|WM_Modifier_Alt, WM_Key_J, IC_Icon_SidebarLeftClosed, 0, IC_Icon_SidebarLeftOpen},
+  {str8_lit_comp("Outline"), str8_lit_comp("Ctrl+B"), WM_Modifier_Ctrl, WM_Key_B,  IC_Icon_ListTree},
+  {str8_lit_comp("Open"),    str8_lit_comp("Ctrl+O"), WM_Modifier_Ctrl, WM_Key_O,  IC_Icon_Folder},
+  {str8_lit_comp("Reload"),  str8_lit_comp("F5"),     0,                WM_Key_F5, IC_Icon_RotateCw},
+  {str8_lit_comp("Find"),    str8_lit_comp("Ctrl+F"), WM_Modifier_Ctrl, WM_Key_F,  IC_Icon_MagnifyingGlass},
+  {str8_lit_comp("Theme"),   str8_lit_comp("Ctrl+T"), WM_Modifier_Ctrl, WM_Key_T,  IC_Icon_Moon, IC_Icon_Sun},
 };
 
 typedef enum MV_Caption
@@ -274,8 +296,6 @@ struct MV_TitleBar
   F32 scale;
   Rng2F32 rect;
   Rng2F32 buttons[ArrayCount(mv_title_buttons)];
-  Rng2F32 strip;                 // the tab strip, between the buttons and the captions
-  Rng2F32 tab;
   Rng2F32 captions[MV_Caption_COUNT];
 };
 
@@ -302,29 +322,22 @@ mv_title_bar_layout(void)
   }
 
   //- shortcut buttons, styled as titlebar_context_button: 26px tall, px_2,
-  // 2px apart, after the brand inset
+  // 2px apart, after the brand inset; icon buttons are square
   F32 button_h = round_f32(26.f*s);
   F32 y0 = t.rect.y0 + round_f32((h - button_h)/2);
   F32 x = t.rect.x0 + round_f32(8.f*s);
   for EachElement(i, mv_title_buttons)
   {
     MV_TitleButton *b = &mv_title_buttons[i];
-    F32 w = 8.f*s + md_text_width(fonts->sans, round_f32(MV_TITLE_LABEL_PX*s), b->label) +
-      6.f*s + md_text_width(fonts->mono, round_f32(MV_TITLE_SHORTCUT_PX*s), b->shortcut) + 8.f*s;
+    F32 w = button_h;
+    if(b->icon == IC_Icon_Null)
+    {
+      w = 8.f*s + md_text_width(fonts->sans, round_f32(MV_TITLE_LABEL_PX*s), b->label) +
+        6.f*s + md_text_width(fonts->mono, round_f32(MV_TITLE_SHORTCUT_PX*s), b->shortcut) + 8.f*s;
+    }
     t.buttons[i] = r2f32p(x, y0, x + round_f32(w), y0 + button_h);
     x = t.buttons[i].x1 + round_f32(2.f*s);
   }
-  x += round_f32(6.f*s);                           // pr_2 after the last button
-
-  //- the tab strip, at most 760px unless maximized, and its one flat tab:
-  // 190px preferred, shrinking to 112px, after a 1px hairline
-  F32 strip_x1 = t.captions[0].x0;
-  if(!wm_window_is_maximized(mv->os)) { strip_x1 = Min(strip_x1, x + round_f32(760.f*s)); }
-  t.strip = r2f32p(x, t.rect.y0, Max(x, strip_x1), t.rect.y1);
-  F32 hairline = Max(1.f, round_f32(s));
-  F32 avail = (t.strip.x1 - t.strip.x0) - hairline - round_f32(6.f*s);
-  F32 tab_w = round_f32(Max(112.f*s, Min(190.f*s, avail)));
-  t.tab = r2f32p(t.strip.x0 + hairline, t.rect.y0, t.strip.x0 + hairline + tab_w, t.rect.y1);
   return t;
 }
 
@@ -365,27 +378,9 @@ mv_caption_activate(MV_Caption caption)
   }
 }
 
-// `truncate()`: the longest prefix that fits, with an ellipsis.
-internal String8
-mv_truncated(Arena *arena, FNT_Tag font, F32 px, String8 string, F32 max_w)
-{
-  if(md_text_width(font, px, string) <= max_w) { return string; }
-  String8 ellipsis = str8_lit("\xe2\x80\xa6");
-  F32 ellipsis_w = md_text_width(font, px, ellipsis);
-  U64 n = string.size;
-  while(n > 0)
-  {
-    n -= 1;
-    while(n > 0 && (string.str[n] & 0xC0) == 0x80) { n -= 1; }
-    if(md_text_width(font, px, str8_prefix(string, n)) + ellipsis_w <= max_w) { break; }
-  }
-  return push_str8f(arena, "%S%S", str8_prefix(string, n), ellipsis);
-}
-
 internal void
 mv_title_bar_draw(MV_TitleBar *t)
 {
-  Temp scratch = scratch_begin(0, 0);
   MD_Fonts *fonts = &mv->view.fonts;
   TH_Colors *colors = &mv->view.theme.colors;
   Vec2F32 mouse = wm_mouse_from_window(mv->os);
@@ -395,38 +390,33 @@ mv_title_bar_draw(MV_TitleBar *t)
   Vec4F32 hover_bg = th_over(bar_bg, colors->ghost_element_hover);
   Vec4F32 selected_bg = th_over(bar_bg, colors->element_selection_background);
 
-  //- the bar, and its bottom border (the active tab paints over it)
+  //- the bar, and its bottom border
   dr_rect(t->rect, th_linear(bar_bg), 0, 0, 0);
   dr_rect(r2f32p(t->rect.x0, t->rect.y1 - line, t->rect.x1, t->rect.y1), th_linear(colors->border), 0, 0, 0);
 
-  //- shortcut buttons: label in text_muted, the binding in the mono font, dim
+  //- shortcut buttons: label in text_muted, the binding in the mono font, dim;
+  // or the icon, muted, brightening on hover
   F32 label_px = round_f32(MV_TITLE_LABEL_PX*s);
   F32 shortcut_px = round_f32(MV_TITLE_SHORTCUT_PX*s);
+  S32 tooltip = -1;
   for EachElement(i, mv_title_buttons)
   {
     MV_TitleButton *b = &mv_title_buttons[i];
     Rng2F32 r = t->buttons[i];
     B32 hovered = contains_2f32(r, mouse);
     if(hovered) { dr_rect(r, th_linear(hover_bg), 6.f*s, 0, 0.5f); }
+    if(b->icon != IC_Icon_Null)
+    {
+      if(hovered) { tooltip = (S32)i; }
+      IC_Icon icon = (b->icon_light && mv->view.theme_kind == TH_Kind_OneLight) ? b->icon_light : b->icon;
+      if(b->icon_open && mv->recent.open) { icon = b->icon_open; }
+      ic_draw(icon, r, IC_SIZE_SMALL_PX*s, hovered ? colors->text : colors->text_muted);
+      continue;
+    }
     F32 x = r.x0 + 8.f*s;
     mdp_draw_text_centered_y(fonts->sans, label_px, r, x, b->label, hovered ? colors->text : colors->text_muted);
     x += md_text_width(fonts->sans, label_px, b->label) + 6.f*s;
     mdp_draw_text_centered_y(fonts->mono, shortcut_px, r, x, b->shortcut, colors->text_placeholder);
-  }
-
-  //- the strip's hairline, then the active tab: editor_background, framed in
-  // border on top and right (the hairline is its left edge), open at the bottom
-  DR_ClipScope(t->strip)
-  {
-    dr_rect(r2f32p(t->strip.x0, t->rect.y0, t->strip.x0 + line, t->rect.y1), th_linear(colors->border), 0, 0, 0);
-    Rng2F32 tab = t->tab;
-    dr_rect(tab, th_linear(colors->editor_background), 0, 0, 0);
-    dr_rect(r2f32p(tab.x0, tab.y0, tab.x1, tab.y0 + line), th_linear(colors->border), 0, 0, 0);
-    dr_rect(r2f32p(tab.x1 - line, tab.y0, tab.x1, tab.y1), th_linear(colors->border), 0, 0, 0);
-    String8 name = mv->view.name.size ? mv->view.name : str8_lit("Welcome");
-    Rng2F32 label = r2f32p(tab.x0 + round_f32(10.f*s), tab.y0, tab.x1 - line - round_f32(10.f*s), tab.y1);
-    name = mv_truncated(scratch.arena, fonts->sans, label_px, name, label.x1 - label.x0);
-    mdp_draw_text_centered_y(fonts->sans, label_px, label, label.x0, name, colors->text);
   }
 
   //- caption buttons: ghost hover, Windows' close red
@@ -468,7 +458,26 @@ mv_title_bar_draw(MV_TitleBar *t)
       mdp_draw_text_centered_y(fonts->sans, px, r, (r.x0 + r.x1)/2 - w/2, glyph, fg);
     }
   }
-  scratch_end(scratch);
+
+  //- an icon button's tooltip (`Tooltip::for_action`): the label and its
+  // binding on an elevated surface, rounded and bordered, below the button
+  if(tooltip >= 0)
+  {
+    MV_TitleButton *b = &mv_title_buttons[tooltip];
+    Rng2F32 r = t->buttons[tooltip];
+    F32 pad_x = round_f32(8.f*s), gap = round_f32(16.f*s);
+    F32 label_w = md_text_width(fonts->sans, label_px, b->label);
+    F32 w = pad_x + label_w + gap + md_text_width(fonts->mono, shortcut_px, b->shortcut) + pad_x;
+    F32 h = round_f32(26.f*s);
+    F32 x0 = r.x0;
+    F32 client_x1 = wm_client_rect_from_window(mv->os).x1;
+    if(x0 + w > client_x1) { x0 = Max(0, client_x1 - w); }
+    Rng2F32 tip = r2f32p(x0, t->rect.y1 + round_f32(4.f*s), x0 + round_f32(w), t->rect.y1 + round_f32(4.f*s) + h);
+    dr_rect(tip, th_linear(colors->elevated_surface_background), 6.f*s, 0, 0.5f);
+    dr_rect(tip, th_linear(colors->border_variant), 6.f*s, line, 0.5f);
+    mdp_draw_text_centered_y(fonts->sans, label_px, tip, tip.x0 + pad_x, b->label, colors->text);
+    mdp_draw_text_centered_y(fonts->mono, shortcut_px, tip, tip.x0 + pad_x + label_w + gap, b->shortcut, colors->text_muted);
+  }
 }
 
 ////////////////////////////////
@@ -484,33 +493,6 @@ mv_update_title(void)
   scratch_end(scratch);
 }
 
-// The last opened file is remembered in the user's config folder, like
-// raddbg's last_user, and reopened when mdview starts without a path.
-internal String8
-mv_last_file_path(Arena *arena)
-{
-  return push_str8f(arena, "%S/mdview/last_file", get_process_info()->user_program_config_data_path);
-}
-
-internal String8
-mv_last_file_read(Arena *arena)
-{
-  Temp scratch = scratch_begin(&arena, 1);
-  String8 path = str8_skip_chop_whitespace(data_from_file_path(arena, mv_last_file_path(scratch.arena)));
-  scratch_end(scratch);
-  return path;
-}
-
-internal void
-mv_last_file_write(String8 path)
-{
-  Temp scratch = scratch_begin(0, 0);
-  String8 file = mv_last_file_path(scratch.arena);
-  make_directory(str8_chop_last_slash(file));
-  write_data_to_file_path(file, path);
-  scratch_end(scratch);
-}
-
 internal B32
 mv_open_path(String8 path, B32 keep_scroll)
 {
@@ -518,7 +500,7 @@ mv_open_path(String8 path, B32 keep_scroll)
   if(ok)
   {
     mv_update_title();
-    mv_last_file_write(mv->view.path);
+    rp_recent_push(&mv->recent, mv->view.path);
   }
   return ok;
 }
@@ -539,7 +521,7 @@ frame(void)
   WM_EventList events = {0};
   if(mv->frame_depth == 1)
   {
-    B32 wait = (mv->frame_index > 2) && !mdp_view_is_animating(view);
+    B32 wait = (mv->frame_index > 2) && !mdp_view_is_animating(view) && !op_panel_is_animating(&mv->outline) && !rp_panel_is_animating(&mv->recent);
     events = wm_get_events(scratch.arena, wait);
   }
 
@@ -552,6 +534,8 @@ frame(void)
   //- the title bar sits above the preview
   MV_TitleBar title = mv_title_bar_layout();
   view->top_inset = title.rect.y1 - title.rect.y0;
+  mv->outline.x0 = rp_panel_width_px(&mv->recent, mv->os);
+  view->left_inset = mv->outline.x0 + op_panel_width_px(&mv->outline, mv->os);
   mv_title_bar_push_hit_areas(&title);
 
   for(WM_Event *ev = events.first; ev != 0; ev = ev->next)
@@ -592,12 +576,25 @@ frame(void)
           ev->key = mv_title_buttons[button].key;
           ev->modifiers = mv_title_buttons[button].modifiers;
         }
-        if(ev->modifiers == WM_Modifier_Ctrl)
+        if(ev->modifiers == (WM_Modifier_Ctrl|WM_Modifier_Alt) && ev->key == WM_Key_J)
+        {
+          mv->recent.open = !mv->recent.open;
+          mv->recent.resizing = 0;
+          taken = 1;
+        }
+        else if(ev->modifiers == WM_Modifier_Ctrl)
         {
           switch(ev->key)
           {
             default:{}break;
             case WM_Key_O: { mv->pick_file_requested = 1; taken = 1; }break;
+            case WM_Key_B:
+            {
+              mv->outline.open = !mv->outline.open;
+              mv->outline.focused = 0;
+              mv->outline.resizing = 0;
+              taken = 1;
+            }break;
             case WM_Key_T: { view->theme_kind = (view->theme_kind == TH_Kind_OneDark) ? TH_Kind_OneLight : TH_Kind_OneDark; taken = 1; }break;
             case WM_Key_W: case WM_Key_Q: { mv->quit = 1; taken = 1; }break;
           }
@@ -609,7 +606,18 @@ frame(void)
         }
       }break;
     }
+    if(!taken)
+    {
+      // the recent files first: its resize handle overlaps the outline's left edge
+      taken = rp_panel_handle_event(&mv->recent, view, mv->os, ev);
+      if(taken && ev->kind == WM_EventKind_Press) { mv->outline.focused = 0; }
+    }
+    if(!taken) { taken = op_panel_handle_event(&mv->outline, view, mv->os, ev); }
     if(!taken) { mdp_view_handle_event(view, mv->os, ev); }
+
+    //- a recent file was clicked; one that is gone is forgotten
+    String8 recent = rp_panel_take_activated(scratch.arena, &mv->recent);
+    if(recent.size && !mv_open_path(recent, 0)) { rp_recent_remove(&mv->recent, recent); }
   }
 
   //- native file picker
@@ -621,11 +629,18 @@ frame(void)
     if(picked.size) { mv_open_path(picked, 0); }
   }
 
+  //- the outline follows the preview
+  mv->outline.x0 = rp_panel_width_px(&mv->recent, mv->os);
+  view->left_inset = mv->outline.x0 + op_panel_width_px(&mv->outline, mv->os);
+  op_panel_update(&mv->outline, view, mv->os);
+
   //- draw
   DR_Bucket *bucket = dr_bucket_make();
   DR_BucketScope(bucket)
   {
     mdp_view_draw(view, mv->os);
+    op_panel_draw(&mv->outline, view, mv->os);
+    rp_panel_draw(&mv->recent, view, mv->os);
     mv_title_bar_draw(&title);
   }
 
@@ -656,6 +671,9 @@ entry_point(CmdLine *cmdline)
   mv = push_array(arena, MV_State, 1);
   mv->arena = arena;
   mdp_view_init(&mv->view);
+  op_panel_init(&mv->outline);
+  rp_panel_init(&mv->recent);
+  rp_recent_load(&mv->recent);
   mv->caption_pressed = -1;
 
   mv->os = wm_window_open(r2f32p(0, 0, 1100, 900), WM_WindowFlag_UseDefaultPosition|WM_WindowFlag_CustomBorder, str8_lit("Preview"));
@@ -663,10 +681,9 @@ entry_point(CmdLine *cmdline)
   mv_load_fonts(&mv->view.fonts);
 
   String8 path = cmdline->inputs.first ? cmdline->inputs.first->string : str8_zero();
-  if(path.size == 0)
+  if(path.size == 0 && mv->recent.path_count != 0 && file_path_exists(mv->recent.paths[0]))
   {
-    String8 last = mv_last_file_read(arena);
-    if(last.size != 0 && file_path_exists(last)) { path = last; }
+    path = push_str8_copy(arena, mv->recent.paths[0]);
   }
   if(path.size == 0 || !mv_open_path(path, 0))
   {
@@ -679,6 +696,7 @@ entry_point(CmdLine *cmdline)
   for(;!update(););
 
   md_images_reset();
+  ic_release_all();
   r_window_unequip(mv->os, mv->r);
   wm_window_close(mv->os);
 }

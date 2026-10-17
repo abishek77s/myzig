@@ -801,6 +801,13 @@ struct MD_PendingRun
   MD_TextRun v;
 };
 
+typedef struct MD_HeadingNode MD_HeadingNode;
+struct MD_HeadingNode
+{
+  MD_HeadingNode *next;
+  MD_Heading v;
+};
+
 typedef struct MD_Builder MD_Builder;
 struct MD_Builder
 {
@@ -849,6 +856,11 @@ struct MD_Builder
   String8List anchor_names;
   MD_Box *anchor_boxes[4096];
   U64 anchor_count;
+
+  // headings, for the outline
+  MD_HeadingNode *first_heading;
+  MD_HeadingNode *last_heading;
+  U64 heading_count;
 };
 
 internal void
@@ -2169,7 +2181,14 @@ md_build_node(MD_Builder *b, MD_Node *node, U64 depth)
     {
       md_push_heading_box(b, node->level, range, MD_Align_None);
       {
-        String8 slug = md_heading_slug(b->arena, md_plain_text_from_inlines(b->arena, node->inlines));
+        String8 text = md_plain_text_from_inlines(b->arena, node->inlines);
+        MD_HeadingNode *h = push_array(b->arena, MD_HeadingNode, 1);
+        h->v.level = node->level;
+        h->v.text = text;
+        h->v.box = b->current;
+        SLLQueuePush(b->first_heading, b->last_heading, h);
+        b->heading_count += 1;
+        String8 slug = md_heading_slug(b->arena, text);
         String8 unique = slug;
         U64 dup = 0;
         for(String8Node *n = b->anchor_names.first; n != 0; n = n->next) { if(str8_match(n->string, slug, 0)) { dup += 1; } }
@@ -2534,6 +2553,12 @@ md_element_build(Arena *arena, MD_Document *doc, MD_Style *style, String8 base_d
       el->anchor_names[i] = n->string;
       el->anchor_boxes[i] = b->anchor_boxes[i];
     }
+  }
+  el->heading_count = b->heading_count;
+  el->headings = push_array(arena, MD_Heading, b->heading_count + 1);
+  {
+    U64 i = 0;
+    for(MD_HeadingNode *n = b->first_heading; n != 0; n = n->next, i += 1) { el->headings[i] = n->v; }
   }
   return el;
 }

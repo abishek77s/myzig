@@ -65,6 +65,10 @@ struct TH_Colors
   Vec4F32 search_match_background;
   Vec4F32 search_active_match_background;
   Vec4F32 ghost_element_hover;
+  Vec4F32 ghost_element_selected;
+  Vec4F32 panel_focused_border;
+  Vec4F32 panel_indent_guide;
+  Vec4F32 panel_indent_guide_active;
   Vec4F32 text_placeholder;
   Vec4F32 border_focused;
   Vec4F32 scrollbar_thumb_background;

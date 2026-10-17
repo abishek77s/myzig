@@ -275,6 +275,15 @@ struct MD_Link
   String8 url;
 };
 
+// A heading, for the outline: its level, its text, and its box.
+typedef struct MD_Heading MD_Heading;
+struct MD_Heading
+{
+  U64 level;
+  String8 text;                  // plain text of the heading's inlines
+  MD_Box *box;
+};
+
 typedef struct MD_Element MD_Element;
 struct MD_Element
 {
@@ -289,6 +298,8 @@ struct MD_Element
   String8 *anchor_names;         // heading slugs, "footnote:<label>"
   MD_Box **anchor_boxes;
   U64 anchor_count;
+  MD_Heading *headings;          // in document order
+  U64 heading_count;
   F32 width;
   F32 height;
 };

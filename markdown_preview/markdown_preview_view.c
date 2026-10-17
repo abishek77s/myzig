@@ -47,6 +47,7 @@ mdp_geometry(MDP_View *view, WM_Window window)
   MDP_Geometry g = {0};
   g.client = wm_client_rect_from_window(window);
   g.client.y0 = Min(g.client.y0 + view->top_inset, g.client.y1);
+  g.client.x0 = Min(g.client.x0 + view->left_inset, g.client.x1);
   F32 dpi = wm_dpi_from_window(window);
   g.scale = (dpi > 0) ? dpi/96.f : 1.f;
   g.rem = round_f32(view->font_size*g.scale);
@@ -291,6 +292,36 @@ mdp_view_scroll_to_position(MDP_View *view, MDP_Geometry *g, U64 row, U64 column
   MD_Text *t = md_element_text_for_source_index(view->element, offset);
   mdp_view_autoscroll_to_text(view, g, t);
   if(t) { view->ix.active_root_index = md_box_root_index(t->box); }
+}
+
+// The outline panel's jump: the heading's box to the top of the viewport,
+// below the container's p_4.
+internal void
+mdp_view_scroll_to_heading_index(MDP_View *view, WM_Window window, U64 index)
+{
+  MDP_Geometry g = mdp_geometry(view, window);
+  if(index >= view->element->heading_count) { return; }
+  MD_Box *box = view->element->headings[index].box;
+  view->scroll_y = Clamp(0, box->rect.y0, g.max_scroll);
+  view->scroll_activity_us = now_time_us();
+  view->ix.active_root_index = md_box_root_index(box);
+}
+
+// The heading being read: the last one that starts in the top fifth of the
+// viewport or above it, or max_U64 above the first.
+internal U64
+mdp_view_heading_index_at_top(MDP_View *view, WM_Window window)
+{
+  MDP_Geometry g = mdp_geometry(view, window);
+  MD_Element *el = view->element;
+  U64 result = max_U64;
+  F32 top = view->scroll_y + g.padding + 0.2f*(g.client.y1 - g.client.y0);
+  for EachIndex(i, el->heading_count)
+  {
+    if(g.padding + el->headings[i].box->rect.y0 > top) { break; }
+    result = i;
+  }
+  return result;
 }
 
 // Targets for a link into another file wait until that file is laid out
