@@ -22,23 +22,308 @@ struct MDP_Geometry
 
 internal void mdp_view_apply_pending_target(MDP_View *view, struct MDP_Geometry *g);
 internal void mdp_search_refresh(MDP_View *view, struct MDP_Geometry *g);
+internal void mdp_search_reset(MDP_View *view);
+
+////////////////////////////////
+//~ Source
+
+// Source bytes: a slice of the text in memory, or read from the file. The
+// file is opened per read and shared, so an editor can still save it.
+internal String8
+mdp_source_read(MDP_View *view, Arena *arena, Rng1U64 range)
+{
+  range.max = Min(range.max, view->source_size);
+  range.min = Min(range.min, range.max);
+  if(view->in_memory) { return str8_substr(view->text, range); }
+  String8 result = {0};
+  File file = file_open(AccessFlag_Read|AccessFlag_ShareRead|AccessFlag_ShareWrite, view->path);
+  if(!file_match(file, file_zero()))
+  {
+    result = string_from_file_range(arena, file, range);
+    file_close(file);
+  }
+  return result;
+}
+
+////////////////////////////////
+//~ Chunks
 
 internal void
-mdp_view_ensure_element(MDP_View *view, F32 width)
+mdp_chunk_evict(MDP_Chunk *c)
 {
-  MD_Style *style = &view->style;
-  if(view->element == 0 || view->element_dirty || view->element_width != width ||
-     view->element_rem != style->rem || view->element_theme != view->theme_kind)
+  if(c->arena) { arena_release(c->arena); }
+  c->arena = 0;
+  c->element = 0;
+  MemoryZeroStruct(&c->doc);
+  c->matches = 0;
+  c->match_count = 0;
+  c->matches_key = 0;
+}
+
+// Takes the chunks the scanner found since the last call.
+internal void
+mdp_view_sync_chunks(MDP_View *view)
+{
+  U64 n = view->scanner.chunk_count;
+  if(n > view->chunk_cap)
   {
-    arena_clear(view->element_arena);
-    view->element = md_element_build(view->element_arena, &view->doc, style, view->base_dir);
-    md_element_layout(view->element, style, width);
-    view->element_dirty = 0;
-    view->element_generation += 1;
-    view->element_width = width;
-    view->element_rem = style->rem;
-    view->element_theme = view->theme_kind;
+    U64 cap = Max(n, view->chunk_cap*2 + 64);
+    MDP_Chunk *bigger = push_array(view->chunk_arena, MDP_Chunk, cap);
+    if(view->chunk_count) { MemoryCopy(bigger, view->chunks, sizeof(MDP_Chunk)*view->chunk_count); }
+    view->chunks = bigger;
+    view->chunk_cap = cap;
   }
+  view->chunk_count = n;
+}
+
+internal void mdp_view_place_chunks(MDP_View *view);
+
+// Feeds the scanner the file, a piece at a time, until the budget runs out.
+internal void
+mdp_view_scan(MDP_View *view, U64 budget_us)
+{
+  MD_Scanner *s = &view->scanner;
+  U64 start_us = now_time_us();
+  for(;!s->done;)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    Rng1U64 range = r1u64(s->offset, Min(s->offset + view->scan_read_size, view->source_size));
+    String8 data = mdp_source_read(view, scratch.arena, range);
+    B32 eof = (range.max >= view->source_size || data.size < dim_1u64(range));
+    U64 used = md_scanner_feed(s, data, eof);
+    if(used == 0 && !s->done) { view->scan_read_size *= 2; } // a line longer than the read
+    scratch_end(scratch);
+    if(now_time_us() - start_us >= budget_us) { break; }
+  }
+  mdp_view_sync_chunks(view);
+  mdp_view_place_chunks(view);
+}
+
+internal B32
+mdp_chunk_is_built(MDP_View *view, MDP_Chunk *c)
+{
+  return c->element != 0 && c->build_key == view->build_key && c->measure_width == view->layout_width;
+}
+
+internal MD_Document
+mdp_chunk_parse(MDP_View *view, Arena *arena, U64 i)
+{
+  MD_ScanChunk *sc = &view->scanner.chunks[i];
+  String8 text = mdp_source_read(view, arena, sc->range);
+  MD_Document doc = md_parse_part(arena, text, sc->range.min, &view->scanner.refs);
+  // the last block loses its bottom margin only at the end of the document
+  doc.end = view->scanner.done ? view->scanner.end : max_U64;
+  doc.root_base = sc->root_base;
+  doc.footnotes_before = sc->footnotes_before;
+  return doc;
+}
+
+// Reads, parses, builds and lays out a chunk, unless it is already.
+internal MDP_Chunk *
+mdp_chunk_build(MDP_View *view, U64 i)
+{
+  MDP_Chunk *c = &view->chunks[i];
+  if(mdp_chunk_is_built(view, c)) { return c; }
+  if(c->arena == 0) { c->arena = arena_alloc(); }
+  arena_clear(c->arena);
+  c->doc = mdp_chunk_parse(view, c->arena, i);
+  c->element = md_element_build(c->arena, &c->doc, &view->style, view->base_dir, mdp_text_base_from_chunk(i), 0);
+  md_element_layout(c->element, &view->style, view->layout_width);
+  c->build_key = view->build_key;
+  c->height = c->element->height;
+  c->lead = c->element->lead;
+  c->trail = c->element->trail;
+  c->measure_width = view->layout_width;
+  c->measure_rem = view->style.rem;
+  c->matches_key = 0;
+  return c;
+}
+
+// A chunk's element for its texts alone: the built one, or one built in
+// `arena` that loads no images and is not laid out.
+internal MD_Element *
+mdp_chunk_text_element(MDP_View *view, Arena *arena, U64 i, MD_Document **doc_out)
+{
+  MDP_Chunk *c = &view->chunks[i];
+  if(c->element && c->build_key == view->build_key)
+  {
+    if(doc_out) { *doc_out = &c->doc; }
+    return c->element;
+  }
+  MD_Document *doc = push_array(arena, MD_Document, 1);
+  *doc = mdp_chunk_parse(view, arena, i);
+  if(doc_out) { *doc_out = doc; }
+  return md_element_build(arena, doc, &view->style, view->base_dir, mdp_text_base_from_chunk(i), 1);
+}
+
+// Stacks the chunks, collapsing the margins between their blocks as one
+// element would. Chunks not laid out at this width take an estimate from
+// the ones that are.
+internal void
+mdp_view_place_chunks(MDP_View *view)
+{
+  F64 measured_h = 0, measured_bytes = 0;
+  for EachIndex(i, view->chunk_count)
+  {
+    MDP_Chunk *c = &view->chunks[i];
+    if(c->measure_width == view->layout_width && c->measure_rem == view->style.rem)
+    {
+      measured_h += c->height;
+      measured_bytes += dim_1u64(view->scanner.chunks[i].range);
+    }
+  }
+  view->px_per_byte = (measured_bytes > 0) ? (F32)(measured_h/measured_bytes) : ClampBot(view->style.rem, 16.f)/48.f;
+  F32 y = 0;
+  F32 prev_trail = 0;
+  for EachIndex(i, view->chunk_count)
+  {
+    MDP_Chunk *c = &view->chunks[i];
+    if(c->measure_width != view->layout_width || c->measure_rem != view->style.rem)
+    {
+      c->height = dim_1u64(view->scanner.chunks[i].range)*view->px_per_byte;
+      c->lead = c->trail = 0;
+    }
+    y -= Min(prev_trail, c->lead);
+    c->y = y;
+    y += c->height;
+    prev_trail = c->trail;
+  }
+  view->tail_y = y;
+  U64 scanned = view->chunk_count ? view->scanner.chunks[view->chunk_count-1].range.max : 0;
+  view->content_height = y + (view->scanner.done ? 0 : (view->source_size - scanned)*view->px_per_byte);
+}
+
+// The last chunk that starts at or above y.
+internal U64
+mdp_chunk_at_y(MDP_View *view, F32 y)
+{
+  U64 lo = 0, hi = view->chunk_count;
+  for(;lo + 1 < hi;)
+  {
+    U64 mid = (lo + hi)/2;
+    if(view->chunks[mid].y <= y) { lo = mid; } else { hi = mid; }
+  }
+  return lo;
+}
+
+// The chunk holding a source offset.
+internal U64
+mdp_chunk_from_offset(MDP_View *view, U64 offset)
+{
+  U64 lo = 0, hi = view->chunk_count;
+  for(;lo + 1 < hi;)
+  {
+    U64 mid = (lo + hi)/2;
+    if(view->scanner.chunks[mid].range.min <= offset) { lo = mid; } else { hi = mid; }
+  }
+  return lo;
+}
+
+// The scroll position as a place in the chunk it falls in, which outlasts
+// changes to the heights of the chunks above it.
+typedef struct MDP_Anchor MDP_Anchor;
+struct MDP_Anchor
+{
+  U64 chunk;
+  F32 dy;
+  F32 height;
+};
+
+internal MDP_Anchor
+mdp_view_anchor(MDP_View *view)
+{
+  MDP_Anchor a = {0};
+  if(view->chunk_count && view->scroll_y > 0)
+  {
+    a.chunk = mdp_chunk_at_y(view, view->scroll_y);
+    a.dy = view->scroll_y - view->chunks[a.chunk].y;
+    a.height = view->chunks[a.chunk].height;
+  }
+  return a;
+}
+
+// Puts the scroll position back at its anchor; when the anchor chunk itself
+// changed height (it got laid out, or the font size changed), at the same
+// fraction of it.
+internal void
+mdp_view_restore_anchor(MDP_View *view, MDP_Anchor a)
+{
+  if(a.chunk >= view->chunk_count) { return; }
+  MDP_Chunk *c = &view->chunks[a.chunk];
+  F32 dy = a.dy;
+  if(c->height != a.height && a.height > 0 && dy > 0 && dy < a.height) { dy = dy/a.height*c->height; }
+  view->scroll_y = c->y + dy;
+}
+
+// Builds the chunks around the viewport and drops those far from it. As
+// chunks get laid out, those above the viewport change height, so the
+// scroll position follows the chunk it is in.
+internal void
+mdp_view_update_chunks(MDP_View *view, MDP_Geometry *g, B32 stick_to_bottom)
+{
+  if(view->build_rem != view->style.rem || view->build_theme != view->theme_kind || view->build_scan_done != view->scanner.done)
+  {
+    view->build_key += 1;
+    view->build_rem = view->style.rem;
+    view->build_theme = view->theme_kind;
+    view->build_scan_done = view->scanner.done;
+  }
+  // the anchor, from the positions the scroll position was set against
+  MDP_Anchor anchor = mdp_view_anchor(view);
+  view->layout_width = g->content_w;
+  mdp_view_place_chunks(view);
+  if(!stick_to_bottom) { mdp_view_restore_anchor(view, anchor); }
+  F32 viewport_h = g->client.y1 - g->client.y0;
+  view->scan_urgent = (!view->scanner.done && view->tail_y < view->scroll_y - g->padding + 1.5f*viewport_h);
+  if(view->chunk_count == 0) { return; }
+  for(U64 pass = 0; pass < 8; pass += 1)
+  {
+    if(stick_to_bottom) { view->scroll_y = ClampBot(0, view->content_height + 2*g->padding - viewport_h); }
+    F32 top = view->scroll_y - g->padding - 0.5f*viewport_h;
+    F32 bottom = view->scroll_y - g->padding + 1.5f*viewport_h;
+    B32 built = 0;
+    for(U64 i = mdp_chunk_at_y(view, top); i < view->chunk_count && view->chunks[i].y < bottom; i += 1)
+    {
+      if(!mdp_chunk_is_built(view, &view->chunks[i])) { mdp_chunk_build(view, i); built = 1; }
+    }
+    if(!built) { break; }
+    mdp_view_place_chunks(view);
+    if(!stick_to_bottom) { mdp_view_restore_anchor(view, anchor); }
+  }
+
+  //- drop what is far away, and the images only it showed
+  F32 keep_top = view->scroll_y - g->padding - 2*viewport_h;
+  F32 keep_bottom = view->scroll_y - g->padding + 3*viewport_h;
+  B32 evicted = 0;
+  for EachIndex(i, view->chunk_count)
+  {
+    MDP_Chunk *c = &view->chunks[i];
+    if(c->arena && (c->y + c->height < keep_top || c->y > keep_bottom)) { mdp_chunk_evict(c); evicted = 1; }
+  }
+  if(evicted)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    MD_Element **keep = push_array(scratch.arena, MD_Element *, view->chunk_count);
+    U64 keep_count = 0;
+    for EachIndex(i, view->chunk_count) { if(view->chunks[i].element) { keep[keep_count++] = view->chunks[i].element; } }
+    md_images_trim(keep, keep_count);
+    scratch_end(scratch);
+  }
+}
+
+// Builds a chunk away from the viewport (a link or search target), keeping
+// the viewport's content where it is.
+internal MDP_Chunk *
+mdp_view_build_chunk_at(MDP_View *view, MDP_Geometry *g, U64 i)
+{
+  MDP_Anchor anchor = mdp_view_anchor(view);
+  MDP_Chunk *c = mdp_chunk_build(view, i);
+  mdp_view_place_chunks(view);
+  mdp_view_restore_anchor(view, anchor);
+  F32 viewport_h = g->client.y1 - g->client.y0;
+  g->total_h = view->content_height + 2*g->padding;
+  g->max_scroll = ClampBot(0, g->total_h - viewport_h);
+  return c;
 }
 
 internal MDP_Geometry
@@ -66,13 +351,14 @@ mdp_geometry(MDP_View *view, WM_Window window)
   F32 avail = (g.client.x1 - g.client.x0) - 2*g.padding;
   g.content_w = floor_f32(ClampBot(1, Min(avail, MDP_MAX_WIDTH_PX*g.scale)));
   g.content_x = g.client.x0 + g.padding + floor_f32((avail - g.content_w)/2);
-  mdp_view_ensure_element(view, g.content_w);
 
   F32 viewport_h = g.client.y1 - g.client.y0;
-  g.total_h = view->element->height + 2*g.padding;
+  B32 at_bottom = (view->scroll_y > 0 && view->scroll_y >= view->content_height + 2*g.padding - viewport_h - 0.5f);
+  mdp_view_update_chunks(view, &g, at_bottom);
+  g.total_h = view->content_height + 2*g.padding;
   g.max_scroll = ClampBot(0, g.total_h - viewport_h);
   view->scroll_y = Clamp(0, view->scroll_y, g.max_scroll);
-  if(view->pending_target != MDP_LinkTargetKind_None) { mdp_view_apply_pending_target(view, &g); }
+  if(view->pending_target != MDP_LinkTargetKind_None || view->pending_offset_valid) { mdp_view_apply_pending_target(view, &g); }
   mdp_search_refresh(view, &g);
   g.origin = v2f32(g.content_x, g.client.y0 + g.padding - round_f32(view->scroll_y));
 
@@ -94,6 +380,127 @@ mdp_geometry(MDP_View *view, WM_Window window)
 }
 
 ////////////////////////////////
+//~ Selection Space Across Chunks
+
+internal MD_Hit
+mdp_view_hit_test(MDP_View *view, Vec2F32 p, MD_Element **el_out)
+{
+  MD_Hit hit = {0};
+  *el_out = 0;
+  if(view->chunk_count == 0) { return hit; }
+  MDP_Chunk *c = &view->chunks[mdp_chunk_at_y(view, p.y)];
+  if(c->element == 0) { return hit; }
+  *el_out = c->element;
+  return md_element_hit_test(c->element, &view->ix, v2f32(p.x, p.y - c->y));
+}
+
+internal String8
+mdp_view_link_url(MD_Element *el, U64 link)
+{
+  return (el && link && link <= el->link_count) ? el->links[link-1].url : str8_zero();
+}
+
+internal U64
+mdp_view_offset_from_point(MDP_View *view, Vec2F32 p)
+{
+  if(view->chunk_count == 0) { return 0; }
+  U64 i = mdp_chunk_at_y(view, p.y);
+  // a point past the chunks that are built (a drag far out of view): the nearest one that is
+  if(view->chunks[i].element == 0)
+  {
+    U64 j = i;
+    for(;j > 0 && view->chunks[j].element == 0; j -= 1);
+    if(view->chunks[j].element == 0)
+    {
+      for(j = i; j+1 < view->chunk_count && view->chunks[j].element == 0; j += 1);
+    }
+    if(view->chunks[j].element == 0) { return mdp_text_base_from_chunk(i); }
+    i = j;
+  }
+  MDP_Chunk *c = &view->chunks[i];
+  return md_element_offset_from_point(c->element, &view->style, &view->ix, v2f32(p.x, p.y - c->y));
+}
+
+internal MD_Element *
+mdp_view_element_at_offset(MDP_View *view, U64 offset)
+{
+  U64 i = mdp_chunk_from_text_offset(offset);
+  return (i < view->chunk_count) ? view->chunks[i].element : 0;
+}
+
+internal Rng1U64
+mdp_view_word_at(MDP_View *view, U64 offset)
+{
+  MD_Element *el = mdp_view_element_at_offset(view, offset);
+  return el ? md_element_word_at(el, offset) : r1u64(offset, offset);
+}
+
+// The rendered text in a selection, through every chunk it covers.
+internal String8
+mdp_view_text_in_range(MDP_View *view, Arena *arena, U64 start, U64 end)
+{
+  if(end <= start || view->chunk_count == 0) { return str8_zero(); }
+  U64 a = mdp_chunk_from_text_offset(start);
+  U64 z = Min(mdp_chunk_from_text_offset(end), view->chunk_count-1);
+  String8List parts = {0};
+  for(U64 i = a; i <= z; i += 1)
+  {
+    Temp scratch = scratch_begin(&arena, 1);
+    MD_Element *el = mdp_chunk_text_element(view, scratch.arena, i, 0);
+    U64 s = Max(start, el->text_base), e = Min(end, el->text_end);
+    if(s < e)
+    {
+      String8 text = md_element_text_in_range(arena, el, s, e);
+      if(text.size) { str8_list_push(arena, &parts, text); }
+    }
+    scratch_end(scratch);
+  }
+  return str8_list_join(arena, &parts, &(StringJoin){.sep = str8_lit_comp("\n")});
+}
+
+// The Markdown source behind a selection; across chunks, the source of the
+// blocks it touches.
+internal String8
+mdp_view_source_in_range(MDP_View *view, Arena *arena, U64 start, U64 end)
+{
+  if(end <= start || view->chunk_count == 0) { return str8_zero(); }
+  U64 a = mdp_chunk_from_text_offset(start);
+  U64 z = Min(mdp_chunk_from_text_offset(end), view->chunk_count-1);
+  Temp scratch = scratch_begin(&arena, 1);
+  String8 result = {0};
+  MD_Document *doc_a = 0;
+  MD_Element *el_a = mdp_chunk_text_element(view, scratch.arena, a, &doc_a);
+  if(a == z)
+  {
+    if(el_a->text_end > el_a->text_base) { end = Min(end, el_a->text_end - 1); }
+    result = push_str8_copy(arena, md_element_source_in_range(el_a, doc_a, start, end));
+  }
+  else
+  {
+    MD_Element *el_z = mdp_chunk_text_element(view, scratch.arena, z, 0);
+    MD_Text *ta = md_element_text_at(el_a, start);
+    MD_Text *tz = md_element_text_at(el_z, end);
+    Rng1U64 range = r1u64(view->scanner.chunks[a].range.min, view->scanner.chunks[z].range.max);
+    if(ta) { range.min = md_box_source_range(ta->box).min; }
+    if(tz) { range.max = md_box_source_range(tz->box).max; }
+    result = push_str8_copy(arena, str8_skip_chop_whitespace(mdp_source_read(view, scratch.arena, range)));
+  }
+  scratch_end(scratch);
+  return result;
+}
+
+// Puts a selection on the clipboard, as rendered text or as its Markdown
+// source. A selection can span the whole document, so it is gathered in an
+// arena of its own and given back after.
+internal void
+mdp_view_copy(MDP_View *view, U64 start, U64 end, B32 as_markdown)
+{
+  Arena *arena = arena_alloc();
+  wm_set_clipboard_text(as_markdown ? mdp_view_source_in_range(view, arena, start, end) : mdp_view_text_in_range(view, arena, start, end));
+  arena_release(arena);
+}
+
+////////////////////////////////
 //~ Document
 
 internal void
@@ -101,14 +508,34 @@ mdp_view_init(MDP_View *view)
 {
   view->arena = arena_alloc();
   view->doc_arena = arena_alloc();
-  view->element_arena = arena_alloc();
+  view->chunk_arena = arena_alloc();
   view->interaction_arena = arena_alloc();
-  view->search_arena = arena_alloc();
   view->menu_selected = max_U64;
   view->font_size = MDP_DEFAULT_FONT_SIZE_PX;
   view->theme_kind = TH_Kind_OneDark;
   view->theme = th_theme_from_kind(view->theme_kind);
-  view->element_dirty = 1;
+  view->search_key = 1;
+}
+
+// Forgets the document and starts scanning the source again.
+internal void
+mdp_view_reset_document(MDP_View *view)
+{
+  for EachIndex(i, view->chunk_count) { mdp_chunk_evict(&view->chunks[i]); }
+  arena_clear(view->chunk_arena);
+  view->chunks = 0;
+  view->chunk_count = 0;
+  view->chunk_cap = 0;
+  md_scanner_release(&view->scanner);
+  md_scanner_init(&view->scanner, MDP_CHUNK_BYTES);
+  view->scan_read_size = MDP_SCAN_READ_BYTES;
+  view->build_key += 1;
+  view->content_height = 0;
+  view->ix.selection_start = view->ix.selection_end = 0;
+  mdp_search_reset(view);
+
+  // what is on screen first is scanned now, the rest a little each frame
+  mdp_view_scan(view, 20000);
 }
 
 internal void
@@ -123,10 +550,10 @@ mdp_view_load_text(MDP_View *view, String8 name, String8 path, String8 text)
   view->path = push_str8_copy(view->doc_arena, path_copy);
   view->base_dir = push_str8_copy(view->doc_arena, str8_chop_last_slash(path_copy));
   view->text = push_str8_copy(view->doc_arena, text_copy);
+  view->in_memory = 1;
+  view->source_size = view->text.size;
   view->error = str8_zero();
-  view->doc = md_parse(view->doc_arena, view->text);
-  view->element_dirty = 1;
-  view->ix.selection_start = view->ix.selection_end = 0;
+  mdp_view_reset_document(view);
   scratch_end(scratch);
 }
 
@@ -136,21 +563,39 @@ mdp_view_open_path(MDP_View *view, String8 path, B32 keep_scroll)
   Temp scratch = scratch_begin(0, 0);
   String8 full = full_path_from_path(scratch.arena, path);
   FileProperties props = properties_from_file_path(full);
+  File file = file_open(AccessFlag_Read|AccessFlag_ShareRead|AccessFlag_ShareWrite, full);
   B32 ok = 0;
-  if(props.modified != 0 && !(props.flags & FilePropertyFlag_IsFolder))
+  if(props.modified != 0 && !(props.flags & FilePropertyFlag_IsFolder) && !file_match(file, file_zero()))
   {
-    String8 data = data_from_file_path(scratch.arena, full);
-    if(!keep_scroll || !str8_match(full, view->path, 0))
+    B32 same = str8_match(full, view->path, 0);
+    if(!keep_scroll || !same)
     {
       md_images_reset();
       view->scroll_y = 0;
       view->ix.active_root_index = 0;
       view->pending_target = MDP_LinkTargetKind_None;
+      view->pending_offset_valid = 0;
       arena_clear(view->interaction_arena);
       view->ix.first_scroll = 0;
     }
-    mdp_view_load_text(view, str8_skip_last_slash(full), full, data);
+    else if(view->chunk_count)
+    {
+      // a reload keeps the top of the viewport where it was in the source
+      MDP_Chunk *c = &view->chunks[mdp_chunk_at_y(view, view->scroll_y)];
+      view->pending_offset_valid = 1;
+      view->pending_offset = view->scanner.chunks[c - view->chunks].range.min;
+      view->pending_offset_dy = view->scroll_y - c->y;
+    }
+    arena_clear(view->doc_arena);
+    view->name = push_str8_copy(view->doc_arena, str8_skip_last_slash(full));
+    view->path = push_str8_copy(view->doc_arena, full);
+    view->base_dir = push_str8_copy(view->doc_arena, str8_chop_last_slash(full));
+    view->text = str8_zero();
+    view->in_memory = 0;
+    view->source_size = props.size;
+    view->error = str8_zero();
     view->file_modified = props.modified;
+    mdp_view_reset_document(view);
     ok = 1;
   }
   else
@@ -158,17 +603,27 @@ mdp_view_open_path(MDP_View *view, String8 path, B32 keep_scroll)
     view->error = push_str8f(view->arena, "Could not open %S", full);
     view->error_until_us = now_time_us() + 4000000;
   }
+  file_close(file);
   scratch_end(scratch);
   return ok;
 }
 
-// Re-reads the file when it changed on disk, after Zed's reparse debounce.
+internal void mdp_search_count(MDP_View *view, U64 budget_us);
+
+// Once a frame: re-reads the file when it changed on disk (after Zed's
+// reparse debounce), scans more of it, and counts more search matches.
 internal void
 mdp_view_poll_file(MDP_View *view)
 {
-  // a remote image finished downloading: lay the document out again
-  if(md_images_poll()) { view->element_dirty = 1; }
-  if(view->path.size == 0) { return; }
+  // a remote image finished downloading: build the chunks again
+  if(md_images_poll()) { view->build_key += 1; }
+  if(!view->scanner.done)
+  {
+    // the viewport waits on the scan: scan harder
+    mdp_view_scan(view, view->scan_urgent ? 4*MDP_SCAN_BUDGET_US : MDP_SCAN_BUDGET_US);
+  }
+  mdp_search_count(view, MDP_SCAN_BUDGET_US);
+  if(view->path.size == 0 || view->in_memory) { return; }
   U64 now = now_time_us();
   if(view->reload_at_us == 0)
   {
@@ -186,6 +641,38 @@ mdp_view_poll_file(MDP_View *view)
   }
 }
 
+// on_checkbox_toggle: [ ] <-> [x]. One byte changes, so the scan still holds
+// and only the chunk with the checkbox is built again.
+internal void
+mdp_view_toggle_task(MDP_View *view, U64 offset)
+{
+  Temp scratch = scratch_begin(0, 0);
+  String8 current = mdp_source_read(view, scratch.arena, r1u64(offset, offset+1));
+  if(current.size == 1 && view->chunk_count)
+  {
+    U8 c = (current.str[0] == ' ') ? 'x' : ' ';
+    B32 ok = 1;
+    if(view->in_memory)
+    {
+      view->text.str[offset] = c;
+    }
+    else
+    {
+      File file = file_open(AccessFlag_Write|AccessFlag_Append|AccessFlag_ShareRead|AccessFlag_ShareWrite, view->path);
+      ok = !file_match(file, file_zero()) && file_write(file, r1u64(offset, offset+1), &c) == 1;
+      file_close(file);
+      view->file_modified = properties_from_file_path(view->path).modified;
+    }
+    if(ok) { view->chunks[mdp_chunk_from_offset(view, offset)].build_key = 0; }
+    else
+    {
+      view->error = push_str8f(view->arena, "Could not write %S", view->path);
+      view->error_until_us = now_time_us() + 4000000;
+    }
+  }
+  scratch_end(scratch);
+}
+
 ////////////////////////////////
 //~ Scrolling
 
@@ -197,10 +684,17 @@ mdp_view_scroll_by(MDP_View *view, F32 dy)
 }
 
 internal void
-mdp_view_scroll_to_box(MDP_View *view, MDP_Geometry *g, MD_Box *box)
+mdp_view_scroll_to_box(MDP_View *view, MDP_Geometry *g, MDP_Chunk *c, MD_Box *box)
 {
-  view->scroll_y = Clamp(0, g->padding + box->rect.y0, g->max_scroll);
+  view->scroll_y = Clamp(0, g->padding + c->y + box->rect.y0, g->max_scroll);
   view->scroll_activity_us = now_time_us();
+}
+
+internal F32
+mdp_text_chunk_y(MDP_View *view, MD_Text *t)
+{
+  U64 i = mdp_chunk_from_text_offset(t->global_start);
+  return (i < view->chunk_count) ? view->chunks[i].y : 0;
 }
 
 // MarkdownElement::autoscroll (AutoscrollBehavior::Controlled): keep the
@@ -213,7 +707,7 @@ mdp_view_autoscroll_to_line(MDP_View *view, MDP_Geometry *g, MD_Text *t, U64 lin
   F32 margin = line_h*3.f;
   F32 top_goal = g->client.y0 + margin;
   F32 bottom_goal = g->client.y1 - margin;
-  F32 y = g->client.y0 + g->padding - view->scroll_y + t->box->rect.y0 + line_index*line_h;
+  F32 y = g->client.y0 + g->padding - view->scroll_y + mdp_text_chunk_y(view, t) + t->box->rect.y0 + line_index*line_h;
   if(y < top_goal) { view->scroll_y -= top_goal - y; }
   else if(y + line_h > bottom_goal) { view->scroll_y += (y + line_h) - bottom_goal; }
   view->scroll_y = Clamp(0, view->scroll_y, g->max_scroll);
@@ -231,7 +725,10 @@ mdp_view_autoscroll_to_text(MDP_View *view, MDP_Geometry *g, MD_Text *t)
 internal void
 mdp_view_autoscroll_to_offset(MDP_View *view, MDP_Geometry *g, U64 offset)
 {
-  MD_Text *t = md_element_text_at(view->element, offset);
+  U64 i = mdp_chunk_from_text_offset(offset);
+  if(i >= view->chunk_count) { return; }
+  MDP_Chunk *c = mdp_view_build_chunk_at(view, g, i);
+  MD_Text *t = md_element_text_at(c->element, offset);
   if(t == 0 || t->lines == 0) { return; }
   U64 local = offset - t->global_start;
   U64 li = 0;
@@ -251,16 +748,68 @@ mdp_view_autoscroll_to_offset(MDP_View *view, MDP_Geometry *g, U64 offset)
   }
 }
 
-internal MD_Box *
-mdp_view_anchor_box(MDP_View *view, String8 name)
+//- headings
+
+internal MD_ScanHeading *
+mdp_view_headings(MDP_View *view, U64 *count_out)
 {
-  MD_Element *el = view->element;
-  for EachIndex(i, el->anchor_count)
+  *count_out = view->scanner.heading_count;
+  return view->scanner.headings;
+}
+
+// The last heading that starts at or before a source offset, or max_U64.
+internal U64
+mdp_heading_at_or_before(MDP_View *view, U64 offset)
+{
+  MD_ScanHeading *h = view->scanner.headings;
+  U64 lo = 0, hi = view->scanner.heading_count;
+  for(;lo < hi;)
   {
-    // heading_slugs is a HashMap: exact, case-sensitive lookup
-    if(str8_match(el->anchor_names[i], name, 0)) { return el->anchor_boxes[i]; }
+    U64 mid = (lo + hi)/2;
+    if(h[mid].offset <= offset) { lo = mid + 1; } else { hi = mid; }
+  }
+  return lo ? lo-1 : max_U64;
+}
+
+internal MD_Box *
+mdp_chunk_heading_box(MDP_Chunk *c, U64 offset)
+{
+  for EachIndex(i, c->element->heading_count)
+  {
+    if(c->element->headings[i].box->src.min == offset) { return c->element->headings[i].box; }
   }
   return 0;
+}
+
+// The heading a `#slug` names: heading_slugs maps each heading's slug, and
+// a repeated slug also as slug-N (N = earlier anchors with that slug).
+internal U64
+mdp_heading_from_slug(MDP_View *view, String8 name)
+{
+  Temp scratch = scratch_begin(0, 0);
+  typedef struct MDP_SlugCount MDP_SlugCount;
+  struct MDP_SlugCount { MDP_SlugCount *next; String8 slug; U64 count; };
+  U64 slot_count = 4096;
+  MDP_SlugCount **slots = push_array(scratch.arena, MDP_SlugCount *, slot_count);
+  U64 result = max_U64;
+  for EachIndex(i, view->scanner.heading_count)
+  {
+    String8 names[2] = {md_heading_slug(scratch.arena, view->scanner.headings[i].text)};
+    U64 name_count = 1;
+    for EachIndex(k, name_count)
+    {
+      if(str8_match(names[k], name, 0)) { result = i; goto done; }
+      MDP_SlugCount **slot = &slots[u64_hash_from_str8(names[k]) % slot_count];
+      MDP_SlugCount *n = *slot;
+      for(;n != 0 && !str8_match(n->slug, names[k], 0); n = n->next);
+      if(n == 0) { n = push_array(scratch.arena, MDP_SlugCount, 1); n->slug = names[k]; SLLStackPush(*slot, n); }
+      if(k == 0 && n->count) { names[name_count++] = push_str8f(scratch.arena, "%S-%I64u", names[0], n->count); }
+      n->count += 1;
+    }
+  }
+  done:;
+  scratch_end(scratch);
+  return result;
 }
 
 // Markdown::scroll_to_heading, plus the editor-cursor move Zed does for links
@@ -268,30 +817,69 @@ mdp_view_anchor_box(MDP_View *view, String8 name)
 internal B32
 mdp_view_scroll_to_heading(MDP_View *view, MDP_Geometry *g, String8 slug, B32 activate)
 {
-  MD_Box *box = mdp_view_anchor_box(view, slug);
+  U64 index = mdp_heading_from_slug(view, slug);
+  if(index == max_U64 || view->chunk_count == 0) { return 0; }
+  U64 offset = view->scanner.headings[index].offset;
+  MDP_Chunk *c = mdp_view_build_chunk_at(view, g, mdp_chunk_from_offset(view, offset));
+  MD_Box *box = mdp_chunk_heading_box(c, offset);
   if(box == 0) { return 0; }
-  MD_Text *t = md_element_first_text_in(view->element, box);
-  mdp_view_autoscroll_to_text(view, g, t);
+  mdp_view_autoscroll_to_text(view, g, md_element_first_text_in(c->element, box));
   if(activate) { view->ix.active_root_index = md_box_root_index(box); }
   return 1;
 }
 
-// navigate_to_link_target / sync_preview_to_source_index for a row and column
+// A footnote reference's target: the definition's content.
 internal void
+mdp_view_scroll_to_footnote(MDP_View *view, MDP_Geometry *g, String8 anchor)
+{
+  String8 label = str8_skip(anchor, 9);
+  for EachIndex(i, view->scanner.footnote_count)
+  {
+    MD_ScanFootnote *f = &view->scanner.footnotes[i];
+    if(!str8_match(f->label, label, 0)) { continue; }
+    MDP_Chunk *c = mdp_view_build_chunk_at(view, g, mdp_chunk_from_offset(view, f->offset));
+    MD_Element *el = c->element;
+    for EachIndex(k, el->anchor_count)
+    {
+      if(str8_match(el->anchor_names[k], anchor, 0))
+      {
+        mdp_view_autoscroll_to_text(view, g, md_element_first_text_in(el, el->anchor_boxes[k]));
+        break;
+      }
+    }
+    break;
+  }
+}
+
+// navigate_to_link_target / sync_preview_to_source_index for a row and
+// column. False while the scan has not reached the row.
+internal B32
 mdp_view_scroll_to_position(MDP_View *view, MDP_Geometry *g, U64 row, U64 column)
 {
-  String8 src = view->doc.source;
+  if(view->chunk_count == 0) { return view->scanner.done; }
+  MD_ScanChunk *last = &view->scanner.chunks[view->chunk_count-1];
+  if(!view->scanner.done && row >= last->line_base) { return 0; }
+  U64 lo = 0, hi = view->chunk_count;
+  for(;lo + 1 < hi;)
+  {
+    U64 mid = (lo + hi)/2;
+    if(view->scanner.chunks[mid].line_base <= row) { lo = mid; } else { hi = mid; }
+  }
+  MD_ScanChunk *sc = &view->scanner.chunks[lo];
+  MDP_Chunk *c = mdp_view_build_chunk_at(view, g, lo);
+  String8 src = c->doc.source;
   U64 offset = 0;
-  for(U64 r = 0; r < row && offset < src.size; r += 1)
+  for(U64 r = sc->line_base; r < row && offset < src.size; r += 1)
   {
     U64 nl = str8_find_needle(src, offset, str8_lit("\n"), 0);
     offset = (nl < src.size) ? nl+1 : src.size;
   }
   U64 nl = str8_find_needle(src, offset, str8_lit("\n"), 0);
-  offset = Min(offset + column, nl);
-  MD_Text *t = md_element_text_for_source_index(view->element, offset);
+  offset = sc->range.min + Min(offset + column, nl);
+  MD_Text *t = md_element_text_for_source_index(c->element, offset);
   mdp_view_autoscroll_to_text(view, g, t);
   if(t) { view->ix.active_root_index = md_box_root_index(t->box); }
+  return 1;
 }
 
 // The outline panel's jump: the heading's box to the top of the viewport,
@@ -300,11 +888,13 @@ internal void
 mdp_view_scroll_to_heading_index(MDP_View *view, WM_Window window, U64 index)
 {
   MDP_Geometry g = mdp_geometry(view, window);
-  if(index >= view->element->heading_count) { return; }
-  MD_Box *box = view->element->headings[index].box;
-  view->scroll_y = Clamp(0, box->rect.y0, g.max_scroll);
+  if(index >= view->scanner.heading_count || view->chunk_count == 0) { return; }
+  U64 offset = view->scanner.headings[index].offset;
+  MDP_Chunk *c = mdp_view_build_chunk_at(view, &g, mdp_chunk_from_offset(view, offset));
+  MD_Box *box = mdp_chunk_heading_box(c, offset);
+  view->scroll_y = Clamp(0, c->y + (box ? box->rect.y0 : 0), g.max_scroll);
   view->scroll_activity_us = now_time_us();
-  view->ix.active_root_index = md_box_root_index(box);
+  if(box) { view->ix.active_root_index = md_box_root_index(box); }
 }
 
 // The heading being read: the last one that starts in the top fifth of the
@@ -313,34 +903,59 @@ internal U64
 mdp_view_heading_index_at_top(MDP_View *view, WM_Window window)
 {
   MDP_Geometry g = mdp_geometry(view, window);
-  MD_Element *el = view->element;
-  U64 result = max_U64;
-  F32 top = view->scroll_y + g.padding + 0.2f*(g.client.y1 - g.client.y0);
-  for EachIndex(i, el->heading_count)
+  if(view->chunk_count == 0) { return max_U64; }
+  F32 top = view->scroll_y + 0.2f*(g.client.y1 - g.client.y0);
+  U64 i = mdp_chunk_at_y(view, top);
+  MDP_Chunk *c = &view->chunks[i];
+  U64 offset = max_U64;
+  if(c->element)
   {
-    if(g.padding + el->headings[i].box->rect.y0 > top) { break; }
-    result = i;
+    for EachIndex(k, c->element->heading_count)
+    {
+      MD_Box *box = c->element->headings[k].box;
+      if(c->y + box->rect.y0 > top) { break; }
+      offset = box->src.min;
+    }
   }
-  return result;
+  if(offset != max_U64) { return mdp_heading_at_or_before(view, offset); }
+  U64 start = view->scanner.chunks[i].range.min;
+  return start ? mdp_heading_at_or_before(view, start-1) : max_U64;
 }
 
-// Targets for a link into another file wait until that file is laid out
-// (scroll_to_heading_when_parsed).
+// Targets for a link into another file wait until that file is scanned that
+// far, and laid out (scroll_to_heading_when_parsed); so does the position a
+// reload keeps.
 internal void
 mdp_view_apply_pending_target(MDP_View *view, MDP_Geometry *g)
 {
-  MDP_LinkTargetKind kind = view->pending_target;
-  view->pending_target = MDP_LinkTargetKind_None;
-  switch(kind)
+  B32 done = view->scanner.done;
+  if(view->pending_offset_valid && view->chunk_count &&
+     (done || view->pending_offset < view->scanner.chunks[view->chunk_count-1].range.max))
+  {
+    view->pending_offset_valid = 0;
+    MDP_Chunk *c = mdp_view_build_chunk_at(view, g, mdp_chunk_from_offset(view, view->pending_offset));
+    view->scroll_y = Clamp(0, c->y + view->pending_offset_dy, g->max_scroll);
+  }
+  else if(view->pending_offset_valid && done)
+  {
+    view->pending_offset_valid = 0;
+  }
+  switch(view->pending_target)
   {
     default:{}break;
     case MDP_LinkTargetKind_Heading:
     {
-      mdp_view_scroll_to_heading(view, g, str8(view->pending_slug, view->pending_slug_size), 0);
+      if(mdp_view_scroll_to_heading(view, g, str8(view->pending_slug, view->pending_slug_size), 0) || done)
+      {
+        view->pending_target = MDP_LinkTargetKind_None;
+      }
     }break;
     case MDP_LinkTargetKind_Position:
     {
-      mdp_view_scroll_to_position(view, g, view->pending_row, view->pending_column);
+      if(mdp_view_scroll_to_position(view, g, view->pending_row, view->pending_column) || done)
+      {
+        view->pending_target = MDP_LinkTargetKind_None;
+      }
     }break;
   }
 }
@@ -491,8 +1106,7 @@ mdp_view_open_link(MDP_View *view, MDP_Geometry *g, String8 url, B32 alt)
   //- footnote references scroll to the definition's content
   if(str8_match(str8_prefix(url, 9), str8_lit("footnote:"), 0))
   {
-    MD_Box *box = mdp_view_anchor_box(view, url);
-    if(box) { mdp_view_autoscroll_to_text(view, g, md_element_first_text_in(view->element, box)); }
+    mdp_view_scroll_to_footnote(view, g, url);
     return;
   }
   
@@ -561,6 +1175,10 @@ mdp_view_open_link(MDP_View *view, MDP_Geometry *g, String8 url, B32 alt)
 // mdview searches the rendered text, which is what that leaves. Matches
 // highlight with `search_match_background`, the active one with
 // `search_active_match_background`, and activating one autoscrolls to it.
+//
+// The whole document is searched a few chunks a frame, starting at the
+// anchor's chunk; a chunk keeps only its match count, and its matches while
+// it is built.
 
 internal B32
 mdp_char_is_word(U8 c)
@@ -568,18 +1186,18 @@ mdp_char_is_word(U8 c)
   return md_char_is_alnum(c) || c == '_' || c >= 0x80;
 }
 
-internal void
-mdp_search_recompute(MDP_View *view)
+internal B32
+mdp_search_active(MDP_View *view)
 {
-  MD_Element *el = view->element;
-  arena_clear(view->search_arena);
-  view->ix.search_matches = 0;
-  view->ix.search_match_count = 0;
-  view->ix.search_active = max_U64;
+  return view->search_open && view->search_query_size > 0;
+}
+
+internal Rng1U64 *
+mdp_search_element(MDP_View *view, Arena *arena, MD_Element *el, U64 *count_out)
+{
   String8 q = str8(view->search_query, view->search_query_size);
-  if(!view->search_open || q.size == 0 || el == 0) { return; }
-  U64 cap = 256, n = 0;
-  Rng1U64 *m = push_array_no_zero(view->search_arena, Rng1U64, cap);
+  U64 cap = 64, n = 0;
+  Rng1U64 *m = push_array_no_zero(arena, Rng1U64, cap);
   for EachIndex(ti, el->text_count)
   {
     MD_Text *t = el->texts[ti];
@@ -601,7 +1219,7 @@ mdp_search_recompute(MDP_View *view)
       }
       if(n == cap)
       {
-        Rng1U64 *bigger = push_array_no_zero(view->search_arena, Rng1U64, cap*2);
+        Rng1U64 *bigger = push_array_no_zero(arena, Rng1U64, cap*2);
         MemoryCopy(bigger, m, sizeof(*m)*n);
         m = bigger;
         cap *= 2;
@@ -610,33 +1228,184 @@ mdp_search_recompute(MDP_View *view)
       i += q.size - 1;
     }
   }
-  view->ix.search_matches = m;
-  view->ix.search_match_count = n;
-  // active_match_index(Direction::Next): the first match at or after the anchor
-  if(n)
+  *count_out = n;
+  return m;
+}
+
+// False when a chunk's source can't hold a match: rendered text keeps the
+// source's runs of letters and digits, so the query's longest run must be
+// in it.
+internal B32
+mdp_search_source_may_match(MDP_View *view, String8 source)
+{
+  String8 q = str8(view->search_query, view->search_query_size);
+  String8 run = {0};
+  for(U64 i = 0; i < q.size;)
   {
-    U64 a = 0;
-    for(;a < n && m[a].min < view->search_anchor; a += 1);
-    view->ix.search_active = (a < n) ? a : 0;
+    U64 k = i;
+    for(;k < q.size && (md_char_is_alnum(q.str[k]) || q.str[k] >= 0x80); k += 1);
+    if(k - i > run.size) { run = str8_substr(q, r1u64(i, k)); }
+    i = k+1;
   }
+  if(run.size == 0) { return 1; }
+  return str8_find_needle(source, 0, run, view->search_case ? 0 : StringMatchFlag_CaseInsensitive) < source.size;
+}
+
+// A chunk's matches: kept while it is built, else found in `arena`.
+internal Rng1U64 *
+mdp_search_chunk_matches(MDP_View *view, Arena *arena, U64 i, U64 *count_out)
+{
+  MDP_Chunk *c = &view->chunks[i];
+  if(c->element && c->build_key == view->build_key)
+  {
+    if(c->matches_key != view->search_key)
+    {
+      c->matches = mdp_search_element(view, c->arena, c->element, &c->match_count);
+      c->matches_key = view->search_key;
+    }
+    *count_out = c->match_count;
+    return c->matches;
+  }
+  Temp scratch = scratch_begin(&arena, 1);
+  *count_out = 0;
+  Rng1U64 *result = 0;
+  String8 source = mdp_source_read(view, scratch.arena, view->scanner.chunks[i].range);
+  if(mdp_search_source_may_match(view, source))
+  {
+    U64 n = 0;
+    Rng1U64 *m = mdp_search_element(view, scratch.arena, mdp_chunk_text_element(view, scratch.arena, i, 0), &n);
+    result = push_array_no_zero(arena, Rng1U64, n + 1);
+    MemoryCopy(result, m, sizeof(*m)*n);
+    *count_out = n;
+  }
+  scratch_end(scratch);
+  return result;
+}
+
+internal U64
+mdp_search_count_chunk(MDP_View *view, U64 i)
+{
+  MDP_Chunk *c = &view->chunks[i];
+  if(c->search_key != view->search_key)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    mdp_search_chunk_matches(view, scratch.arena, i, &c->search_count);
+    scratch_end(scratch);
+    c->search_key = view->search_key;
+    view->search_total += c->search_count;
+  }
+  return c->search_count;
+}
+
+internal void
+mdp_search_activate(MDP_View *view, U64 i, U64 index)
+{
+  Temp scratch = scratch_begin(0, 0);
+  U64 n = 0;
+  Rng1U64 *m = mdp_search_chunk_matches(view, scratch.arena, i, &n);
+  if(index < n)
+  {
+    view->search_has_active = 1;
+    view->search_active_range = m[index];
+  }
+  scratch_end(scratch);
+}
+
+internal U64
+mdp_search_first_chunk(MDP_View *view)
+{
+  return Min(mdp_chunk_from_text_offset(view->search_anchor), ClampBot(view->chunk_count, 1) - 1);
+}
+
+internal B32
+mdp_search_counting(MDP_View *view)
+{
+  if(!mdp_search_active(view)) { return 0; }
+  return !view->search_wrapped || view->search_next <= mdp_search_first_chunk(view);
+}
+
+// Counts matches a chunk at a time until the budget runs out: from the
+// anchor's chunk to the end, then from the start. The first match at or
+// after the anchor becomes active (active_match_index, Direction::Next),
+// wrapping around to the first one.
+internal void
+mdp_search_count(MDP_View *view, U64 budget_us)
+{
+  U64 start_us = now_time_us();
+  for(;mdp_search_counting(view);)
+  {
+    if(!view->search_wrapped && view->search_next >= view->chunk_count)
+    {
+      if(!view->scanner.done) { break; }
+      view->search_wrapped = 1;
+      view->search_next = 0;
+      continue;
+    }
+    if(view->search_next >= view->chunk_count) { view->search_next = mdp_search_first_chunk(view) + 1; break; } // nothing to search
+    U64 i = view->search_next++;
+    U64 count = mdp_search_count_chunk(view, i);
+    if(!view->search_has_active && count > 0)
+    {
+      if(view->search_wrapped) { mdp_search_activate(view, i, 0); }
+      else
+      {
+        Temp scratch = scratch_begin(0, 0);
+        U64 n = 0;
+        Rng1U64 *m = mdp_search_chunk_matches(view, scratch.arena, i, &n);
+        for EachIndex(k, n) { if(m[k].min >= view->search_anchor) { mdp_search_activate(view, i, k); break; } }
+        scratch_end(scratch);
+      }
+    }
+    if(now_time_us() - start_us >= budget_us) { break; }
+  }
+}
+
+// Starts counting over: the query, its options or the document changed.
+internal void
+mdp_search_reset(MDP_View *view)
+{
+  view->search_key += 1;
+  view->search_total = 0;
+  view->search_wrapped = 0;
+  view->search_has_active = 0;
+  view->search_next = mdp_search_first_chunk(view);
+}
+
+// The active match's place among all of them (1-based), or 0 while chunks
+// before it are still to be counted.
+internal U64
+mdp_search_active_ordinal(MDP_View *view)
+{
+  if(!view->search_has_active) { return 0; }
+  U64 i = mdp_chunk_from_text_offset(view->search_active_range.min);
+  U64 before = 0;
+  for EachIndex(k, i)
+  {
+    if(view->chunks[k].search_key != view->search_key) { return 0; }
+    before += view->chunks[k].search_count;
+  }
+  Temp scratch = scratch_begin(0, 0);
+  U64 n = 0;
+  Rng1U64 *m = mdp_search_chunk_matches(view, scratch.arena, i, &n);
+  U64 local = 0;
+  for(;local < n && m[local].min < view->search_active_range.min; local += 1);
+  scratch_end(scratch);
+  return before + local + 1;
 }
 
 internal void
 mdp_search_refresh(MDP_View *view, MDP_Geometry *g)
 {
-  if(view->search_dirty || view->search_generation != view->element_generation)
+  if(view->search_dirty)
   {
-    mdp_search_recompute(view);
     view->search_dirty = 0;
-    view->search_generation = view->element_generation;
+    mdp_search_reset(view);
+    mdp_search_count(view, MDP_SCAN_BUDGET_US);
   }
-  if(view->search_scroll_pending)
+  if(view->search_scroll_pending && view->search_has_active)
   {
     view->search_scroll_pending = 0;
-    if(view->ix.search_active < view->ix.search_match_count)
-    {
-      mdp_view_autoscroll_to_offset(view, g, view->ix.search_matches[view->ix.search_active].min);
-    }
+    mdp_view_autoscroll_to_offset(view, g, view->search_active_range.min);
   }
 }
 
@@ -650,26 +1419,30 @@ mdp_search_changed(MDP_View *view)
 internal void
 mdp_search_open(MDP_View *view, MDP_Geometry *g)
 {
-  MD_Element *el = view->element;
   view->search_open = 1;
   view->search_focused = 1;
-  // query_suggestion: the selected text, when it is a single line
-  if(view->ix.selection_end > view->ix.selection_start)
+  // query_suggestion: the selected text, when it is a single line (and so
+  // fits the query: offsets in one chunk count bytes)
+  U64 sel_start = view->ix.selection_start, sel_end = view->ix.selection_end;
+  if(sel_end > sel_start)
   {
-    Temp scratch = scratch_begin(0, 0);
-    String8 sel = md_element_text_in_range(scratch.arena, el, view->ix.selection_start, view->ix.selection_end);
-    if(sel.size && sel.size <= sizeof(view->search_query) && str8_find_needle(sel, 0, str8_lit("\n"), 0) == sel.size)
+    if(sel_end - sel_start <= sizeof(view->search_query))
     {
-      MemoryCopy(view->search_query, sel.str, sel.size);
-      view->search_query_size = sel.size;
+      Temp scratch = scratch_begin(0, 0);
+      String8 sel = mdp_view_text_in_range(view, scratch.arena, sel_start, sel_end);
+      if(sel.size && sel.size <= sizeof(view->search_query) && str8_find_needle(sel, 0, str8_lit("\n"), 0) == sel.size)
+      {
+        MemoryCopy(view->search_query, sel.str, sel.size);
+        view->search_query_size = sel.size;
+      }
+      scratch_end(scratch);
     }
-    scratch_end(scratch);
-    view->search_anchor = view->ix.selection_start;
+    view->search_anchor = sel_start;
   }
   else
   {
     // from the top of the viewport
-    view->search_anchor = md_element_offset_from_point(el, &view->style, &view->ix, v2f32(0, view->scroll_y - g->padding));
+    view->search_anchor = mdp_view_offset_from_point(view, v2f32(0, view->scroll_y - g->padding));
   }
   mdp_search_changed(view);
 }
@@ -682,15 +1455,33 @@ mdp_search_close(MDP_View *view)
   view->search_dirty = 1;
 }
 
+// The next or previous match, counting the chunks on the way that are not
+// counted yet.
 internal void
 mdp_search_step(MDP_View *view, B32 backwards)
 {
-  U64 n = view->ix.search_match_count;
-  if(n == 0) { return; }
-  U64 cur = view->ix.search_active;
-  U64 next = (cur >= n) ? 0 : backwards ? (cur + n - 1) % n : (cur + 1) % n;
-  view->ix.search_active = next;
-  view->search_anchor = view->ix.search_matches[next].min;
+  if(!view->search_has_active || view->chunk_count == 0) { return; }
+  U64 n = view->chunk_count;
+  U64 i = mdp_chunk_from_text_offset(view->search_active_range.min);
+  Temp scratch = scratch_begin(0, 0);
+  U64 count = 0;
+  Rng1U64 *m = mdp_search_chunk_matches(view, scratch.arena, i, &count);
+  U64 local = 0;
+  for(;local < count && m[local].min < view->search_active_range.min; local += 1);
+  scratch_end(scratch);
+  if(!backwards && local+1 < count) { mdp_search_activate(view, i, local+1); }
+  else if(backwards && local > 0 && local <= count) { mdp_search_activate(view, i, local-1); }
+  else
+  {
+    for(U64 step = 1; step <= n; step += 1)
+    {
+      if(!view->scanner.done && (backwards ? step > i : i + step >= n)) { break; } // no wrapping before the end is known
+      U64 j = backwards ? (i + n - step) % n : (i + step) % n;
+      U64 c = mdp_search_count_chunk(view, j);
+      if(c > 0) { mdp_search_activate(view, j, backwards ? c-1 : 0); break; }
+    }
+  }
+  view->search_anchor = view->search_active_range.min;
   view->search_scroll_pending = 1;
 }
 
@@ -820,12 +1611,11 @@ internal void
 mdp_menu_activate(MDP_View *view, U32 item)
 {
   Temp scratch = scratch_begin(0, 0);
-  MD_Element *el = view->element;
   U64 a = view->ix.selection_start, z = view->ix.selection_end;
   switch(item)
   {
-    case MDP_MenuItem_Copy:           { wm_set_clipboard_text(md_element_text_in_range(scratch.arena, el, a, z)); }break;
-    case MDP_MenuItem_CopyAsMarkdown: { wm_set_clipboard_text(md_element_source_in_range(el, view->doc.source, a, z)); }break;
+    case MDP_MenuItem_Copy:           { mdp_view_copy(view, a, z, 0); }break;
+    case MDP_MenuItem_CopyAsMarkdown: { mdp_view_copy(view, a, z, 1); }break;
     case MDP_MenuItem_CopyLink:       { wm_set_clipboard_text(str8(view->menu_link, view->menu_link_size)); }break;
   }
   view->menu_open = 0;
@@ -837,17 +1627,17 @@ mdp_menu_activate(MDP_View *view, U32 item)
 internal void
 mdp_menu_open(MDP_View *view, MDP_Geometry *g, Vec2F32 pos)
 {
-  MD_Element *el = view->element;
-  MD_Hit hit = md_element_hit_test(el, &view->ix, sub_2f32(pos, g->origin));
+  MD_Element *el = 0;
+  MD_Hit hit = mdp_view_hit_test(view, sub_2f32(pos, g->origin), &el);
   view->menu_item_count = 0;
   if(view->ix.selection_end > view->ix.selection_start)
   {
     view->menu_items[view->menu_item_count++] = MDP_MenuItem_Copy;
     view->menu_items[view->menu_item_count++] = MDP_MenuItem_CopyAsMarkdown;
   }
-  if(hit.link && hit.link <= el->link_count)
+  String8 url = mdp_view_link_url(el, hit.link);
+  if(url.size)
   {
-    String8 url = el->links[hit.link-1].url;
     view->menu_link_size = Min(url.size, sizeof(view->menu_link));
     MemoryCopy(view->menu_link, url.str, view->menu_link_size);
     view->menu_items[view->menu_item_count++] = MDP_MenuItem_CopyLink;
@@ -864,7 +1654,6 @@ internal B32
 mdp_view_handle_event(MDP_View *view, WM_Window window, WM_Event *ev)
 {
   MDP_Geometry g = mdp_geometry(view, window);
-  MD_Element *el = view->element;
   F32 viewport_h = g.client.y1 - g.client.y0;
   B32 taken = 0;
 
@@ -978,7 +1767,8 @@ mdp_view_handle_event(MDP_View *view, WM_Window window, WM_Event *ev)
     {
       if(ev->modifiers & WM_Modifier_Ctrl) { break; }
       Vec2F32 p = sub_2f32(ev->pos, g.origin);
-      MD_Hit hit = md_element_hit_test(el, &view->ix, p);
+      MD_Element *el = 0;
+      MD_Hit hit = mdp_view_hit_test(view, p, &el);
       F32 notches_y = ev->delta.y/120.f;
       F32 notches_x = ev->delta.x/120.f;
       if(ev->modifiers & WM_Modifier_Shift) { notches_x = notches_y; notches_y = 0; }
@@ -1008,18 +1798,29 @@ mdp_view_handle_event(MDP_View *view, WM_Window window, WM_Event *ev)
       else if(m == 0 && ev->key == WM_Key_Up) { mdp_view_scroll_by(view, -2*g.rem); taken = 1; }
       else if(m == WM_Modifier_Ctrl && ev->key == WM_Key_Home) { view->scroll_y = 0; view->scroll_activity_us = now_time_us(); taken = 1; }
       else if(m == WM_Modifier_Ctrl && ev->key == WM_Key_End) { view->scroll_y = g.max_scroll; view->scroll_activity_us = now_time_us(); taken = 1; }
-      else if(m == WM_Modifier_Alt && (ev->key == WM_Key_Down || ev->key == WM_Key_Up))
+      else if(m == WM_Modifier_Alt && (ev->key == WM_Key_Down || ev->key == WM_Key_Up) && view->chunk_count)
       {
-        // ScrollDownByItem / ScrollUpByItem: to the next / previous root block
+        // ScrollDownByItem / ScrollUpByItem: to the next / previous root
+        // block, in the chunk at the top or the ones next to it
         F32 top = view->scroll_y - g.padding;
+        B32 down = (ev->key == WM_Key_Down);
+        U64 i = mdp_chunk_at_y(view, top);
+        MDP_Chunk *target_chunk = 0;
         MD_Box *target = 0;
-        for(MD_Box *b = el->root->first; b != 0; b = b->next)
+        for(U64 step = 0; step < 3 && target == 0 && i < view->chunk_count; step += 1)
         {
-          if(ev->key == WM_Key_Down && b->rect.y0 > top + 1) { target = b; break; }
-          if(ev->key == WM_Key_Up && b->rect.y0 < top - 1) { target = b; }
+          MDP_Chunk *c = mdp_view_build_chunk_at(view, &g, i);
+          top = view->scroll_y - g.padding;
+          for(MD_Box *b = c->element->root->first; b != 0; b = b->next)
+          {
+            if(down && c->y + b->rect.y0 > top + 1) { target = b; break; }
+            if(!down && c->y + b->rect.y0 < top - 1) { target = b; }
+          }
+          target_chunk = c;
+          if(down) { i += 1; } else if(i == 0) { break; } else { i -= 1; }
         }
-        if(target) { mdp_view_scroll_to_box(view, &g, target); }
-        else if(ev->key == WM_Key_Up) { view->scroll_y = 0; }
+        if(target) { mdp_view_scroll_to_box(view, &g, target_chunk, target); }
+        else if(!down) { view->scroll_y = 0; }
         taken = 1;
       }
 
@@ -1028,16 +1829,14 @@ mdp_view_handle_event(MDP_View *view, WM_Window window, WM_Event *ev)
       {
         if(view->ix.selection_end > view->ix.selection_start)
         {
-          Temp scratch = scratch_begin(0, 0);
-          wm_set_clipboard_text(md_element_text_in_range(scratch.arena, el, view->ix.selection_start, view->ix.selection_end));
-          scratch_end(scratch);
+          mdp_view_copy(view, view->ix.selection_start, view->ix.selection_end, 0);
         }
         taken = 1;
       }
       else if(m == WM_Modifier_Ctrl && ev->key == WM_Key_A)
       {
         view->ix.selection_start = 0;
-        view->ix.selection_end = el->text_total;
+        view->ix.selection_end = max_U64;
         taken = 1;
       }
 
@@ -1089,28 +1888,11 @@ mdp_view_handle_event(MDP_View *view, WM_Window window, WM_Event *ev)
           taken = 1;
           break;
         }
-        MD_Hit hit = md_element_hit_test(el, &view->ix, p);
+        MD_Element *el = 0;
+        MD_Hit hit = mdp_view_hit_test(view, p, &el);
         if(hit.checkbox)
         {
-          // on_checkbox_toggle: rewrite [ ] / [x] in the source
-          U64 offset = hit.checkbox - 1;
-          if(offset < view->text.size)
-          {
-            Temp scratch = scratch_begin(0, 0);
-            String8 text = push_str8_copy(scratch.arena, view->text);
-            text.str[offset] = (text.str[offset] == ' ') ? 'x' : ' ';
-            F32 scroll = view->scroll_y;
-            if(view->path.size && write_data_to_file_path(view->path, text))
-            {
-              mdp_view_open_path(view, view->path, 1);
-            }
-            else
-            {
-              mdp_view_load_text(view, view->name, view->path, text);
-            }
-            view->scroll_y = scroll;
-            scratch_end(scratch);
-          }
+          mdp_view_toggle_task(view, hit.checkbox - 1);
           taken = 1;
           break;
         }
@@ -1131,11 +1913,12 @@ mdp_view_handle_event(MDP_View *view, WM_Window window, WM_Event *ev)
         view->last_click_pos = ev->pos;
         view->press_on_link = (hit.link != 0);
         view->press_link = hit.link;
+        view->press_element = el;
         view->press_pos = ev->pos;
-        U64 offset = md_element_offset_from_point(el, &view->style, &view->ix, p);
+        U64 offset = mdp_view_offset_from_point(view, p);
         if(double_click)
         {
-          Rng1U64 word = md_element_word_at(el, offset);
+          Rng1U64 word = mdp_view_word_at(view, offset);
           view->ix.selection_start = word.min;
           view->ix.selection_end = word.max;
           view->selecting = 0;
@@ -1167,10 +1950,14 @@ mdp_view_handle_event(MDP_View *view, WM_Window window, WM_Event *ev)
         if(view->press_on_link && !moved && view->ix.selection_start == view->ix.selection_end)
         {
           Vec2F32 p = sub_2f32(ev->pos, g.origin);
-          MD_Hit hit = md_element_hit_test(el, &view->ix, p);
-          if(hit.link == view->press_link && hit.link > 0 && hit.link <= el->link_count)
+          MD_Element *el = 0;
+          MD_Hit hit = mdp_view_hit_test(view, p, &el);
+          String8 url = mdp_view_link_url(el, hit.link);
+          if(el == view->press_element && hit.link == view->press_link && url.size)
           {
-            mdp_view_open_link(view, &g, el->links[hit.link-1].url, !!(ev->modifiers & WM_Modifier_Alt));
+            Temp scratch = scratch_begin(0, 0);
+            mdp_view_open_link(view, &g, push_str8_copy(scratch.arena, url), !!(ev->modifiers & WM_Modifier_Alt));
+            scratch_end(scratch);
           }
         }
         view->selecting = 0;
@@ -1194,7 +1981,7 @@ mdp_view_handle_event(MDP_View *view, WM_Window window, WM_Event *ev)
       {
         Vec2F32 p = sub_2f32(ev->pos, g.origin);
         U64 anchor = view->select_anchor;
-        U64 head = md_element_offset_from_point(el, &view->style, &view->ix, p);
+        U64 head = mdp_view_offset_from_point(view, p);
         view->ix.selection_start = Min(anchor, head);
         view->ix.selection_end = Max(anchor, head);
       }
@@ -1215,6 +2002,8 @@ mdp_view_is_animating(MDP_View *view)
   if(view->ix.copied_code_until_us && now < view->ix.copied_code_until_us) { return 1; }
   if(view->reload_at_us) { return 1; }
   if(view->error.size && now < view->error_until_us + 100000) { return 1; }
+  if(!view->scanner.done || mdp_search_counting(view)) { return 1; }
+  if(view->pending_target != MDP_LinkTargetKind_None || view->pending_offset_valid) { return 1; }
   return 0;
 }
 
@@ -1263,7 +2052,7 @@ mdp_search_bar_draw(MDP_View *view, MDP_Geometry *g, Vec2F32 mouse)
   dr_rect(r2f32p(g->bar.x0, g->bar.y1 - border, g->bar.x1, g->bar.y1), th_linear(colors->border_variant), 0, 0, 0);
 
   //- query editor
-  B32 no_match = (view->search_query_size > 0 && view->ix.search_match_count == 0);
+  B32 no_match = (view->search_query_size > 0 && view->search_total == 0 && !mdp_search_counting(view));
   Vec4F32 frame = no_match ? colors->error : view->search_focused ? colors->border_focused : colors->border;
   dr_rect(l.input, th_linear(colors->editor_background), 0.25f*u, 0, 0.5f);
   dr_rect(l.input, th_linear(frame), 0.25f*u, border, 0.5f);
@@ -1293,10 +2082,14 @@ mdp_search_bar_draw(MDP_View *view, MDP_Geometry *g, Vec2F32 mouse)
   mdp_draw_icon_button(view, g, l.toggle_word, str8_lit("ab"), view->fonts.sans, view->search_word, mouse, 1);
   if(view->search_query_size)
   {
+    // while chunks are still to be counted: a "+" on the total, and "?" for
+    // a place not known yet
     Temp scratch = scratch_begin(0, 0);
-    U64 n = view->ix.search_match_count;
-    U64 a = (view->ix.search_active < n) ? view->ix.search_active + 1 : 0;
-    String8 label = push_str8f(scratch.arena, "%I64u/%I64u", a, n);
+    U64 n = view->search_total;
+    U64 a = mdp_search_active_ordinal(view);
+    B32 counting = mdp_search_counting(view);
+    String8 label = (view->search_has_active && a == 0) ? push_str8f(scratch.arena, "?/%I64u%s", n, counting ? "+" : "") :
+      push_str8f(scratch.arena, "%I64u/%I64u%s", a, n, counting ? "+" : "");
     F32 px = round_f32(14.f*g->scale);
     F32 w = md_text_width(view->fonts.sans, px, label);
     mdp_draw_text_centered_y(view->fonts.sans, px, l.count, (l.count.x0 + l.count.x1)/2 - w/2, label, colors->text_muted);
@@ -1339,7 +2132,6 @@ mdp_view_draw(MDP_View *view, WM_Window window)
 {
   Temp scratch = scratch_begin(0, 0);
   MDP_Geometry g = mdp_geometry(view, window);
-  MD_Element *el = view->element;
   TH_Colors *colors = &view->theme.colors;
   Vec2F32 mouse = wm_mouse_from_window(window);
   B32 mouse_inside = contains_2f32(g.client, mouse);
@@ -1349,8 +2141,9 @@ mdp_view_draw(MDP_View *view, WM_Window window)
   view->ix.mouse_inside = mouse_inside && !view->thumb_dragging && !(g.has_thumb && contains_2f32(g.track, mouse)) &&
     !(view->menu_open && contains_2f32(mdp_menu_layout(view, &g).box, mouse));
   MD_Hit hit = {0};
-  if(view->ix.mouse_inside) { hit = md_element_hit_test(el, &view->ix, view->ix.mouse); }
-  view->hovered_url = (hit.link && hit.link <= el->link_count) ? el->links[hit.link-1].url : str8_zero();
+  MD_Element *hit_el = 0;
+  if(view->ix.mouse_inside) { hit = mdp_view_hit_test(view, view->ix.mouse, &hit_el); }
+  view->hovered_url = mdp_view_link_url(hit_el, hit.link);
   view->thumb_hovered = g.has_thumb && mouse_inside && contains_2f32(g.thumb, mouse);
   if(view->selecting) { wm_set_cursor(WM_Cursor_IBar); }
   else if(hit.link || hit.copy_button || hit.checkbox) { wm_set_cursor(WM_Cursor_HandPoint); }
@@ -1361,8 +2154,39 @@ mdp_view_draw(MDP_View *view, WM_Window window)
   //- background: .bg(editor_background)
   dr_rect(g.client, th_linear(colors->editor_background), 0, 0, 0);
 
-  //- markdown element
-  md_element_paint(el, &view->style, &view->ix, g.origin, g.client);
+  //- the chunks in view, each an element of its own; the selection space
+  // is shared, the search matches are the chunk's own
+  F32 view_top = view->scroll_y - g.padding;
+  F32 view_bottom = view_top + (g.client.y1 - g.client.y0);
+  B32 show_matches = mdp_search_active(view);
+  for(U64 i = view->chunk_count ? mdp_chunk_at_y(view, view_top) : 0; i < view->chunk_count && view->chunks[i].y < view_bottom; i += 1)
+  {
+    MDP_Chunk *c = &view->chunks[i];
+    if(c->element == 0) { continue; }
+    MD_Interaction ix = view->ix;
+    ix.mouse.y -= c->y;
+    ix.search_matches = 0;
+    ix.search_match_count = 0;
+    ix.search_active = max_U64;
+    if(show_matches)
+    {
+      ix.search_matches = mdp_search_chunk_matches(view, scratch.arena, i, &ix.search_match_count);
+      for EachIndex(k, ix.search_match_count)
+      {
+        if(view->search_has_active && ix.search_matches[k].min == view->search_active_range.min) { ix.search_active = k; break; }
+      }
+    }
+    md_element_paint(c->element, &view->style, &ix, v2f32(g.origin.x, g.origin.y + c->y), g.client);
+  }
+
+  //- the rest of the document, until the scan gets there
+  if(!view->scanner.done && view->tail_y < view_bottom)
+  {
+    String8 label = str8_lit("Loading\xe2\x80\xa6");
+    F32 px = round_f32(14.f*g.scale);
+    F32 y = g.origin.y + view->tail_y + g.rem;
+    mdp_draw_text_centered_y(view->fonts.sans, px, r2f32p(g.content_x, y, g.content_x + g.content_w, y + 2*px), g.content_x, label, colors->text_muted);
+  }
 
   //- vertical scrollbar
   if(g.has_thumb)

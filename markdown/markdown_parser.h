@@ -163,15 +163,119 @@ typedef struct MD_Document MD_Document;
 struct MD_Document
 {
   String8 source;
+  U64 base;                      // document offset of source.str[0]: a part holds offsets into the whole
   MD_Node *root;
   U64 end;                       // end of the last root block (Zed's `markdown_end`)
   U64 word_count;
+  U64 root_base;                 // root blocks before this part of the document
+  B32 footnotes_before;          // a footnote definition comes before this part
+};
+
+////////////////////////////////
+//~ References
+//
+// Link reference definitions and footnote labels apply to the whole document,
+// wherever they are defined, so a parse of one part of it looks up those
+// found in the rest (`shared`) as well as its own.
+
+typedef struct MD_Ref MD_Ref;
+struct MD_Ref
+{
+  MD_Ref *next;
+  String8 label;                 // normalized; footnote labels lowercased
+  String8 url;
+};
+
+#define MD_REF_SLOT_COUNT 256
+
+typedef struct MD_RefTable MD_RefTable;
+struct MD_RefTable
+{
+  MD_Ref *links[MD_REF_SLOT_COUNT];
+  MD_Ref *footnotes[MD_REF_SLOT_COUNT];
+  U64 count;                     // definitions added, to notice new ones
+};
+
+////////////////////////////////
+//~ Scanner
+//
+// A pass over the whole document that keeps none of it: it runs the block
+// parser line by line and, between root blocks, drops what it built. What it
+// keeps is what a part of the document needs from the rest of it: where the
+// root blocks fall (grouped into chunks of about `chunk_target` bytes, each
+// parsed on its own later), the headings for the outline, the footnote
+// definitions, and the reference table. The caller feeds it the source in
+// pieces, so the document never has to be in memory at once.
+
+typedef struct MD_ScanChunk MD_ScanChunk;
+struct MD_ScanChunk
+{
+  Rng1U64 range;                 // whole root blocks and the blank lines after them
+  U64 root_base;                 // root blocks before the chunk
+  U64 line_base;                 // lines before the chunk
+  B32 footnotes_before;
+};
+
+typedef struct MD_ScanHeading MD_ScanHeading;
+struct MD_ScanHeading
+{
+  U64 level;
+  String8 text;                  // plain text of the heading's inlines
+  U64 offset;                    // source offset of the heading block
+};
+
+typedef struct MD_ScanFootnote MD_ScanFootnote;
+struct MD_ScanFootnote
+{
+  String8 label;
+  U64 offset;                    // source offset of the definition
+};
+
+typedef struct MD_Scanner MD_Scanner;
+struct MD_Scanner
+{
+  Arena *arena;                  // results
+  Arena *work;                   // the block parser, reset between root blocks
+  U64 work_pos;
+  struct MD_BlockParser *p;
+  MD_Node *harvested;            // last root block already taken from the parser
+  U64 chunk_target;
+
+  // progress
+  U64 offset;                    // start of the next line to feed
+  U64 line_count;
+  U64 root_count;                // root blocks finished
+  U64 end;                       // end of the last root block
+  B32 footnotes_seen;
+  B32 done;
+
+  // results
+  MD_RefTable refs;
+  MD_ScanChunk *chunks;
+  U64 chunk_count;
+  U64 chunk_cap;
+  MD_ScanChunk open_chunk;       // the chunk being accumulated
+  MD_ScanHeading *headings;
+  U64 heading_count;
+  U64 heading_cap;
+  MD_ScanFootnote *footnotes;
+  U64 footnote_count;
+  U64 footnote_cap;
 };
 
 ////////////////////////////////
 //~ Parser API
 
 internal MD_Document md_parse(Arena *arena, String8 source);
+// Parses root blocks from `source`, which holds the document's bytes from
+// offset `base` on. Node ranges are offsets into the whole document.
+internal MD_Document md_parse_part(Arena *arena, String8 source, U64 base, MD_RefTable *shared);
+
+internal void md_scanner_init(MD_Scanner *s, U64 chunk_target);
+internal void md_scanner_release(MD_Scanner *s);
+// Takes the source from s->offset on and returns how many bytes it used:
+// whole lines, unless `eof`. 0 means a line is longer than `data`.
+internal U64  md_scanner_feed(MD_Scanner *s, String8 data, B32 eof);
 
 ////////////////////////////////
 //~ Helpers

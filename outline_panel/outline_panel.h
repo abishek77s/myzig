@@ -17,7 +17,7 @@
 typedef struct OP_Entry OP_Entry;
 struct OP_Entry
 {
-  U64 heading;                   // index into MD_Element.headings
+  U64 heading;                   // index into the scanned headings
   U64 depth;
   B32 has_children;
   B32 collapsed;

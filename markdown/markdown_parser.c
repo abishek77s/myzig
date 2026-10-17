@@ -1,19 +1,12 @@
 ////////////////////////////////
 //~ Parse State
 
-typedef struct MD_LinkRef MD_LinkRef;
-struct MD_LinkRef
-{
-  MD_LinkRef *next;
-  String8 label;                 // normalized
-  String8 url;
-};
-
 typedef struct MD_BlockParser MD_BlockParser;
 struct MD_BlockParser
 {
   Arena *arena;
   String8 source;
+  U64 base;                      // document offset of source.str[0]
   MD_Node *root;
   MD_Node *tip;
   MD_Node *old_tip;
@@ -31,9 +24,11 @@ struct MD_BlockParser
   B32 blank;
   B32 line_consumed;             // the block start used the whole line (fence opener)
 
-  // link reference definitions, footnote definition labels
-  MD_LinkRef *first_ref;
-  String8List footnote_labels;
+  // link reference definitions and footnote labels: those defined here
+  // (allocated on ref_arena), and those from the rest of the document
+  Arena *ref_arena;
+  MD_RefTable *refs;
+  MD_RefTable *shared;
 };
 
 ////////////////////////////////
@@ -264,15 +259,55 @@ md_plain_text_from_inlines(Arena *arena, MD_InlineArray inlines)
 ////////////////////////////////
 //~ Link Reference Definitions
 
+internal MD_Ref **
+md_ref_slot(MD_Ref **slots, String8 key)
+{
+  return &slots[u64_hash_from_str8(key) % MD_REF_SLOT_COUNT];
+}
+
+internal MD_Ref *
+md_ref_find(MD_BlockParser *p, B32 footnote, String8 key)
+{
+  MD_RefTable *tables[] = {p->refs, p->shared};
+  for EachElement(i, tables)
+  {
+    if(tables[i] == 0) { continue; }
+    MD_Ref **slot = md_ref_slot(footnote ? tables[i]->footnotes : tables[i]->links, key);
+    for(MD_Ref *r = *slot; r != 0; r = r->next)
+    {
+      if(str8_match(r->label, key, 0)) { return r; }
+    }
+  }
+  return 0;
+}
+
+// The first definition of a label wins.
+internal void
+md_ref_add(MD_BlockParser *p, B32 footnote, String8 key, String8 url)
+{
+  if(md_ref_find(p, footnote, key)) { return; }
+  MD_Ref *r = push_array(p->ref_arena, MD_Ref, 1);
+  r->label = push_str8_copy(p->ref_arena, key);
+  r->url = push_str8_copy(p->ref_arena, url);
+  MD_Ref **slot = md_ref_slot(footnote ? p->refs->footnotes : p->refs->links, key);
+  SLLStackPush(*slot, r);
+  p->refs->count += 1;
+}
+
+internal String8
+md_footnote_key(Arena *arena, String8 label)
+{
+  String8 key = push_str8_copy(arena, label);
+  for EachIndex(i, key.size) { key.str[i] = lower_from_char(key.str[i]); }
+  return key;
+}
+
 internal B32
 md_ref_lookup(MD_BlockParser *p, Arena *scratch, String8 label, String8 *url_out)
 {
-  String8 key = md_normalize_label(scratch, label);
-  for(MD_LinkRef *r = p->first_ref; r != 0; r = r->next)
-  {
-    if(str8_match(r->label, key, 0)) { *url_out = r->url; return 1; }
-  }
-  return 0;
+  MD_Ref *r = md_ref_find(p, 0, md_normalize_label(scratch, label));
+  if(r) { *url_out = r->url; }
+  return (r != 0);
 }
 
 // Parses a link destination at s[*pos]; returns 1 on success.
@@ -395,15 +430,10 @@ md_extract_link_refs(MD_BlockParser *p, String8 text)
       if(e < text.size && text.str[e] != '\n') { break; }
       end = e;
     }
-    String8 key = md_normalize_label(p->arena, label);
-    B32 exists = 0;
-    for(MD_LinkRef *r = p->first_ref; r != 0; r = r->next) { if(str8_match(r->label, key, 0)) { exists = 1; break; } }
-    if(!exists)
     {
-      MD_LinkRef *ref = push_array(p->arena, MD_LinkRef, 1);
-      ref->label = key;
-      ref->url = md_unescape(p->arena, dest);
-      SLLStackPush(p->first_ref, ref);
+      Temp scratch = scratch_begin(&p->ref_arena, 1);
+      md_ref_add(p, 0, md_normalize_label(scratch.arena, label), md_unescape(scratch.arena, dest));
+      scratch_end(scratch);
     }
     text = str8_skip(text, end < text.size ? end+1 : end);
   }
@@ -1027,7 +1057,11 @@ md_try_block_starts(MD_BlockParser *p, MD_Node *container)
     {
       MD_Node *fn = md_add_child(p, MD_NodeKind_FootnoteDefinition);
       fn->label = push_str8_copy(p->arena, str8_substr(rest, r1u64(2, close)));
-      str8_list_push(p->arena, &p->footnote_labels, fn->label);
+      {
+        Temp scratch = scratch_begin(&p->ref_arena, 1);
+        md_ref_add(p, 1, md_footnote_key(scratch.arena, fn->label), str8_zero());
+        scratch_end(scratch);
+      }
       p->pos = p->next_nonspace + close + 2;
       for(;md_peek(p, p->pos) == ' '; p->pos += 1);
       return 1;
@@ -1109,11 +1143,11 @@ md_try_block_starts(MD_BlockParser *p, MD_Node *container)
             // the line is a slice of the source unless tabs were expanded
             if(p->line.str >= p->source.str && p->line.str < p->source.str + p->source.size)
             {
-              item->task_offset = (U64)(p->line.str - p->source.str) + p->pos + 1;
+              item->task_offset = p->base + (U64)(p->line.str - p->source.str) + p->pos + 1;
             }
             else
             {
-              String8 src_line = str8_substr(p->source, r1u64(p->line_start, p->line_end));
+              String8 src_line = str8_substr(p->source, r1u64(p->line_start - p->base, p->line_end - p->base));
               U64 b0 = str8_find_needle(src_line, 0, str8_lit("["), 0);
               item->task_offset = p->line_start + b0 + 1;
             }
@@ -1285,8 +1319,11 @@ md_incorporate_line(MD_BlockParser *p, String8 line, U64 line_start, U64 line_en
     {
       md_table_add_row(p, tip, md_rest_of_line(p), 0);
     }
-    else if(!p->blank && md_can_contain(tip->kind, MD_NodeKind_Paragraph))
+    else if(!p->blank && !md_str8_is_blank(md_rest_of_line(p)))
     {
+      // a paragraph, closing what can't hold one (a list whose item ended);
+      // a block start that used the whole line, like a setext underline,
+      // leaves nothing for it
       md_add_child(p, MD_NodeKind_Paragraph);
       md_add_line(p);
     }
@@ -1650,11 +1687,9 @@ md_handle_close_bracket(MD_InlineParser *ip)
   if(opener->footnote)
   {
     String8 label = str8_substr(ip->s, r1u64(opener->text_pos+1, close_pos));
-    B32 defined = 0;
-    for(String8Node *n = ip->bp->footnote_labels.first; n != 0; n = n->next)
-    {
-      if(str8_match(n->string, label, StringMatchFlag_CaseInsensitive)) { defined = 1; break; }
-    }
+    Temp scratch = scratch_begin(&ip->arena, 1);
+    B32 defined = (md_ref_find(ip->bp, 1, md_footnote_key(scratch.arena, label)) != 0);
+    scratch_end(scratch);
     if(defined && str8_find_needle(label, 0, str8_lit(" "), 0) >= label.size)
     {
       ip->bracket_top = opener->prev;
@@ -2184,64 +2219,267 @@ md_count_words_rec(MD_Node *node, U64 *count)
   }
 }
 
-internal MD_Document
-md_parse(Arena *arena, String8 source)
+// Feeds the line at source[start..] to the parser, CR dropped and tabs
+// expanded to 4-column stops, and returns where the next line starts. A
+// `copy` of the line outlives the source buffer.
+internal U64
+md_parse_line(MD_BlockParser *p, String8 source, U64 start, B32 copy)
 {
-  Temp scratch = scratch_begin(&arena, 1);
-  MD_BlockParser p_ = {0};
-  MD_BlockParser *p = &p_;
-  p->arena = arena;
-  p->source = source;
-  p->root = md_node_alloc(arena, MD_NodeKind_Document);
-  p->tip = p->root;
-
-  //- frontmatter
-  U64 body_start = md_parse_frontmatter(p, p->root);
-
-  //- lines (tabs expanded to 4-column stops)
-  for(U64 start = body_start; start < source.size;)
+  Arena *arena = p->arena;
+  U64 nl = str8_find_needle(source, start, str8_lit("\n"), 0);
+  U64 end = (nl < source.size) ? nl+1 : nl;
+  String8 line = str8_substr(source, r1u64(start, nl));
+  if(line.size && line.str[line.size-1] == '\r') { line.size -= 1; }
+  if(str8_find_needle(line, 0, str8_lit("\t"), 0) < line.size)
   {
-    U64 nl = str8_find_needle(source, start, str8_lit("\n"), 0);
-    U64 end = (nl < source.size) ? nl+1 : nl;
-    String8 line = str8_substr(source, r1u64(start, nl));
-    if(line.size && line.str[line.size-1] == '\r') { line.size -= 1; }
-    if(str8_find_needle(line, 0, str8_lit("\t"), 0) < line.size)
+    String8List parts = {0};
+    U64 col = 0, seg = 0;
+    for EachIndex(i, line.size)
     {
-      String8List parts = {0};
-      U64 col = 0, seg = 0;
-      for EachIndex(i, line.size)
+      if(line.str[i] == '\t')
       {
-        if(line.str[i] == '\t')
-        {
-          str8_list_push(arena, &parts, str8_substr(line, r1u64(seg, i)));
-          col += i - seg;
-          U64 spaces = 4 - (col % 4);
-          str8_list_push(arena, &parts, str8_prefix(str8_lit("    "), spaces));
-          col += spaces;
-          seg = i+1;
-        }
+        str8_list_push(arena, &parts, str8_substr(line, r1u64(seg, i)));
+        col += i - seg;
+        U64 spaces = 4 - (col % 4);
+        str8_list_push(arena, &parts, str8_prefix(str8_lit("    "), spaces));
+        col += spaces;
+        seg = i+1;
       }
-      str8_list_push(arena, &parts, str8_skip(line, seg));
-      line = str8_list_join(arena, &parts, 0);
     }
-    md_incorporate_line(p, line, start, end);
-    start = end;
+    str8_list_push(arena, &parts, str8_skip(line, seg));
+    line = str8_list_join(arena, &parts, 0);
   }
+  else if(copy)
+  {
+    line = push_str8_copy(arena, line);
+  }
+  md_incorporate_line(p, line, p->base + start, p->base + end);
+  return end;
+}
+
+internal void
+md_parse_finish(MD_BlockParser *p)
+{
   for(;p->tip != 0;)
   {
     MD_Node *parent = p->tip->parent;
     md_finalize(p, p->tip);
     p->tip = parent;
   }
+}
+
+internal MD_Document
+md_parse_part(Arena *arena, String8 source, U64 base, MD_RefTable *shared)
+{
+  MD_BlockParser p_ = {0};
+  MD_BlockParser *p = &p_;
+  p->arena = arena;
+  p->source = source;
+  p->base = base;
+  p->root = md_node_alloc(arena, MD_NodeKind_Document);
+  p->tip = p->root;
+  p->ref_arena = arena;
+  p->refs = push_array(arena, MD_RefTable, 1);
+  p->shared = shared;
+
+  //- frontmatter, at the start of the document
+  U64 body_start = (base == 0) ? md_parse_frontmatter(p, p->root) : 0;
+
+  //- lines
+  for(U64 start = body_start; start < source.size;)
+  {
+    start = md_parse_line(p, source, start, 0);
+  }
+  md_parse_finish(p);
 
   //- inline content
   md_parse_inlines_rec(p, p->root);
 
   MD_Document doc = {0};
   doc.source = source;
+  doc.base = base;
   doc.root = p->root;
-  doc.end = p->root->last ? p->root->last->range.max : 0;
+  doc.end = p->root->last ? p->root->last->range.max : base;
   md_count_words_rec(p->root, &doc.word_count);
-  scratch_end(scratch);
   return doc;
+}
+
+internal MD_Document
+md_parse(Arena *arena, String8 source)
+{
+  return md_parse_part(arena, source, 0, 0);
+}
+
+////////////////////////////////
+//~ Scanner
+
+internal void
+md_scanner_reset_parser(MD_Scanner *s)
+{
+  arena_pop_to(s->work, s->work_pos);
+  MD_BlockParser *p = push_array(s->work, MD_BlockParser, 1);
+  p->arena = s->work;
+  p->root = md_node_alloc(s->work, MD_NodeKind_Document);
+  p->tip = p->root;
+  p->ref_arena = s->arena;
+  p->refs = &s->refs;
+  s->p = p;
+  s->harvested = 0;
+}
+
+internal void
+md_scanner_init(MD_Scanner *s, U64 chunk_target)
+{
+  MemoryZeroStruct(s);
+  s->arena = arena_alloc();
+  s->work = arena_alloc();
+  s->work_pos = arena_pos(s->work);
+  s->chunk_target = chunk_target;
+  md_scanner_reset_parser(s);
+}
+
+internal void
+md_scanner_release(MD_Scanner *s)
+{
+  if(s->arena) { arena_release(s->arena); }
+  if(s->work) { arena_release(s->work); }
+  MemoryZeroStruct(s);
+}
+
+#define md_scanner_grow(arena, v, count, cap) do { \
+if((count) == (cap)) { \
+U64 new_cap_ = (cap)*2 + 64; \
+void *bigger_ = push_array_no_zero((arena), U8, sizeof(*(v))*new_cap_); \
+if((count)) { MemoryCopy(bigger_, (v), sizeof(*(v))*(count)); } \
+*(void **)&(v) = bigger_; \
+(cap) = new_cap_; \
+} \
+} while(0)
+
+// A finished root block: its headings and footnote definitions, at any depth.
+internal void
+md_scanner_take_node(MD_Scanner *s, MD_Node *node)
+{
+  if(node->kind == MD_NodeKind_Heading)
+  {
+    Temp scratch = scratch_begin(&s->arena, 1);
+    MD_InlineArray inlines = md_inlines_from_text(s->p, node->text);
+    String8 text = md_plain_text_from_inlines(scratch.arena, inlines);
+    md_scanner_grow(s->arena, s->headings, s->heading_count, s->heading_cap);
+    MD_ScanHeading *h = &s->headings[s->heading_count++];
+    h->level = node->level;
+    h->text = push_str8_copy(s->arena, text);
+    h->offset = node->range.min;
+    scratch_end(scratch);
+  }
+  if(node->kind == MD_NodeKind_FootnoteDefinition)
+  {
+    md_scanner_grow(s->arena, s->footnotes, s->footnote_count, s->footnote_cap);
+    MD_ScanFootnote *f = &s->footnotes[s->footnote_count++];
+    f->label = push_str8_copy(s->arena, node->label);
+    f->offset = node->range.min;
+    s->footnotes_seen = 1;
+  }
+  for(MD_Node *c = node->first; c != 0; c = c->next) { md_scanner_take_node(s, c); }
+}
+
+// Takes the root blocks that are finished: all but `open`.
+internal void
+md_scanner_take_finished(MD_Scanner *s, MD_Node *open)
+{
+  MD_Node *first = s->harvested ? s->harvested->next : s->p->root->first;
+  for(MD_Node *c = first; c != 0 && c != open; c = c->next)
+  {
+    md_scanner_take_node(s, c);
+    s->root_count += 1;
+    s->end = c->range.max;
+    s->harvested = c;
+  }
+}
+
+internal void
+md_scanner_push_chunk(MD_Scanner *s, U64 end, U64 next_line)
+{
+  md_scanner_grow(s->arena, s->chunks, s->chunk_count, s->chunk_cap);
+  MD_ScanChunk *c = &s->chunks[s->chunk_count++];
+  *c = s->open_chunk;
+  c->range.max = end;
+  MemoryZeroStruct(&s->open_chunk);
+  s->open_chunk.range = r1u64(end, end);
+  s->open_chunk.root_base = s->root_count;
+  s->open_chunk.line_base = next_line;
+  s->open_chunk.footnotes_before = s->footnotes_seen;
+}
+
+internal U64
+md_scanner_feed(MD_Scanner *s, String8 data, B32 eof)
+{
+  if(s->done) { return 0; }
+  MD_BlockParser *p = s->p;
+  U64 base = s->offset;
+  p->source = data;
+  p->base = base;
+  U64 used = 0;
+
+  //- frontmatter, at the start of the document
+  if(base == 0 && s->line_count == 0)
+  {
+    used = md_parse_frontmatter(p, p->root);
+    // its closing fence may be past this piece: wait for more, up to a point
+    B32 candidate = (str8_match(str8_prefix(data, 3), str8_lit("---"), 0) || str8_match(str8_prefix(data, 3), str8_lit("+++"), 0));
+    if(used == 0 && candidate && !eof && data.size < MB(1)) { return 0; }
+    for EachIndex(i, used) { s->line_count += (data.str[i] == '\n'); }
+  }
+
+  //- lines
+  for(;used < data.size;)
+  {
+    U64 nl = str8_find_needle(data, used, str8_lit("\n"), 0);
+    if(nl >= data.size && !eof) { break; }
+    U64 start = used;
+    U64 line_index = s->line_count;
+    MD_Node *last = p->root->last;
+    used = md_parse_line(p, data, start, 1);
+    s->line_count += 1;
+
+    //- a line that starts a root block ends the ones before it
+    MD_Node *now = p->root->last;
+    if(now != last && now != 0 && now->range.min == base + start)
+    {
+      md_scanner_take_finished(s, now);
+      if(base + start - s->open_chunk.range.min >= s->chunk_target)
+      {
+        md_scanner_push_chunk(s, base + start, line_index);
+      }
+
+      // drop the finished blocks: a fresh parser starts the same block from
+      // this line, as nothing before it is open
+      if(arena_pos(s->work) > s->work_pos + MB(8))
+      {
+        md_scanner_reset_parser(s);
+        p = s->p;
+        p->source = data;
+        p->base = base;
+        md_parse_line(p, data, start, 1);
+      }
+    }
+  }
+  s->offset = base + used;
+
+  //- end of the document
+  if(eof && used >= data.size)
+  {
+    md_parse_finish(p);
+    md_scanner_take_finished(s, 0);
+    if(s->root_count > s->open_chunk.root_base || s->chunk_count == 0)
+    {
+      if(s->root_count > 0) { md_scanner_push_chunk(s, s->offset, s->line_count); }
+    }
+    else
+    {
+      s->chunks[s->chunk_count-1].range.max = s->offset;
+    }
+    s->done = 1;
+  }
+  return used;
 }

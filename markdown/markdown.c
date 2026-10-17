@@ -107,6 +107,29 @@ md_images_reset(void)
   if(md_image_arena) { arena_clear(md_image_arena); }
 }
 
+internal void
+md_images_mark_used(MD_Box *box)
+{
+  if(box->image) { box->image->in_use = 1; }
+  for(MD_Box *c = box->first; c != 0; c = c->next) { md_images_mark_used(c); }
+}
+
+// Releases the textures of images no element in `keep` shows; they decode
+// again when a build needs them.
+internal void
+md_images_trim(MD_Element **keep, U64 count)
+{
+  for(MD_Image *img = md_first_image; img != 0; img = img->next) { img->in_use = 0; }
+  for EachIndex(i, count) { if(keep[i]) { md_images_mark_used(keep[i]->root); } }
+  for(MD_Image *img = md_first_image; img != 0; img = img->next)
+  {
+    if(img->in_use || img->pending || r_handle_match(img->texture, r_handle_zero())) { continue; }
+    r_tex2d_release(img->texture);
+    img->texture = r_handle_zero();
+    img->evicted = 1;
+  }
+}
+
 internal String8
 md_base64_decode(Arena *arena, String8 s)
 {
@@ -697,8 +720,10 @@ md_image_result(MD_Image *img)
   return img->pending ? MD_ImageResolve_Pending : img->failed ? MD_ImageResolve_Failed : MD_ImageResolve_Loaded;
 }
 
+// `text_only` resolves nothing that needs loading: a build for its text alone
+// (search, copy) must not start downloads or decode images.
 internal MD_ImageResolve
-md_image_resolve(String8 url, String8 base_dir, F32 scale, MD_Image **out)
+md_image_resolve(String8 url, String8 base_dir, F32 scale, B32 text_only, MD_Image **out)
 {
   Temp scratch = scratch_begin(0, 0);
   if(md_image_arena == 0) { md_image_arena = arena_alloc(); }
@@ -722,6 +747,7 @@ md_image_resolve(String8 url, String8 base_dir, F32 scale, MD_Image **out)
     if(!file_path_exists(path)) { scratch_end(scratch); return MD_ImageResolve_None; }
     key = path;
   }
+  if(text_only) { scratch_end(scratch); return MD_ImageResolve_Pending; }
 
   //- cached
   MD_Image *img = 0;
@@ -729,11 +755,16 @@ md_image_resolve(String8 url, String8 base_dir, F32 scale, MD_Image **out)
   {
     if(str8_match(n->key, key, 0)) { img = n; break; }
   }
-  if(img == 0)
+  if(img == 0 || img->evicted)
   {
-    img = push_array(md_image_arena, MD_Image, 1);
-    img->key = push_str8_copy(md_image_arena, key);
-    SLLStackPush(md_first_image, img);
+    if(img == 0)
+    {
+      img = push_array(md_image_arena, MD_Image, 1);
+      img->key = push_str8_copy(md_image_arena, key);
+      SLLStackPush(md_first_image, img);
+    }
+    img->evicted = 0;
+    img->first_text = 0;
     if(remote)
     {
       img->pending = 1;
@@ -851,6 +882,7 @@ struct MD_Builder
 
   B32 rendered_footnote_separator;
   U64 root_count;
+  B32 text_only;
   
   // link targets: heading slugs and footnote definitions
   String8List anchor_names;
@@ -1274,7 +1306,7 @@ md_build_inlines(MD_Builder *b, MD_InlineArray inlines)
       case MD_InlineKind_ImageStart:
       {
         MD_Image *image = 0;
-        MD_ImageResolve r = md_image_resolve(in->url, b->base_dir, b->style->scale, &image);
+        MD_ImageResolve r = md_image_resolve(in->url, b->base_dir, b->style->scale, b->text_only, &image);
         if(r == MD_ImageResolve_None)
         {
           // no image source: the alt text flows as plain text
@@ -1626,7 +1658,7 @@ md_html_image(MD_Builder *b, MD_HtmlNode *node)
   String8 src = md_unescape(b->arena, md_html_attr(node->tag, str8_lit("src")));
   String8 alt = md_unescape(b->arena, md_html_attr(node->tag, str8_lit("alt")));
   MD_Image *image = 0;
-  MD_ImageResolve r = md_image_resolve(src, b->base_dir, b->style->scale, &image);
+  MD_ImageResolve r = md_image_resolve(src, b->base_dir, b->style->scale, b->text_only, &image);
   if(r == MD_ImageResolve_None || r == MD_ImageResolve_Pending) { return; }
   U64 link = (b->link_depth > 0) ? md_run_style(b)->link : 0;
   if(r == MD_ImageResolve_Loaded)
@@ -2496,7 +2528,7 @@ md_build_children(MD_Builder *b, MD_Node *node, U64 depth)
 }
 
 internal MD_Element *
-md_element_build(Arena *arena, MD_Document *doc, MD_Style *style, String8 base_dir)
+md_element_build(Arena *arena, MD_Document *doc, MD_Style *style, String8 base_dir, U64 text_base, B32 text_only)
 {
   MD_Element *el = push_array(arena, MD_Element, 1);
   el->arena = arena;
@@ -2508,6 +2540,9 @@ md_element_build(Arena *arena, MD_Document *doc, MD_Style *style, String8 base_d
   b->doc = doc;
   b->el = el;
   b->base_dir = base_dir;
+  b->root_count = doc->root_base;
+  b->text_only = text_only;
+  b->rendered_footnote_separator = doc->footnotes_before;
 
   // base_text_style: preview font, 1rem, `text` color
   MD_RunStyle base = {0};
@@ -2535,13 +2570,14 @@ md_element_build(Arena *arena, MD_Document *doc, MD_Style *style, String8 base_d
   //- selection space: texts in document order, one separator between each
   el->texts = b->texts;
   el->text_count = b->text_count;
-  U64 offset = 0;
+  U64 offset = text_base;
   for EachIndex(i, el->text_count)
   {
     el->texts[i]->global_start = offset;
     offset += el->texts[i]->string.size + 1;
   }
-  el->text_total = offset;
+  el->text_base = text_base;
+  el->text_end = offset;
   el->root_block_count = b->root_count;
   el->anchor_count = b->anchor_count;
   el->anchor_names = push_array(arena, String8, b->anchor_count + 1);
@@ -3161,6 +3197,14 @@ md_element_layout(MD_Element *el, MD_Style *style, F32 width)
   md_compute_margins(el->root);
   el->height = md_layout_box(&c, el->root, 0, 0, width);
   el->width = width;
+  el->lead = el->trail = 0;
+  B32 first = 1;
+  for(MD_Box *b = el->root->first; b != 0; b = b->next)
+  {
+    if(!md_box_in_flow(b)) { continue; }
+    if(first) { el->lead = b->eff_margin_top; first = 0; }
+    el->trail = b->eff_margin_bottom;
+  }
 }
 
 ////////////////////////////////
@@ -3625,7 +3669,7 @@ md_box_scroll_dx(MD_Interaction *ix, MD_Box *box)
 internal U64
 md_element_offset_from_point(MD_Element *el, MD_Style *style, MD_Interaction *ix, Vec2F32 p)
 {
-  if(el->text_count == 0) { return 0; }
+  if(el->text_count == 0) { return el->text_base; }
   // the first text whose box reaches below the point
   MD_Text *best = 0;
   for EachIndex(i, el->text_count)
@@ -3644,7 +3688,7 @@ md_element_offset_from_point(MD_Element *el, MD_Style *style, MD_Interaction *ix
     best = t;
     if(p.y < r.y1) { break; }
   }
-  if(best == 0) { return 0; }
+  if(best == 0) { return el->text_base; }
   MD_Text *t = best;
   Rng2F32 r = shift_2f32(t->box->rect, v2f32(md_box_scroll_dx(ix, t->box), 0));
   if(p.y >= r.y1) { return t->global_start + t->string.size; }
@@ -3715,13 +3759,17 @@ md_char_is_marker(U8 c)
 // source with the emphasis and code markers around it; anything else copies
 // the blocks it touches.
 internal String8
-md_element_source_in_range(MD_Element *el, String8 source, U64 start, U64 end)
+md_element_source_in_range(MD_Element *el, MD_Document *doc, U64 start, U64 end)
 {
   MD_Text *a = md_element_text_at(el, start);
   MD_Text *z = md_element_text_at(el, end);
   if(a == 0 || z == 0 || end <= start) { return str8_zero(); }
+  // block ranges are document offsets; the source holds the part from doc->base
+  String8 source = doc->source;
   Rng1U64 ra = md_box_source_range(a->box);
   Rng1U64 rz = md_box_source_range(z->box);
+  ra = r1u64(ClampBot(ra.min, doc->base) - doc->base, ClampBot(ra.max, doc->base) - doc->base);
+  rz = r1u64(ClampBot(rz.min, doc->base) - doc->base, ClampBot(rz.max, doc->base) - doc->base);
   ra.min = Min(ra.min, source.size); ra.max = Min(ra.max, source.size);
   rz.min = Min(rz.min, source.size); rz.max = Min(rz.max, source.size);
   if(a == z)

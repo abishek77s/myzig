@@ -7,8 +7,24 @@
 // into a flat list of the items it fuzzy-matches, collapsed ones included,
 // best match first.
 
+// The document's headings, from the preview's scan.
+typedef struct OP_Headings OP_Headings;
+struct OP_Headings
+{
+  MD_ScanHeading *v;
+  U64 count;
+};
+
+internal OP_Headings
+op_headings(MDP_View *view)
+{
+  OP_Headings hs = {0};
+  hs.v = mdp_view_headings(view, &hs.count);
+  return hs;
+}
+
 internal U64
-op_collapse_key(MD_Heading *h)
+op_collapse_key(MD_ScanHeading *h)
 {
   Temp scratch = scratch_begin(0, 0);
   U64 key = u64_hash_from_str8(push_str8f(scratch.arena, "%I64u:%S", h->level, h->text));
@@ -17,15 +33,16 @@ op_collapse_key(MD_Heading *h)
 }
 
 internal B32
-op_is_collapsed(OP_Panel *panel, MD_Heading *h)
+op_is_collapsed(OP_Panel *panel, MD_ScanHeading *h)
 {
+  if(panel->collapsed_count == 0) { return 0; }
   U64 key = op_collapse_key(h);
   for EachIndex(i, panel->collapsed_count) { if(panel->collapsed[i] == key) { return 1; } }
   return 0;
 }
 
 internal void
-op_toggle_collapsed(OP_Panel *panel, MD_Heading *h)
+op_toggle_collapsed(OP_Panel *panel, MD_ScanHeading *h)
 {
   U64 key = op_collapse_key(h);
   for EachIndex(i, panel->collapsed_count)
@@ -100,10 +117,10 @@ struct OP_Outline
 };
 
 internal OP_Outline
-op_outline(Arena *arena, OP_Panel *panel, MD_Element *el)
+op_outline(Arena *arena, OP_Panel *panel, OP_Headings *el)
 {
   OP_Outline o = {0};
-  U64 n = el->heading_count;
+  U64 n = el->count;
   o.depths = push_array(arena, U64, n + 1);
   o.entries = push_array(arena, OP_Entry, n + 1);
   {
@@ -111,7 +128,7 @@ op_outline(Arena *arena, OP_Panel *panel, MD_Element *el)
     U64 top = 0;
     for EachIndex(i, n)
     {
-      U64 level = el->headings[i].level;
+      U64 level = el->v[i].level;
       while(top > 0 && stack[top-1] >= level) { top -= 1; }
       o.depths[i] = top;
       if(top < ArrayCount(stack)) { stack[top++] = level; }
@@ -124,7 +141,7 @@ op_outline(Arena *arena, OP_Panel *panel, MD_Element *el)
     {
       OP_Entry e = {0};
       e.heading = i;
-      e.label = el->headings[i].text;
+      e.label = el->v[i].text;
       if(!op_fuzzy_match(arena, e.label, query, &e.match_positions, &e.match_count, &e.match_score)) { continue; }
       // stable insertion by score: ties keep document order
       U64 r = o.entry_count++;
@@ -136,7 +153,7 @@ op_outline(Arena *arena, OP_Panel *panel, MD_Element *el)
   U64 hidden_below = max_U64;
   for EachIndex(i, n)
   {
-    MD_Heading *h = &el->headings[i];
+    MD_ScanHeading *h = &el->v[i];
     U64 d = o.depths[i];
     if(hidden_below != max_U64 && d > hidden_below) { continue; }
     hidden_below = max_U64;
@@ -155,10 +172,10 @@ op_outline(Arena *arena, OP_Panel *panel, MD_Element *el)
 // The row that shows the selection: the selected heading's, or its nearest
 // visible ancestor's when it is collapsed away.
 internal U64
-op_selected_row(OP_Panel *panel, OP_Outline *o, MD_Element *el)
+op_selected_row(OP_Panel *panel, OP_Outline *o, OP_Headings *el)
 {
   U64 h = panel->selected;
-  while(h < el->heading_count)
+  while(h < el->count)
   {
     for EachIndex(r, o->entry_count) { if(o->entries[r].heading == h) { return r; } }
     U64 d = o->depths[h];
@@ -239,7 +256,8 @@ op_layout(Arena *arena, OP_Panel *panel, MDP_View *view, WM_Window window)
   //- the list
   l.list = r2f32p(l.rect.x0, l.filter.y1, inner_x1, l.rect.y1);
   l.row_h = round_f32(OP_ROW_HEIGHT_PX*s);
-  l.outline = op_outline(arena, panel, view->element);
+  OP_Headings headings = op_headings(view);
+  l.outline = op_outline(arena, panel, &headings);
   F32 content_h = l.outline.entry_count*l.row_h;
   l.max_scroll = ClampBot(0, content_h - (l.list.y1 - l.list.y0));
   panel->scroll_y = Clamp(0, panel->scroll_y, l.max_scroll);
@@ -321,7 +339,8 @@ op_panel_handle_event(OP_Panel *panel, MDP_View *view, WM_Window window, WM_Even
   Temp scratch = scratch_begin(0, 0);
   OP_Layout l = op_layout(scratch.arena, panel, view, window);
   OP_Outline *o = &l.outline;
-  MD_Element *el = view->element;
+  OP_Headings headings = op_headings(view);
+  OP_Headings *el = &headings;
   B32 taken = 0;
   switch(ev->kind)
   {
@@ -388,7 +407,7 @@ op_panel_handle_event(OP_Panel *panel, MDP_View *view, WM_Window window, WM_Even
         {
           OP_Entry *e = &o->entries[row];
           Rng2F32 slot = op_icon_slot(&l, op_row_rect(&l, panel, row), e->depth);
-          if(e->has_children && contains_2f32(slot, ev->pos)) { op_toggle_collapsed(panel, &el->headings[e->heading]); }
+          if(e->has_children && contains_2f32(slot, ev->pos)) { op_toggle_collapsed(panel, &el->v[e->heading]); }
           else { op_select_row(panel, view, window, &l, row); }
         }
         break;
@@ -442,7 +461,7 @@ op_panel_handle_event(OP_Panel *panel, MDP_View *view, WM_Window window, WM_Even
           if(row != max_U64)
           {
             OP_Entry *e = &o->entries[row];
-            if(e->has_children && !e->collapsed) { op_toggle_collapsed(panel, &el->headings[e->heading]); }
+            if(e->has_children && !e->collapsed) { op_toggle_collapsed(panel, &el->v[e->heading]); }
             else
             {
               for(U64 r = row; r > 0; r -= 1) { if(o->entries[r-1].depth < e->depth) { op_select_row(panel, view, window, &l, r-1); break; } }
@@ -456,7 +475,7 @@ op_panel_handle_event(OP_Panel *panel, MDP_View *view, WM_Window window, WM_Even
           if(row != max_U64)
           {
             OP_Entry *e = &o->entries[row];
-            if(e->has_children && e->collapsed) { op_toggle_collapsed(panel, &el->headings[e->heading]); }
+            if(e->has_children && e->collapsed) { op_toggle_collapsed(panel, &el->v[e->heading]); }
             else if(e->has_children) { op_select_row(panel, view, window, &l, row + 1); }
           }
           taken = 1;
@@ -497,7 +516,8 @@ op_panel_update(OP_Panel *panel, MDP_View *view, WM_Window window)
     panel->autoscroll = 0;
     Temp scratch = scratch_begin(0, 0);
     OP_Layout l = op_layout(scratch.arena, panel, view, window);
-    U64 row = op_selected_row(panel, &l.outline, view->element);
+    OP_Headings headings = op_headings(view);
+    U64 row = op_selected_row(panel, &l.outline, &headings);
     if(row != max_U64)
     {
       F32 y = row*l.row_h;
@@ -527,7 +547,8 @@ op_panel_draw(OP_Panel *panel, MDP_View *view, WM_Window window)
   Temp scratch = scratch_begin(0, 0);
   OP_Layout l = op_layout(scratch.arena, panel, view, window);
   OP_Outline *o = &l.outline;
-  MD_Element *el = view->element;
+  OP_Headings headings = op_headings(view);
+  OP_Headings *el = &headings;
   TH_Colors *colors = &view->theme.colors;
   MD_Fonts *fonts = &view->fonts;
   F32 s = l.s;

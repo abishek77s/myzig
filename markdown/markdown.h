@@ -192,6 +192,8 @@ struct MD_Image
   Vec2S32 tex_size;              // texture px (SVGs rasterize above 1x)
   B32 failed;
   B32 pending;                   // remote image still downloading
+  B32 evicted;                   // texture released while unused; decodes again on use
+  B32 in_use;
   MD_SvgText *first_text;
 };
 
@@ -293,7 +295,8 @@ struct MD_Element
   U64 link_count;
   MD_Text **texts;
   U64 text_count;
-  U64 text_total;
+  U64 text_base;                 // selection space: texts lie in [text_base, text_end)
+  U64 text_end;
   U64 root_block_count;
   String8 *anchor_names;         // heading slugs, "footnote:<label>"
   MD_Box **anchor_boxes;
@@ -302,6 +305,8 @@ struct MD_Element
   U64 heading_count;
   F32 width;
   F32 height;
+  F32 lead;                      // the first root block's top margin, inside the height
+  F32 trail;                     // the last root block's bottom margin, inside the height
 };
 
 typedef struct MD_ScrollState MD_ScrollState;
@@ -343,14 +348,17 @@ struct MD_Hit
 
 internal void md_images_reset(void);
 internal B32 md_images_poll(void);
-internal MD_Element *md_element_build(Arena *arena, MD_Document *doc, MD_Style *style, String8 base_dir);
+internal void md_images_trim(MD_Element **keep, U64 count);
+// `text_base` places the element's texts in the selection space; a
+// `text_only` build is for reading its texts, and loads no images.
+internal MD_Element *md_element_build(Arena *arena, MD_Document *doc, MD_Style *style, String8 base_dir, U64 text_base, B32 text_only);
 internal void md_element_layout(MD_Element *el, MD_Style *style, F32 width);
 internal void md_element_paint(MD_Element *el, MD_Style *style, MD_Interaction *ix, Vec2F32 origin, Rng2F32 clip);
 internal MD_Hit md_element_hit_test(MD_Element *el, MD_Interaction *ix, Vec2F32 p);
 internal U64 md_element_offset_from_point(MD_Element *el, MD_Style *style, MD_Interaction *ix, Vec2F32 p);
 internal Rng1U64 md_element_word_at(MD_Element *el, U64 offset);
 internal String8 md_element_text_in_range(Arena *arena, MD_Element *el, U64 start, U64 end);
-internal String8 md_element_source_in_range(MD_Element *el, String8 source, U64 start, U64 end);
+internal String8 md_element_source_in_range(MD_Element *el, MD_Document *doc, U64 start, U64 end);
 internal MD_Text *md_element_text_at(MD_Element *el, U64 offset);
 internal F32 *md_scroll_offset_ptr(MD_Interaction *ix, Arena *arena, U64 key);
 internal MD_Text *md_element_first_text_in(MD_Element *el, MD_Box *box);
